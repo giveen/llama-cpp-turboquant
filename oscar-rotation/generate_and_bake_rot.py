@@ -128,7 +128,7 @@ def read_model_config(path: str) -> dict:
 def generate_hadamard(cfg: dict, output_dir: str):
     """Generate Hadamard rotation .pt files compatible with export_rot_kv_gguf.py."""
     nl = cfg["n_layers"]
-    per_layer_hd = cfg["per_layer_head_dim"]
+    per_layer_hd = {k: int(v) for k, v in cfg["per_layer_head_dim"].items()}
 
     # Unique head dims across all layers
     unique_hd = sorted(set(per_layer_hd.values()))
