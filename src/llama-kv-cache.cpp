@@ -177,11 +177,14 @@ llama_kv_cache::llama_kv_cache(
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
         };
         if ((k_is_oscar2 || v_is_oscar2) && type_k != type_v) {
-            // only auto-align when the non-oscar2 side is a quantized type
-            // that the oscar2 kernel would misinterpret — skip f16/f32/turbo
-            const bool k_can_stay = !k_is_oscar2 && (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_F32 || is_turbo(type_k));
-            const bool v_can_stay = !v_is_oscar2 && (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_F32 || is_turbo(type_v));
-            if (!k_can_stay || !v_can_stay) {
+            // if the non-oscar2 side is f16/f32/turbo, it can stay as-is;
+            // otherwise (q8_0, q4_0, etc.) it would be misread by the kernel
+            const bool non_oscar2_k = !k_is_oscar2 && v_is_oscar2;
+            const bool non_oscar2_v = !v_is_oscar2 && k_is_oscar2;
+            const bool need_upgrade =
+                (non_oscar2_k && type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_F32 && !is_turbo(type_k)) ||
+                (non_oscar2_v && type_v != GGML_TYPE_F16 && type_v != GGML_TYPE_F32 && !is_turbo(type_v));
+            if (need_upgrade) {
                 LLAMA_LOG_WARN("%s: oscar2 FA kernel requires matching KV types — "
                                "upgrading %s/%s to oscar2/oscar2\n",
                                __func__, ggml_type_name(type_k), ggml_type_name(type_v));
