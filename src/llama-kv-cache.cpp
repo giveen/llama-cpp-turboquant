@@ -166,31 +166,25 @@ llama_kv_cache::llama_kv_cache(
 
     // oscar2 auto-alignment: the dedicated oscar2 FA kernel always reads both K
     // and V as block_oscar2 (ignoring its type_K/type_V template params) and
-    // Hadamard-transforms Q — this is only correct when both sides are oscar2.
-    // Mixed oscar2+q8_0 (or any non-turbo, non-f16 quantized type) produces
-    // garbage. Turbo types (turbo2/3/4) have their own FA kernels and are not
-    // routed through the oscar2 path — leave them alone.
+    // Hadamard-transforms Q. The only non-oscar2 type the dispatch supports is
+    // f16 (f32 is promoted to f16). Any other quantized type (q8_0, turbo4, etc.)
+    // causes a fatal error in the oscar2 FA dispatch. Force-alignment to oscar2.
     {
         const bool k_is_oscar2 = (type_k == GGML_TYPE_OSCAR2);
         const bool v_is_oscar2 = (type_v == GGML_TYPE_OSCAR2);
-        auto is_turbo = [](ggml_type t) {
-            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
-        };
-        if ((k_is_oscar2 || v_is_oscar2) && type_k != type_v) {
-            // if the non-oscar2 side is f16/f32/turbo, it can stay as-is;
-            // otherwise (q8_0, q4_0, etc.) it would be misread by the kernel
-            const bool non_oscar2_k = !k_is_oscar2 && v_is_oscar2;
-            const bool non_oscar2_v = !v_is_oscar2 && k_is_oscar2;
-            const bool need_upgrade =
-                (non_oscar2_k && type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_F32 && !is_turbo(type_k)) ||
-                (non_oscar2_v && type_v != GGML_TYPE_F16 && type_v != GGML_TYPE_F32 && !is_turbo(type_v));
-            if (need_upgrade) {
-                LLAMA_LOG_WARN("%s: oscar2 FA kernel requires matching KV types — "
-                               "upgrading %s/%s to oscar2/oscar2\n",
-                               __func__, ggml_type_name(type_k), ggml_type_name(type_v));
-                type_k = GGML_TYPE_OSCAR2;
-                type_v = GGML_TYPE_OSCAR2;
-            }
+        const bool k_is_f16    = (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_F32);
+        const bool v_is_f16    = (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_F32);
+        if (k_is_oscar2 && !v_is_oscar2 && !v_is_f16) {
+            LLAMA_LOG_WARN("%s: oscar2 FA dispatch only accepts oscar2 or f16 — "
+                           "upgrading V from %s to oscar2\n",
+                           __func__, ggml_type_name(type_v));
+            type_v = GGML_TYPE_OSCAR2;
+        }
+        if (v_is_oscar2 && !k_is_oscar2 && !k_is_f16) {
+            LLAMA_LOG_WARN("%s: oscar2 FA dispatch only accepts oscar2 or f16 — "
+                           "upgrading K from %s to oscar2\n",
+                           __func__, ggml_type_name(type_k));
+            type_k = GGML_TYPE_OSCAR2;
         }
     }
 
