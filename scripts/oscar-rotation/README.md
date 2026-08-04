@@ -43,7 +43,7 @@ The conversion script bakes calibrated or Hadamard rotation matrices into a copy
 For models that need conversion, use the data-free Hadamard method:
 
 ```bash
-python3 oscar-rotation/generate_and_bake_rot.py \
+python3 scripts/oscar-rotation/generate_and_bake_rot.py \
     --base /path/to/model.gguf \
     --out  /path/to/model-rot-kv.gguf
 ```
@@ -60,13 +60,13 @@ calibration dataset:
 ./build/bin/llama-oscar-calib -m model.gguf -f calibration.txt -o covariances/
 
 # Step 2: compute eigendecomposition + R·H·P composition
-python3 oscar-rotation/calibrate_rotation.py \
+python3 scripts/oscar-rotation/calibrate_rotation.py \
     --cov-dir covariances/ \
     --out-dir rotations/ \
     --num-layers N --head-dim D
 
 # Step 3: bake into GGUF
-python3 oscar-rotation/export_rot_kv_gguf.py \
+python3 scripts/oscar-rotation/export_rot_kv_gguf.py \
     --base model.gguf \
     --rot-dir rotations/ \
     --out model-rot-kv.gguf

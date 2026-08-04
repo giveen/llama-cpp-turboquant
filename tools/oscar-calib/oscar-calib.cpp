@@ -263,11 +263,18 @@ int main(int argc, char ** argv) {
     params.cb_eval_user_data = nullptr;
     params.warmup = false;
 
-    // Parse output dir from a custom argument or default.
+    // Parse -o <dir> before common_params_parse, then strip it so the
+    // upstream parser does not reject it as an unknown argument.
     g_output_dir = "covariances";
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "-o" && i + 1 < argc) {
             g_output_dir = argv[i + 1];
+            // shift remaining args over the -o pair
+            for (int j = i; j < argc - 2; ++j) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            break;
         }
     }
 

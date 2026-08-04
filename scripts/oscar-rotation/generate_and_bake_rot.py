@@ -10,16 +10,16 @@ QUICK START
 ========================================================================
 
   # A) Data-free Hadamard (no calibration, works out of the box)
-  python3 oscar-rotation/generate_and_bake_rot.py \
+  python3 scripts/oscar-rotation/generate_and_bake_rot.py \
       --base model.gguf --out model-rot.gguf
 
   # B) Calibrated rotation (better quality, needs llama-oscar-calib built)
-  python3 oscar-rotation/generate_and_bake_rot.py \
+  python3 scripts/oscar-rotation/generate_and_bake_rot.py \
       --base model.gguf --out model-rot.gguf \
       --method calibrated --dump-path calibration.txt
 
   # C) Use existing rotation files (skip generation)
-  python3 oscar-rotation/generate_and_bake_rot.py \
+  python3 scripts/oscar-rotation/generate_and_bake_rot.py \
       --base model.gguf --out model-rot.gguf \
       --rot-dir rotations/
 
@@ -78,7 +78,7 @@ if PAPER_ROT.exists():
 # calibrate_rotation.py + llama-oscar-calib (no external repo needed).
 
 # Add our gguf-py for GGUF reading
-TQ_GGUF = Path(__file__).parent.parent / "gguf-py"
+TQ_GGUF = Path(__file__).parent.parent.parent / "gguf-py"
 sys.path.insert(0, str(TQ_GGUF))
 
 
@@ -224,7 +224,7 @@ def main():
         calib_bin = shutil.which("llama-oscar-calib")
         if not calib_bin:
             # Try build/bin relative to repo root.
-            repo_root = Path(__file__).parent.parent
+            repo_root = Path(__file__).parent.parent.parent
             candidate = repo_root / "build" / "bin" / "llama-oscar-calib"
             if candidate.exists():
                 calib_bin = str(candidate)
@@ -236,6 +236,7 @@ def main():
                 calib_bin,
                 "-m", str(base_path),
                 "-o", cov_dir,
+                "-b", "4096",
             ]
             if calib_text:
                 # --dump-path doubles as calibration text file in the new pipeline.
@@ -264,7 +265,7 @@ def main():
                 sys.executable, str(PAPER_ROT / "compute_kv_rotation.py"),
                 "--method", "qqt_sst",
                 "--dump-path", args.dump_path,
-                "--head-dim", str(first_hd),
+                "--head-dim", str(int(first_hd)),
                 "--composition", "r_h_pbr",
                 "--output-dir", str(rot_dir),
             ]
@@ -280,7 +281,7 @@ def main():
         rot_cmd = [
             sys.executable, str(calib_py),
             "--cov-dir", cov_dir,
-            "--head-dim", str(first_hd),
+            "--head-dim", str(int(first_hd)),
             "--num-layers", str(cfg["n_layers"]),
             "--output-dir", str(rot_dir),
             "--composition", "r_h_pbr",

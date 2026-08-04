@@ -18,7 +18,7 @@ many models. With rotation, they match the unquantized baseline.
 
 ```bash
 # Data-free Hadamard rotation (works for any model, power-of-2 head_dim)
-python3 oscar-rotation/generate_and_bake_rot.py \
+python3 scripts/oscar-rotation/generate_and_bake_rot.py \
     --base /path/to/model.gguf \
     --out /path/to/model-rot-kv.gguf \
     --method hadamard
@@ -42,7 +42,7 @@ Then use the rotated model with any INT2 cache type:
 
 ## Scripts
 
-All scripts live in `oscar-rotation/`:
+All scripts live in `scripts/oscar-rotation/`:
 
 | Script | Purpose |
 |--------|---------|
@@ -60,7 +60,7 @@ Works for any model where the attention head dimension is a power of 2
 (64, 128, 256, 512). No calibration data needed.
 
 ```bash
-python3 oscar-rotation/generate_and_bake_rot.py \
+python3 scripts/oscar-rotation/generate_and_bake_rot.py \
     --base /path/to/model.gguf \
     --out /path/to/model-rot-kv.gguf \
     --method hadamard
@@ -88,7 +88,7 @@ is self-contained (no external OSCAR paper repo needed).
 cmake -B build -DGGML_CUDA=ON && cmake --build build --target llama-oscar-calib
 
 # Run calibration + bake in one step
-python3 oscar-rotation/generate_and_bake_rot.py \
+python3 scripts/oscar-rotation/generate_and_bake_rot.py \
     --base /path/to/model.gguf \
     --out /path/to/model-rot-kv.gguf \
     --method calibrated \
@@ -105,12 +105,12 @@ directory of QKV dumps from a previous run.
 ./build/bin/llama-oscar-calib -m model.gguf -f calibration.txt -o covariances/
 
 # Step 2: Eigendecompose and compose R·H·P_br
-python3 oscar-rotation/calibrate_rotation.py \
+python3 scripts/oscar-rotation/calibrate_rotation.py \
     --cov-dir covariances/ --head-dim 128 --num-layers 28 \
     --output-dir rotations/ --composition r_h_pbr
 
 # Step 3: Bake into GGUF (with V rotation absorbed into W_o for zero runtime cost)
-python3 oscar-rotation/export_rot_kv_gguf.py \
+python3 scripts/oscar-rotation/export_rot_kv_gguf.py \
     --base model.gguf --rot-dir rotations/ --out model-rot.gguf --absorb-v
 ```
 
@@ -122,7 +122,7 @@ This is an iterative process that converges in 1-2 iterations.
 
 ```bash
 # Calibrate with 1 uresidual iteration
-python3 oscar-rotation/calibrate_rotation.py \
+python3 scripts/oscar-rotation/calibrate_rotation.py \
     --cov-dir covariances/ --head-dim 128 --num-layers 28 \
     --output-dir rotations/ --composition r_h_pbr \
     --uresidual-iters 1
@@ -145,7 +145,7 @@ The V rotation can be baked into the output projection weight at
 quantization time, eliminating runtime overhead entirely:
 
 ```bash
-python3 oscar-rotation/export_rot_kv_gguf.py \
+python3 scripts/oscar-rotation/export_rot_kv_gguf.py \
     --base model.gguf --rot-dir rotations/ --out model-rot.gguf \
     --absorb-v
 ```
@@ -159,7 +159,7 @@ If you already have rotation `.pt` files (e.g. from a previous
 calibration run), bake them in directly:
 
 ```bash
-python3 oscar-rotation/export_rot_kv_gguf.py \
+python3 scripts/oscar-rotation/export_rot_kv_gguf.py \
     --base /path/to/model.gguf \
     --rot-dir /path/to/rotation_pt_files \
     --out /path/to/model-rot-kv.gguf

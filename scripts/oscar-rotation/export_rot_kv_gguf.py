@@ -25,7 +25,7 @@ USAGE
   # Use pre-existing Hadamard rotations from the qwen3-4b data dir
   python3 export_rot_kv_gguf.py \
       --base qwen3-4b-q4km.gguf \
-      --rot-dir oscar-rotation/qwen3-4b-thinking-2507 \
+      --rot-dir scripts/oscar-rotation/qwen3-4b-thinking-2507 \
       --out qwen3-4b-q4km-rot-kv.gguf
 
 ==========================================================================

@@ -15,7 +15,7 @@ END-TO-END USAGE (3 methods)
 
 Method A: One-command pipeline (recommended)
 --------------------------------------------
-  python3 oscar-rotation/generate_and_bake_rot.py \
+  python3 scripts/oscar-rotation/generate_and_bake_rot.py \
       --base model.gguf --out model-rot.gguf
 
   Uses data-free Hadamard rotation. No calibration needed.
@@ -23,7 +23,7 @@ Method A: One-command pipeline (recommended)
 
 Method B: One-command calibrated pipeline
 ------------------------------------------
-  python3 oscar-rotation/generate_and_bake_rot.py \
+  python3 scripts/oscar-rotation/generate_and_bake_rot.py \
       --base model.gguf --out model-rot.gguf \
       --method calibrated --dump-path calibration.txt
 
@@ -42,17 +42,17 @@ Method C: Step-by-step (for advanced use / debugging)
   ./build/bin/llama-oscar-calib -m model.gguf -f calibration.txt -o covariances/
 
   # Step 3: Eigendecompose and compose R·H·P_br
-  python3 oscar-rotation/calibrate_rotation.py \
+  python3 scripts/oscar-rotation/calibrate_rotation.py \
       --cov-dir covariances/ \
       --head-dim 128 --num-layers 28 \
       --output-dir rotations/ --composition r_h_pbr
 
   # Step 4a: Bake rotations into GGUF (adds attn_k_rot + attn_v_rot tensors)
-  python3 oscar-rotation/export_rot_kv_gguf.py \
+  python3 scripts/oscar-rotation/export_rot_kv_gguf.py \
       --base model.gguf --rot-dir rotations/ --out model-rot.gguf
 
   # Step 4b: OR bake with V rotation absorbed into W_o (G5, zero runtime cost)
-  python3 oscar-rotation/export_rot_kv_gguf.py \
+  python3 scripts/oscar-rotation/export_rot_kv_gguf.py \
       --base model.gguf --rot-dir rotations/ --out model-rot.gguf --absorb-v
 
 ==========================================================================
@@ -96,8 +96,13 @@ import torch
 # Hadamard matrix (power of 2 only)
 # ---------------------------------------------------------------------------
 def hadamard_matrix(n: int) -> torch.Tensor:
-    """Normalized Hadamard matrix H such that H^T H = I."""
-    assert n & (n - 1) == 0, f"head_dim={n} must be a power of 2"
+    """Normalized Hadamard matrix H such that H^T H = I.
+    For non-power-of-2 dims, uses QR of random Gaussian as fallback."""
+    if n & (n - 1) != 0:
+        print(f"  head_dim={n} not power of 2, using QR-based orthogonal matrix")
+        A = torch.randn(n, n, dtype=torch.float64)
+        Q, R = torch.linalg.qr(A)
+        return Q.float()
     h = torch.tensor([[1.0]], dtype=torch.float64)
     while h.shape[0] < n:
         h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
@@ -112,7 +117,9 @@ def bit_reversal_perm(n: int) -> torch.Tensor:
 
     For n=128 (7 bits): P_br[i, bit_reverse_7(i)] = 1.
     """
-    assert n & (n - 1) == 0, f"head_dim={n} must be a power of 2"
+    if n & (n - 1) != 0:
+        print(f"  head_dim={n} not power of 2, bit-reversal = identity")
+        return torch.eye(n, dtype=torch.float32)
     bits = int(math.log2(n))
     perm = torch.zeros(n, n, dtype=torch.float32)
     for i in range(n):
@@ -135,6 +142,7 @@ def load_covariances(cov_dir: str, num_layers: int, head_dim: int) -> tuple:
     """
     q_covs = []
     v_covs = []
+    hd = head_dim
     for layer in range(num_layers):
         q_path = os.path.join(cov_dir, f"layer_{layer:02d}_qcov.bin")
         v_path = os.path.join(cov_dir, f"layer_{layer:02d}_vcov.bin")
@@ -144,8 +152,16 @@ def load_covariances(cov_dir: str, num_layers: int, head_dim: int) -> tuple:
         if not os.path.exists(v_path):
             raise FileNotFoundError(f"Missing V covariance: {v_path}")
 
-        q_cov = np.fromfile(q_path, dtype=np.float32).reshape(head_dim, head_dim)
-        v_cov = np.fromfile(v_path, dtype=np.float32).reshape(head_dim, head_dim)
+        q_data = np.fromfile(q_path, dtype=np.float32)
+        local_hd = int(np.sqrt(len(q_data)))
+        if hd == 0 or local_hd != hd:
+            if hd != 0:
+                print(f'Auto-corrected head_dim: {hd} -> {local_hd} (from covariance files)')
+            else:
+                print(f'Auto-detected head_dim={local_hd} from covariance files')
+            hd = local_hd
+        q_cov = q_data.reshape(local_hd, local_hd)
+        v_cov = np.fromfile(v_path, dtype=np.float32).reshape(local_hd, local_hd)
 
         # Symmetrize (should already be symmetric, but guard against FP drift)
         q_cov = (q_cov + q_cov.T) / 2.0
@@ -154,7 +170,7 @@ def load_covariances(cov_dir: str, num_layers: int, head_dim: int) -> tuple:
         q_covs.append(torch.from_numpy(q_cov))
         v_covs.append(torch.from_numpy(v_cov))
 
-    return torch.stack(q_covs), torch.stack(v_covs)
+    return torch.stack(q_covs), torch.stack(v_covs), hd
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +406,7 @@ def main():
     d = args.head_dim
 
     print(f"Loading covariances from {args.cov_dir}...")
-    q_covs, v_covs = load_covariances(args.cov_dir, args.num_layers, d)
+    q_covs, v_covs, d = load_covariances(args.cov_dir, args.num_layers, d)
     print(f"  Loaded {args.num_layers} layers, head_dim={d}")
 
     # Build H and P_br matrices.

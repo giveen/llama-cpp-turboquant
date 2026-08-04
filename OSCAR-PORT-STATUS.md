@@ -285,7 +285,7 @@ Speed: Prompt ~74 t/s, Generation ~34 t/s
 ### Rotated Model Generation
 ```bash
 # Hadamard rotation (data-free, recommended)
-python3 oscar-rotation/generate_and_bake_rot.py \
+python3 scripts/oscar-rotation/generate_and_bake_rot.py \
     --base /path/to/model.gguf \
     --out /path/to/model-rot-kv.gguf \
     --method hadamard
