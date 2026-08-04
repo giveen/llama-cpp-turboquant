@@ -211,10 +211,13 @@ def main():
         # Step 2: calibrate_rotation.py eigendecomposes and composes R·H·P_br.
         cfg = read_model_config(str(base_path))
         per_layer_hd = cfg["per_layer_head_dim"]
-        first_hd = list(per_layer_hd.values())[0]
         unique_hd = sorted(set(per_layer_hd.values()))
+        import json
+        per_layer_json = json.dumps({str(k): int(v) for k, v in per_layer_hd.items()})
+        # first_hd kept for legacy fallback path
+        first_hd = unique_hd[0]
         if len(unique_hd) > 1:
-            print(f"WARNING: mixed head dims {unique_hd}; calibration uses first={first_hd}")
+            print(f"Mixed head dims: {unique_hd}. Per-layer map: {per_layer_json[:80]}...")
 
         cov_dir = str(rot_dir / "covariances")
         os.makedirs(cov_dir, exist_ok=True)
@@ -281,7 +284,7 @@ def main():
         rot_cmd = [
             sys.executable, str(calib_py),
             "--cov-dir", cov_dir,
-            "--head-dim", str(int(first_hd)),
+            "--head-dim", per_layer_json,
             "--num-layers", str(cfg["n_layers"]),
             "--output-dir", str(rot_dir),
             "--composition", "r_h_pbr",

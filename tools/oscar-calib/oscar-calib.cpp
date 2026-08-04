@@ -144,14 +144,26 @@ static bool calib_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (s.find("attn_q") != std::string::npos && s.find("soft") == std::string::npos) {
         // Q tensor: shape [n_embd_head, n_head, n_tokens] or [n_embd_head * n_head, n_tokens]
-        // We want per-token Q vectors grouped by KV head.
         const float * data = (const float *)t->data;
         if (!data) return false;
 
-        const int d = acc.n_embd_head;
         const int nh = acc.n_head;
         const int nhkv = acc.n_head_kv;
         const int g = acc.gqa_ratio;
+
+        // Auto-detect n_embd_head from tensor shape on first encounter.
+        // n_embd/n_head is unreliable for models with shared KV layers (e.g. Gemma4).
+        int d = acc.n_embd_head;
+        if ((ne0 % nh) == 0 && ne0 / nh != d) {
+            d = ne0 / nh;
+            int old_hd = acc.n_embd_head;
+            acc.n_embd_head = d;
+            g_n_embd_head = d;
+            // Re-init accumulators with correct head_dim.
+            acc.init(d, nh, nhkv);
+            LOG_INF("layer %d: auto-detected n_embd_head=%d (from Q tensor, was %d)\n",
+                    layer, d, old_hd);
+        }
 
         // Determine layout: [d, nh, n_tok] (ne0=d, ne1=nh) or [d*nh, n_tok]
         int n_tok = 1;
