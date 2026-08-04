@@ -303,9 +303,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // INT2 cache type rotation check: warn when using oscar2 without rotation tensors.
-    // The model's per-layer rotation tensors (attn_k_rot, attn_v_rot) are optional;
-    // when absent, the oscar2 KV cache can produce degraded output.
-    if (type_k == GGML_TYPE_OSCAR2 || type_v == GGML_TYPE_OSCAR2) {
+    // Skip for MLA/DSv4 models — their KV cache backend provides runtime rotation.
+    const bool is_mla = hparams.is_mla();
+    if (!is_mla && (type_k == GGML_TYPE_OSCAR2 || type_v == GGML_TYPE_OSCAR2)) {
         bool has_rotation = false;
         for (size_t il = 0; il < model.layers.size() && !has_rotation; il++) {
             has_rotation = (model.layers[il].attn_k_rot != nullptr || model.layers[il].attn_v_rot != nullptr);
@@ -316,8 +316,6 @@ llama_kv_cache::llama_kv_cache(
                            __func__, ggml_type_name(type_k), ggml_type_name(type_v));
         }
     }
-
-    const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
