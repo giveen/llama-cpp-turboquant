@@ -167,17 +167,27 @@ llama_kv_cache::llama_kv_cache(
     // oscar2 auto-alignment: the dedicated oscar2 FA kernel always reads both K
     // and V as block_oscar2 (ignoring its type_K/type_V template params) and
     // Hadamard-transforms Q — this is only correct when both sides are oscar2.
-    // Mixed oscar2+q8_0 or oscar2+turbo produces garbage. Force alignment:
-    // if either side is oscar2, upgrade the other to oscar2.
+    // Mixed oscar2+q8_0 (or any non-turbo, non-f16 quantized type) produces
+    // garbage. Turbo types (turbo2/3/4) have their own FA kernels and are not
+    // routed through the oscar2 path — leave them alone.
     {
         const bool k_is_oscar2 = (type_k == GGML_TYPE_OSCAR2);
         const bool v_is_oscar2 = (type_v == GGML_TYPE_OSCAR2);
+        auto is_turbo = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        };
         if ((k_is_oscar2 || v_is_oscar2) && type_k != type_v) {
-            LLAMA_LOG_WARN("%s: oscar2 FA kernel requires matching K+V types — "
-                           "upgrading %s/%s to oscar2/oscar2\n",
-                           __func__, ggml_type_name(type_k), ggml_type_name(type_v));
-            type_k = GGML_TYPE_OSCAR2;
-            type_v = GGML_TYPE_OSCAR2;
+            // only auto-align when the non-oscar2 side is a quantized type
+            // that the oscar2 kernel would misinterpret — skip f16/f32/turbo
+            const bool k_can_stay = !k_is_oscar2 && (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_F32 || is_turbo(type_k));
+            const bool v_can_stay = !v_is_oscar2 && (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_F32 || is_turbo(type_v));
+            if (!k_can_stay || !v_can_stay) {
+                LLAMA_LOG_WARN("%s: oscar2 FA kernel requires matching KV types — "
+                               "upgrading %s/%s to oscar2/oscar2\n",
+                               __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+                type_k = GGML_TYPE_OSCAR2;
+                type_v = GGML_TYPE_OSCAR2;
+            }
         }
     }
 
