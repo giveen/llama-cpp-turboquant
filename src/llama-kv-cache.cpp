@@ -164,6 +164,23 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // oscar2 auto-alignment: the dedicated oscar2 FA kernel always reads both K
+    // and V as block_oscar2 (ignoring its type_K/type_V template params) and
+    // Hadamard-transforms Q — this is only correct when both sides are oscar2.
+    // Mixed oscar2+q8_0 or oscar2+turbo produces garbage. Force alignment:
+    // if either side is oscar2, upgrade the other to oscar2.
+    {
+        const bool k_is_oscar2 = (type_k == GGML_TYPE_OSCAR2);
+        const bool v_is_oscar2 = (type_v == GGML_TYPE_OSCAR2);
+        if ((k_is_oscar2 || v_is_oscar2) && type_k != type_v) {
+            LLAMA_LOG_WARN("%s: oscar2 FA kernel requires matching K+V types — "
+                           "upgrading %s/%s to oscar2/oscar2\n",
+                           __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+            type_k = GGML_TYPE_OSCAR2;
+            type_v = GGML_TYPE_OSCAR2;
+        }
+    }
+
     // #24060/MTP fix: iterate ALL layers (incl. nextn) so an all-nextn draft
     // (gemma4-assistant: n_layer()==0) registers its KV layers; has_kv() still
     // gates per-layer. Upstream loops the full hparams.n_layer member here.
