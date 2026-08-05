@@ -56,8 +56,11 @@ struct calib_accumulator {
         n_head_kv = nhkv;
         gqa_ratio = nh / nhkv;
         n_tokens = 0;
-        q_cov.resize(nhkv, std::vector<float>(hd * hd, 0.0f));
-        v_cov.resize(nhkv, std::vector<float>(hd * hd, 0.0f));
+        // assign() replaces every element: resize() would keep existing inner
+        // vectors at their old size when hd changes (head dim flips on
+        // mixed-head models), leaving q_cov/v_cov undersized -> OOB writes.
+        q_cov.assign(nhkv, std::vector<float>((size_t) hd * hd, 0.0f));
+        v_cov.assign(nhkv, std::vector<float>((size_t) hd * hd, 0.0f));
     }
 
     // Accumulate Q^T Q for one KV head. Q is [gqa_ratio, n_embd_head] in row-major.
@@ -154,6 +157,7 @@ static bool calib_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const int ne1 = t->ne[1];
     if (ne1 == 0) return true;
 
+
     const int nh   = acc.n_head;
     const int nhkv = acc.n_head_kv;
     const int g    = acc.gqa_ratio;
@@ -165,10 +169,10 @@ static bool calib_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     int d = acc.n_embd_head;
     int d_candidate = -1;
     if (suffix == "Qcur") {
-        if (ne0 % nh == 0 && ne0 / nh >= 32) {
-            d_candidate = ne0 / nh; // 2D
-        } else if (ne1 == nh && ne0 >= 32) {
-            d_candidate = ne0;      // 3D
+        if (ne1 == nh && ne0 >= 32) {
+            d_candidate = ne0;      // 3D [d, nh, n_tokens]
+        } else if (ne0 % nh == 0 && ne0 / nh >= 32) {
+            d_candidate = ne0 / nh; // 2D [d*nh, n_tokens]
         }
     } else if (suffix == "wqkv" && ne0 % (nh + 2*nhkv) == 0) {
         d_candidate = ne0 / (nh + 2*nhkv);
