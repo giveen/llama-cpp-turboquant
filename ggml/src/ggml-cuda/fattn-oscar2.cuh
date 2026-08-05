@@ -73,6 +73,7 @@ static __global__ void flash_attn_ext_oscar2(
         const float   m1,
         const uint32_t n_head_log2,
         const float   logit_softcap,
+        const bool    no_hadamard,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -169,20 +170,43 @@ static __global__ void flash_attn_ext_oscar2(
         }
         // Transform Q to Hadamard domain: Q_reg[j] <- H(Q_reg[j]).
         // set_rows stores K/V as H(val - mean) / sqrt(128). With Q also in H domain,
-        // the dot product (H(Q) · H(K)) preserves Q·K (H is orthogonal self-inverse).
+        // the dot product (H(Q) . H(K)) preserves Q.K (H is orthogonal self-inverse).
+        // With LLAMA_KV_NO_HADAMARD=1 the graph already applied the calibrated
+        // rotation (which includes H), so Q stays in the natural/rotated domain
+        // and the store writes that domain directly.
+        if (!no_hadamard) {
+            #pragma unroll
+            for (int b = 0; b < nblocks; ++b) {
+                #pragma unroll
+                for (int e = 0; e < elems_per_block; ++e) {
+                    sh_val_had[tid + e * nthreads] = Q_reg[j][b * elems_per_block + e];
+                }
+                __syncwarp();
+                hadamard_inverse_128_32w(sh_val_had, tid);
+                #pragma unroll
+                for (int e = 0; e < elems_per_block; ++e) {
+                    Q_reg[j][b * elems_per_block + e] = sh_val_had[tid + e * nthreads];
+                }
+                __syncwarp();
+            }
+        }
+    }
+
+    // In no-Hadamard mode the per-block K mean correction needs sum(Q_block) in
+    // the natural domain; precompute it once (Q is fixed across the KV loop).
+    float Q_sum_blk[ncols][nblocks] = {};
+    if (no_hadamard) {
         #pragma unroll
-        for (int b = 0; b < nblocks; ++b) {
+        for (int j = 0; j < ncols; ++j) {
             #pragma unroll
-            for (int e = 0; e < elems_per_block; ++e) {
-                sh_val_had[tid + e * nthreads] = Q_reg[j][b * elems_per_block + e];
+            for (int b = 0; b < nblocks; ++b) {
+                float p = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < elems_per_block; ++e) {
+                    p += Q_reg[j][b * elems_per_block + e];
+                }
+                Q_sum_blk[j][b] = warp_reduce_sum(p);
             }
-            __syncwarp();
-            hadamard_inverse_128_32w(sh_val_had, tid);
-            #pragma unroll
-            for (int e = 0; e < elems_per_block; ++e) {
-                Q_reg[j][b * elems_per_block + e] = sh_val_had[tid + e * nthreads];
-            }
-            __syncwarp();
         }
     }
 
@@ -232,11 +256,18 @@ static __global__ void flash_attn_ext_oscar2(
                     }
                     // Per-block K mean correction: the mean was subtracted before
                     // Hadamard transform in set_rows, but is stored in block_oscar2.m.
-                    // The missing term in the centered dot is mean * sum(Q_over_block).
-                    // In Hadamard domain, Q_had[0] = sum(Q) / sqrt(128), so the
-                    // correction is m_k * Q_had[0] * sqrt(128). Only thread 0 (tid==0)
-                    // holds the DC component Q_had[0] at Q_reg[j][b * elems_per_block].
-                    if (tid == 0) {
+                    // In Hadamard domain the missing term is mean * sum(Q_over_block):
+                    // Q_had[0] = sum(Q)/sqrt(128), so the correction is
+                    // m_k * Q_had[0] * sqrt(128), added by thread 0 which holds the
+                    // DC component. In no-Hadamard mode Q is in the natural domain,
+                    // so the correction is m_k * sum(Q_block) via the precomputed
+                    // Q_sum_blk (all threads add it).
+                    if (no_hadamard) {
+                        // Q_sum_blk holds the full block sum on every thread;
+                        // add it once (thread 0) so the warp reduction below
+                        // does not count it 32 times.
+                        if (tid == 0) sum += m_k * Q_sum_blk[j][b];
+                    } else if (tid == 0) {
                         sum += m_k * Q_reg[j][b * elems_per_block] * 11.3137085f; // sqrtf(128.0f)
                     }
                 }
@@ -365,6 +396,19 @@ static __global__ void flash_attn_ext_oscar2(
         }
         #pragma unroll
         for (int b = 0; b < nblocks; ++b) {
+            if (no_hadamard) {
+                // natural/rotated domain: no inverse transform, just add the mean
+                #pragma unroll
+                for (int e = 0; e < elems_per_block; ++e) {
+                    int di = tid + e * nthreads + b * QK_OSCAR2;
+                    float val = VKQ[j][b * elems_per_block + e] * iks + VKQ_mean[j][b] * iks;
+                    if (gridDim.y == 1)
+                        dst_ptr[(((sequence * n_queries + ic0 + j) * ne02 + head)) * D + di] = val;
+                    else
+                        dst_ptr[(((sequence * n_queries + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y) * D + di] = val;
+                }
+                continue;
+            }
             #pragma unroll
             for (int e = 0; e < elems_per_block; ++e) {
                 sh_val_had[tid + e * nthreads] = VKQ[j][b * elems_per_block + e] * iks;
@@ -524,6 +568,11 @@ static void launch_fattn_oscar2(
         scale /= logit_softcap;
     }
 
+    // LLAMA_KV_NO_HADAMARD=1: the calibrated rotation baked into the GGUF
+    // already includes H, so the store and this kernel skip their own Hadamard
+    // (matches the reference port's flag semantics).
+    const bool no_hadamard = getenv("LLAMA_KV_NO_HADAMARD") != nullptr;
+
     const uint32_t n_head      = Q->ne[2];
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
@@ -541,7 +590,7 @@ static void launch_fattn_oscar2(
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
-        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        scale, max_bias, m0, m1, n_head_log2, logit_softcap, no_hadamard,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,

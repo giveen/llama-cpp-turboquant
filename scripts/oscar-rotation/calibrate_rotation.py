@@ -413,9 +413,12 @@ def main():
     per_layer_hd = {}
     try:
         per_layer_hd = json.loads(args.head_dim)
+    except (json.JSONDecodeError, TypeError):
+        per_layer_hd = None
+    if isinstance(per_layer_hd, dict):
         unique_hd = sorted(set(per_layer_hd.values()))
         print(f"Per-layer head dims: {unique_hd}")
-    except (json.JSONDecodeError, TypeError):
+    else:
         d = int(args.head_dim)
         per_layer_hd = {str(i): d for i in range(args.num_layers)}
         print(f"Uniform head_dim={d}")

@@ -97,134 +97,161 @@ static int g_n_embd_head = 0;
 static std::string g_output_dir;
 
 // The eval callback. Called for each node during graph evaluation.
-// We check tensor names to identify Q, K, V, and attention output.
+// We check tensor names to identify Q and V nodes.
 static bool calib_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
-
     if (ask) {
         // Return true if we want to read this tensor's data after evaluation.
         const char * name = ggml_get_name(t);
         if (!name || name[0] == '\0') return false;
-        // We want: attn_q (to compute Q^T Q), attn_v (for V^T diag(w) V),
-        // and attn_kq_soft_max (for the attention weights w).
-        // Tensor names follow: blk.{i}.attn_q, blk.{i}.attn_v, blk.{i}.attn_kv_soft_max
+        // Fork graph naming (llama-graph.cpp cb()/graph_get_cb): tensors are
+        // named "{name}-{layer}", e.g. "Qcur-0". We need:
+        //   Qcur: post-RoPE Q (before any calibrated rotation) - real graph node
+        //   Vcur: pre-rotation V - a real node only when Q/K/V projections are
+        //         separate; with a fused attn_qkv the Q/K/V are views of the
+        //         "wqkv" node, so V is extracted from wqkv instead.
+        // There is no separately named softmax tensor (fused FA), so V
+        // accumulates unweighted.
         std::string s(name);
-        if (s.find("attn_q") != std::string::npos ||
-            s.find("attn_v") != std::string::npos ||
-            s.find("attn_kv_soft_max") != std::string::npos) {
+        const size_t dash = s.rfind('-');
+        if (dash == std::string::npos) return false;
+        const std::string prefix = s.substr(0, dash);
+        if (prefix == "Qcur" || prefix == "Vcur" || prefix == "wqkv") {
             return true;
         }
         return false;
     }
 
-    // Process: tensor data is available now.
+    // Process: tensor data is available now. NOTE: the scheduler stops
+    // evaluating the graph if this callback returns false, so every path here
+    // must return true.
     const char * name = ggml_get_name(t);
-    if (!name || name[0] == '\0') return false;
+    if (!name || name[0] == '\0') return true;
     std::string s(name);
 
-    // Parse layer index from "blk.{i}.*"
-    int layer = -1;
-    if (s.find("blk.") == 0) {
-        size_t dot2 = s.find('.', 4);
-        if (dot2 != std::string::npos) {
-            layer = std::atoi(s.substr(4, dot2 - 4).c_str());
-        }
-    }
-    if (layer < 0 || layer >= g_n_layers) return false;
+    // Parse layer index and tensor name from "{prefix}-{layer}" (fork naming).
+    const size_t dash = s.rfind('-');
+    if (dash == std::string::npos) return true;
+    const int layer = std::atoi(s.c_str() + dash + 1);
+    const std::string suffix = s.substr(0, dash);
+    if (layer < 0 || layer >= g_n_layers) return true;
 
     auto & acc = g_accumulators[layer];
 
     // We only process tensors of the right type and shape.
     const enum ggml_type type = t->type;
-    if (type != GGML_TYPE_F32) return false;
+    if (type != GGML_TYPE_F32) return true;
+
+    // The tensor may live in device memory (CUDA compute buffer): reading
+    // t->data directly from host segfaults. Copy through the backend instead.
+    const size_t nbytes = ggml_nbytes(t);
+    if (nbytes == 0) return true;
+    std::vector<float> host(ggml_nelements(t));
+    ggml_backend_tensor_get(t, host.data(), 0, nbytes);
+    const float * data = host.data();
 
     const int ne0 = ggml_nelements(t) > 0 ? t->ne[0] : 0;
     const int ne1 = t->ne[1];
-    const int ne2 = t->ne[2];
+    if (ne1 == 0) return true;
 
-    if (s.find("attn_q") != std::string::npos && s.find("soft") == std::string::npos) {
-        // Q tensor: shape [n_embd_head, n_head, n_tokens] or [n_embd_head * n_head, n_tokens]
-        const float * data = (const float *)t->data;
-        if (!data) return false;
+    const int nh   = acc.n_head;
+    const int nhkv = acc.n_head_kv;
+    const int g    = acc.gqa_ratio;
 
-        const int nh = acc.n_head;
-        const int nhkv = acc.n_head_kv;
-        const int g = acc.gqa_ratio;
-
-        // Auto-detect n_embd_head from tensor shape on first encounter.
-        // n_embd/n_head is unreliable for models with shared KV layers (e.g. Gemma4).
-        int d = acc.n_embd_head;
-        if ((ne0 % nh) == 0 && ne0 / nh != d) {
-            d = ne0 / nh;
-            int old_hd = acc.n_embd_head;
-            acc.n_embd_head = d;
-            g_n_embd_head = d;
-            // Re-init accumulators with correct head_dim.
-            acc.init(d, nh, nhkv);
-            LOG_INF("layer %d: auto-detected n_embd_head=%d (from Q tensor, was %d)\n",
-                    layer, d, old_hd);
+    // Auto-detect n_embd_head from the tensor shape on first encounter.
+    // n_embd/n_head is unreliable for models with shared KV layers (e.g. Gemma4).
+    // Qcur can be 2D [d*nh, n_tokens] (projection output) or 3D [d, nh, n_tokens]
+    // (post-RoPE). Fused qkv is [d*(nh + 2*nhkv), n_tokens].
+    int d = acc.n_embd_head;
+    int d_candidate = -1;
+    if (suffix == "Qcur") {
+        if (ne0 % nh == 0 && ne0 / nh >= 32) {
+            d_candidate = ne0 / nh; // 2D
+        } else if (ne1 == nh && ne0 >= 32) {
+            d_candidate = ne0;      // 3D
         }
+    } else if (suffix == "wqkv" && ne0 % (nh + 2*nhkv) == 0) {
+        d_candidate = ne0 / (nh + 2*nhkv);
+    }
+    if (d_candidate > 0 && d_candidate != d) {
+        d = d_candidate;
+        acc.n_embd_head = d;
+        g_n_embd_head = d;
+        acc.init(d, nh, nhkv);
+        LOG_INF("layer %d: auto-detected n_embd_head=%d (from %s tensor)\n",
+                layer, d, suffix.c_str());
+    }
+    if (d == 0) return true;
 
-        // Determine layout: [d, nh, n_tok] (ne0=d, ne1=nh) or [d*nh, n_tok]
-        int n_tok = 1;
-        if (ne0 == d && ne1 == nh) {
-            // [d, nh, n_tok] - column-major: data[h*d + r] for head h, dim r
-            n_tok = (ggml_nbytes(t) / sizeof(float)) / (d * nh);
-            for (int tok = 0; tok < n_tok; ++tok) {
-                for (int kvh = 0; kvh < nhkv; ++kvh) {
-                    // Collect g query heads for this KV head.
-                    // Each head's Q vector is at data[tok*nh*d + h*d] for head h.
-                    const float * base = data + tok * nh * d;
-                    // acc_q_cov expects Q_row pointing to g consecutive heads, stride = d.
-                    acc.acc_q_cov(kvh, base + kvh * g * d, d);
-                }
-            }
-        } else if (ne0 == d * nh) {
-            // [d*nh, n_tok] - each column is one token's flattened Q.
+    // accumulate Q^T Q over the g query heads per KV head
+    // data_row points at one token's Q block of ne0_q = d*nh floats (row-major
+    // [d*nh, n_tokens]); Q heads are grouped: KV head kvh owns heads [kvh*g, (kvh+1)*g).
+    const auto acc_q_tok = [&](const float * data_row, int ne0_q) {
+        for (int kvh = 0; kvh < nhkv; ++kvh) {
+            acc.acc_q_cov(kvh, data_row + kvh * g * d, d);
+        }
+        (void) ne0_q;
+    };
+
+    // accumulate V^T V over the KV heads; data_row points at one token's V block
+    // of ne0_v = d*nhkv floats, each KV head's V at stride d.
+    const auto acc_v_tok = [&](const float * data_row, int ne0_v) {
+        const int n_heads = ne0_v / d;
+        for (int kvh = 0; kvh < nhkv && kvh < n_heads; ++kvh) {
+            acc.acc_v_cov(kvh, data_row + kvh * d, 1.0f);
+        }
+    };
+
+    if (suffix == "Qcur") {
+        // [d*nh, n_tokens] - each column is one token's flattened Q.
+        // (also accept the [d, nh, n_tokens] 3D layout)
+        int n_tok;
+        if (ne0 == d * nh) {
             n_tok = ne1;
             for (int tok = 0; tok < n_tok; ++tok) {
-                for (int kvh = 0; kvh < nhkv; ++kvh) {
-                    acc.acc_q_cov(kvh, data + tok * d * nh + kvh * g * d, d);
-                }
+                acc_q_tok(data + (size_t) tok * d * nh, d * nh);
             }
+        } else if (ne0 == d && ne1 == nh) {
+            n_tok = (int) (ggml_nbytes(t) / sizeof(float)) / (d * nh);
+            for (int tok = 0; tok < n_tok; ++tok) {
+                acc_q_tok(data + (size_t) tok * nh * d, d * nh);
+            }
+        } else {
+            return true;
+        }
+        acc.n_tokens += n_tok;
+    } else if (suffix == "Vcur") {
+        // Separate-projection V: [d*nhkv, n_tokens] (or [d, nhkv, n_tokens]).
+        int n_tok;
+        if (ne0 == d * nhkv) {
+            n_tok = ne1;
+            for (int tok = 0; tok < n_tok; ++tok) {
+                acc_v_tok(data + (size_t) tok * d * nhkv, d * nhkv);
+            }
+        } else if (ne0 == d && ne1 == nhkv) {
+            n_tok = (int) (ggml_nbytes(t) / sizeof(float)) / (d * nhkv);
+            for (int tok = 0; tok < n_tok; ++tok) {
+                acc_v_tok(data + (size_t) tok * nhkv * d, d * nhkv);
+            }
+        } else {
+            return true;
+        }
+    } else if (suffix == "wqkv") {
+        // Fused projection: [d*(nh + 2*nhkv), n_tokens]; Q at rows [0, d*nh),
+        // V at rows [d*(nh+nhkv), d*(nh+2*nhkv)). No token-count bump for V
+        // (n_tokens already counted from Q).
+        if (ne0 != d * (nh + 2*nhkv)) return true;
+        const int n_tok = ne1;
+        const int q_rows = d * nh;
+        const int v_off  = d * (nh + nhkv);
+        for (int tok = 0; tok < n_tok; ++tok) {
+            acc_q_tok(data + (size_t) tok * ne0, q_rows);
+            acc_v_tok(data + (size_t) tok * ne0 + v_off, d * nhkv);
         }
         acc.n_tokens += n_tok;
     }
 
-    if (s.find("attn_v") != std::string::npos && s.find("soft") == std::string::npos) {
-        // V tensor: same layout as Q.
-        // We accumulate V^T V without attention weights (approximation).
-        // For the score-weighted version, we'd need the softmax output, but
-        // unweighted V^T V is a reasonable approximation for calibration.
-        const float * data = (const float *)t->data;
-        if (!data) return false;
-
-        const int d = acc.n_embd_head;
-        const int nh = acc.n_head;
-        const int nhkv = acc.n_head_kv;
-        const int g = acc.gqa_ratio;
-
-        int n_tok = 1;
-        if (ne0 == d && ne1 == nh) {
-            n_tok = (ggml_nbytes(t) / sizeof(float)) / (d * nh);
-            for (int tok = 0; tok < n_tok; ++tok) {
-                for (int kvh = 0; kvh < nhkv; ++kvh) {
-                    const float * base = data + tok * nh * d;
-                    // V is per-KV-head, so we just take one head (not g grouped).
-                    acc.acc_v_cov(kvh, base + kvh * g * d, 1.0f);
-                }
-            }
-        } else if (ne0 == d * nh) {
-            n_tok = ne1;
-            for (int tok = 0; tok < n_tok; ++tok) {
-                for (int kvh = 0; kvh < nhkv; ++kvh) {
-                    acc.acc_v_cov(kvh, data + tok * d * nh + kvh * g * d, 1.0f);
-                }
-            }
-        }
-    }
-
-    return false;
+    return true;
 }
 
 static void dump_covariances(const std::string & output_dir) {
@@ -346,15 +373,30 @@ int main(int argc, char ** argv) {
 
     LOG_INF("processing %zu tokens...\n", tokens.size());
 
-    // Process in chunks to avoid OOM.
+    // Process in chunks to avoid OOM. Each chunk is an independent window:
+    // clear the cache and restart positions at 0. The slot finder never evicts
+    // cells of the same sequence, and M-RoPE (this model) requires strictly
+    // increasing positions across decodes, so a cleared cache (X = -1 < Y = 0)
+    // is the only pattern that works for corpora longer than n_ctx.
     const int n_ctx = llama_n_ctx(ctx);
     for (size_t i = 0; i < tokens.size(); i += n_ctx) {
         size_t n = std::min((size_t)n_ctx, tokens.size() - i);
-        llama_batch batch = llama_batch_get_one(tokens.data() + i, n);
+        llama_memory_clear(llama_get_memory(ctx), false);
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        for (size_t t = 0; t < n; ++t) {
+            batch.token[t]     = tokens[i + t];
+            batch.pos[t]       = (llama_pos)t;
+            batch.n_seq_id[t]  = 1;
+            batch.seq_id[t][0] = 0;
+            batch.logits[t]    = 1;
+        }
+        batch.n_tokens = n;
         if (llama_decode(ctx, batch)) {
             LOG_ERR("failed to decode at offset %zu\n", i);
+            llama_batch_free(batch);
             return 1;
         }
+        llama_batch_free(batch);
     }
 
     // Dump results.

@@ -1260,7 +1260,7 @@ static __global__ void set_rows_cuda_oscar2(
         const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
         const uint64_t nb10, const uint64_t nb11, const uint64_t nb12,
         const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3,
-        const int32_t nk0, const float clip_ratio) {
+        const int32_t nk0, const float clip_ratio, const bool no_hadamard) {
 
     const int32_t i03 = blockIdx.z;
     const int32_t i02 = blockIdx.y;
@@ -1301,21 +1301,25 @@ static __global__ void set_rows_cuda_oscar2(
         __syncthreads();
         const float mean = sh_wsum[0] / (float)QK_OSCAR2;
 
-        // Subtract mean, forward Hadamard, normalize
+        // Subtract mean, forward Hadamard, normalize. With LLAMA_KV_NO_HADAMARD=1
+        // the calibrated rotation baked in the GGUF already includes H, so the
+        // block stores the (centered) natural/rotated domain directly.
         sh_vals[t] -= mean;
         __syncthreads();
-        for (int h = 1; h < QK_OSCAR2; h <<= 1) {
-            if (!(t & h)) {
-                const float a = sh_vals[t];
-                const float b = sh_vals[t + h];
-                sh_vals[t]     = a + b;
-                sh_vals[t + h] = a - b;
+        if (!no_hadamard) {
+            for (int h = 1; h < QK_OSCAR2; h <<= 1) {
+                if (!(t & h)) {
+                    const float a = sh_vals[t];
+                    const float b = sh_vals[t + h];
+                    sh_vals[t]     = a + b;
+                    sh_vals[t + h] = a - b;
+                }
+                __syncthreads();
             }
+            const float s_had = rsqrtf((float)QK_OSCAR2);
+            sh_vals[t] *= s_had;
             __syncthreads();
         }
-        const float s_had = rsqrtf((float)QK_OSCAR2);
-        sh_vals[t] *= s_had;
-        __syncthreads();
 
         // OSCAR outlier clip: threshold = clip_ratio percentile over the 128 group,
         // exact rank counting (matches CPU qsort). Follows q2_0 pattern.
@@ -1401,7 +1405,7 @@ static __global__ void set_rows_cuda_oscar2_hp(
         const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
         const uint64_t nb10, const uint64_t nb11, const uint64_t nb12,
         const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3,
-        const int32_t nk0) {
+        const int32_t nk0, const bool no_hadamard) {
 
     const int32_t i03 = blockIdx.z;
     const int32_t i02 = blockIdx.y;
@@ -1427,18 +1431,21 @@ static __global__ void set_rows_cuda_oscar2_hp(
 
         // Forward normalized Hadamard (same butterfly as set_rows_cuda_oscar2;
         // no mean subtract - the HP tier needs no centering for exactness).
-        for (int h = 1; h < QK_OSCAR2; h <<= 1) {
-            if (!(t & h)) {
-                const float a = sh_vals[t];
-                const float b = sh_vals[t + h];
-                sh_vals[t]     = a + b;
-                sh_vals[t + h] = a - b;
+        // With LLAMA_KV_NO_HADAMARD=1 store the natural/rotated domain instead.
+        if (!no_hadamard) {
+            for (int h = 1; h < QK_OSCAR2; h <<= 1) {
+                if (!(t & h)) {
+                    const float a = sh_vals[t];
+                    const float b = sh_vals[t + h];
+                    sh_vals[t]     = a + b;
+                    sh_vals[t + h] = a - b;
+                }
+                __syncthreads();
             }
+            const float s_had = rsqrtf((float)QK_OSCAR2);
+            sh_vals[t] *= s_had;
             __syncthreads();
         }
-        const float s_had = rsqrtf((float)QK_OSCAR2);
-        sh_vals[t] *= s_had;
-        __syncthreads();
 
         dst_row[iv * QK_OSCAR2 + t] = __float2half(sh_vals[t]);
         __syncthreads();
@@ -1469,14 +1476,15 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             const char * src1_d = (const char *) src1->data;
             char       * dst_d  = (char *)       dst->data;
 
+            const bool no_hadamard = getenv("LLAMA_KV_NO_HADAMARD") != nullptr;
             if (src1->type == GGML_TYPE_I64) {
                 set_rows_cuda_oscar2_hp<int64_t><<<grid_size, block_size, 0, stream>>>(
                     src0_d, src1_d, dst_d,
-                    ne01, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, nk0);
+                    ne01, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, nk0, no_hadamard);
             } else {
                 set_rows_cuda_oscar2_hp<int32_t><<<grid_size, block_size, 0, stream>>>(
                     src0_d, src1_d, dst_d,
-                    ne01, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, nk0);
+                    ne01, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, nk0, no_hadamard);
             }
             GGML_ASSERT(cudaGetLastError() == cudaSuccess);
             return;
@@ -1487,6 +1495,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (const char * e = getenv("LLAMA_KV_CLIP_RATIO")) {
         clip_ratio = (float) atof(e);
     }
+    const bool no_hadamard = getenv("LLAMA_KV_NO_HADAMARD") != nullptr;
 
     if (dst->type == GGML_TYPE_OSCAR2) {
         GGML_TENSOR_BINARY_OP_LOCALS(src0, src1, dst);
@@ -1506,13 +1515,13 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 src0_d, src1_d, dst_d,
                 ne01, ne11, ne12,
                 nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
-                nk0, clip_ratio);
+                nk0, clip_ratio, no_hadamard);
         } else {
             set_rows_cuda_oscar2<int32_t><<<grid_size, block_size, 0, stream>>>(
                 src0_d, src1_d, dst_d,
                 ne01, ne11, ne12,
                 nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
-                nk0, clip_ratio);
+                nk0, clip_ratio, no_hadamard);
     }
         GGML_ASSERT(cudaGetLastError() == cudaSuccess);
         return;
