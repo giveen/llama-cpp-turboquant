@@ -154,8 +154,10 @@ is generated at runtime via Sylvester construction. Supports any power-of-2 head
 ### 4. HP (High-Precision) Sink+Recent Buffer — IMPLEMENTED (Aug 2, 2026)
 
 OSCAR two-tier KV: quantized LP + F16 HP sink/recent in one fused FA kernel.
-- Env: `LLAMA_KV_HP_SINK` (default 0), `LLAMA_KV_HP_RECENT` (default 0). Recommend
-  sink=64 recent=256 per the vLLM reference and the author's llama.cpp port.
+- Env: `LLAMA_KV_HP_SINK` (default 64), `LLAMA_KV_HP_RECENT` (default 256) - ON by
+  default for oscar2 caches (F16), per the vLLM reference and the author's llama.cpp
+  port. Set both to 0 to disable. Required: the 2-bit tier alone fails on standard
+  attention (KLD 1.5-6.3 at 512 ctx); HP recovers it (gemma4-12b: 6.27 -> 0.28).
 - HP K/V stored F16 in the **Hadamard domain** (forward normalized Hadamard, no mean
   subtract, no quantization) via a dedicated set_rows kernel; the oscar2 FA kernel
   attends them with zero error (Q is already transformed to the same domain).

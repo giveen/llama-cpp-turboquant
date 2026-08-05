@@ -231,21 +231,18 @@ llama_kv_cache::llama_kv_cache(
 
     // OSCAR-style HP (high-precision) sink+recent buffer (env: LLAMA_KV_HP_SINK, LLAMA_KV_HP_RECENT)
     // Only meaningful for INT2-style LP caches and requires flash attention (the graph gates on it).
+    // HP is REQUIRED for oscar2 quality: the 2-bit tier alone fails on standard
+    // attention (KLD 1.5-6.3 at 512 ctx across qwen3-8b/gemma4-12b/qwen2.5-1.5b),
+    // while sink=64/recent=256 F16 recovers it (gemma4-12b: KLD 6.27 -> 0.28).
+    // The 64/256 defaults match the reference port; set either env var to 0 to
+    // opt out.
     {
         const bool lp_is_int2 = (type_k == GGML_TYPE_OSCAR2 || type_v == GGML_TYPE_OSCAR2);
         if (hp_enabled && lp_is_int2) {
             const char * env_sink   = getenv("LLAMA_KV_HP_SINK");
             const char * env_recent = getenv("LLAMA_KV_HP_RECENT");
-            n_kv_sink   = env_sink   ? (uint32_t)atoi(env_sink)   : 0;
-            n_kv_recent = env_recent ? (uint32_t)atoi(env_recent) : 0;
-
-            // Gemma-4 with oscar2 INT2 K+V: the 2-bit quantization noise (err ~50% of signal)
-            // scrambles attention when scale=1.0 (no 1/sqrt(D) scaling). Keep the most recent
-            // context positions as F16 so local attention gets exact KQ. At 96 recent cells
-            // PPL drops from 12M to 1.2K; at 128 (full context) it reaches the f16 baseline.
-            if (n_kv_recent == 0 && model.arch == LLM_ARCH_GEMMA4) {
-                n_kv_recent = 96;
-            }
+            n_kv_sink   = env_sink   ? (uint32_t)atoi(env_sink)   : 64;
+            n_kv_recent = env_recent ? (uint32_t)atoi(env_recent) : 256;
 
             n_hp_total  = n_kv_sink + n_kv_recent;
             if (n_hp_total > 0) {

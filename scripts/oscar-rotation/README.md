@@ -83,8 +83,8 @@ python3 scripts/oscar-rotation/export_rot_kv_gguf.py \
     -f wikitext-2-raw/wiki.test.raw -c 128
 ```
 
-For Gemma 4, HP (high-precision) sink+recent buffer auto-enables with 96 recent cells.
-Override with `LLAMA_KV_HP_RECENT=N` (128 = full context, matches f16 quality).
+
+
 
 ## Files
 
