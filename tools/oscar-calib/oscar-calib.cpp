@@ -15,6 +15,8 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "../ggml/src/ggml-quants.h"
+#include "../ggml/src/ggml-common.h"
 
 #include <clocale>
 #include <cmath>
@@ -119,7 +121,7 @@ static bool calib_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         const size_t dash = s.rfind('-');
         if (dash == std::string::npos) return false;
         const std::string prefix = s.substr(0, dash);
-        if (prefix == "Qcur" || prefix == "Vcur" || prefix == "wqkv") {
+        if (prefix == "Qcur" || prefix == "Vcur" || prefix == "wqkv" || prefix == "Kcur") {
             return true;
         }
         return false;
@@ -253,6 +255,28 @@ static bool calib_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
             acc_v_tok(data + (size_t) tok * ne0 + v_off, d * nhkv);
         }
         acc.n_tokens += n_tok;
+    }
+
+    if (suffix == "Kcur" && layer == 0) {
+        // Codec health check: round-trip the first layer's K through the CPU
+        // oscar2 quantizer and report mean NMSE. Expect ~0.117 (2-bit Lloyd-Max
+        // theoretical optimum); a much larger value means the store/FA domains
+        // drifted apart.
+        const int d = acc.n_embd_head > 0 ? acc.n_embd_head : ne0;
+        if (d > 0 && ne0 % d == 0 && ggml_nelements(t) % 128 == 0) {
+            const size_t n = ggml_nelements(t);
+            std::vector<float> recon(n);
+            std::vector<uint8_t> blk(n / 128 * sizeof(block_oscar2));
+            auto * traits = ggml_get_type_traits(GGML_TYPE_OSCAR2);
+            traits->from_float_ref(data, blk.data(), n);
+            traits->to_float(blk.data(), recon.data(), n);
+            double se = 0.0, s2 = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                se += (double)(recon[i] - data[i]) * (recon[i] - data[i]);
+                s2 += (double)data[i] * data[i];
+            }
+            fprintf(stderr, "KNMSE: layer0 K nmse = %.4f (n=%zu)\n", se / (s2 > 0 ? s2 : 1), n);
+        }
     }
 
     return true;
