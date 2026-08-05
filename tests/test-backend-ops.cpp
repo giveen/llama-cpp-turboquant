@@ -7092,7 +7092,7 @@ struct test_flash_attn_ext : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        return (type_K == GGML_TYPE_OSCAR2 || type_V == GGML_TYPE_OSCAR2) ? 1e-2 : 5e-4;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -7134,14 +7134,16 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        // OSCAR2 K/V have no canonical byte layout across backends: the CPU store
-        // quantizes in the natural domain (with P_br), the CUDA store writes the
-        // Hadamard domain. The generic harness initializes K/V through the CPU
-        // quantize path (ggml_quantize_chunk), which the CUDA FA kernel cannot
-        // decode (garbage scores, ERR ~ 1). Route OSCAR2 K/V through SET_ROWS so
-        // each backend stores rows in its own domain; the attention output is
-        // domain-invariant, so comparing only the final node (run_whole_graph)
-        // still validates the store+FA pipeline end-to-end.
+        // OSCAR2 K/V have no canonical byte layout across backends: both CPU and
+        // CUDA stores write the Hadamard domain, but their blocks can differ in
+        // fp16 d/m rounding (different reduction orders). The generic harness
+        // initializes K/V through the CPU quantize path (ggml_quantize_chunk),
+        // which the CUDA FA kernel cannot decode (garbage scores, ERR ~ 1).
+        // Route OSCAR2 K/V through SET_ROWS so each backend stores rows itself;
+        // the attention output is domain-invariant, so comparing only the final
+        // node (run_whole_graph) still validates the store+FA pipeline
+        // end-to-end (within the quantization-noise tolerance set by
+        // max_nmse_err for oscar2).
         ggml_tensor * k;
         if (type_K == GGML_TYPE_OSCAR2) {
             ggml_tensor * k_dst = ggml_new_tensor_4d(ctx, type_K, hsk_padded, kv, nh, nr23[1]);
@@ -10049,7 +10051,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
 
-    // OSCAR2 KV cache: asymmetric INT2 with no Hadamard.
+    // OSCAR2 KV cache: 2-bit Lloyd-Max INT2 stored in the Hadamard domain.
     // Head dim 128 = one oscar2 block per vector.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
@@ -10403,7 +10405,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
 
-    // OSCAR2 KV cache: asymmetric INT2, no Hadamard.
+    // OSCAR2 KV cache: 2-bit Lloyd-Max INT2 stored in the Hadamard domain.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));

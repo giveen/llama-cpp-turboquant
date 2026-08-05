@@ -16,8 +16,9 @@
 // ggml-common.h declares these as static const, but the CUDA compiler does
 // not make them visible in __device__ code for arrays > ~64 bytes. These
 // __device__ copies ensure the FA kernel can access them.
-// Note: P_br (bit-reversal permutation from the OSCAR paper) is CPU-only;
-// the GPU set_rows kernel does not apply it, so P_BR_DEV is not declared here.
+// Note: P_br (bit-reversal permutation from the OSCAR paper) is applied by
+// neither the CPU nor the GPU store kernel (see ggml-common.h rationale), so
+// P_BR_DEV is not declared here.
 static __device__ const float OSCAR2_CENTROIDS_DEV[4] = {-1.510257f, -0.452734f, 0.452734f, 1.510257f};
 
 // ---------------------------------------------------------------------------
@@ -56,7 +57,7 @@ static __device__ void hadamard_inverse_128_32w(float * sh, int tid) {
 // Main kernel
 // ---------------------------------------------------------------------------
 
-template <int D, int ncols, bool use_logit_softcap, ggml_type type_K, ggml_type type_V>
+template <int D, int ncols, bool use_logit_softcap>
 static __global__ void flash_attn_ext_oscar2(
         const char  * Q_ptr,
         const char  * K_ptr,
@@ -570,7 +571,7 @@ static void launch_fattn_oscar2(
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int D, ggml_type type_K, ggml_type type_V>
+template <int D>
 void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
@@ -604,18 +605,18 @@ void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_
     auto launch = [&](int ncols_val, bool lsc) {
         if (lsc) {
             switch (ncols_val) {
-                case 1: { auto k = flash_attn_ext_oscar2<D, 1, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
-                case 2: { auto k = flash_attn_ext_oscar2<D, 2, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
-                case 4: { auto k = flash_attn_ext_oscar2<D, 4, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
-                case 8: { auto k = flash_attn_ext_oscar2<D, 8, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 1: { auto k = flash_attn_ext_oscar2<D, 1, true>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 2: { auto k = flash_attn_ext_oscar2<D, 2, true>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 4: { auto k = flash_attn_ext_oscar2<D, 4, true>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 8: { auto k = flash_attn_ext_oscar2<D, 8, true>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
                 default: GGML_ABORT("unsupported ncols for oscar2 FA"); break;
             }
         } else {
             switch (ncols_val) {
-                case 1: { auto k = flash_attn_ext_oscar2<D, 1, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
-                case 2: { auto k = flash_attn_ext_oscar2<D, 2, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
-                case 4: { auto k = flash_attn_ext_oscar2<D, 4, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
-                case 8: { auto k = flash_attn_ext_oscar2<D, 8, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 1: { auto k = flash_attn_ext_oscar2<D, 1, false>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 2: { auto k = flash_attn_ext_oscar2<D, 2, false>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 4: { auto k = flash_attn_ext_oscar2<D, 4, false>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 8: { auto k = flash_attn_ext_oscar2<D, 8, false>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
                 default: GGML_ABORT("unsupported ncols for oscar2 FA"); break;
             }
         }

@@ -475,12 +475,14 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
         }
     }
 }
-// Bit-reversal permutation P_br for OSCAR2 (OSCAR paper: R.H.P_br).
-// Enabled by default via LLAMA_KV_OSCAR2_PBR=1.
-// OSCAR2 store pipeline (matches set_rows_cuda_oscar2 bit-for-bit): subtract
-// mean -> forward normalized Hadamard (H/sqrt(128)) -> RMS scale -> Lloyd-Max
-// encode. The Hadamard domain is what the fused FA kernels consume, so CPU and
-// CUDA produce byte-identical blocks.
+// OSCAR2 store pipeline (matches set_rows_cuda_oscar2): subtract mean ->
+// forward normalized Hadamard (H/sqrt(128)) -> RMS scale -> Lloyd-Max encode.
+// The Hadamard domain is what the fused FA kernels consume. CPU and CUDA use
+// the same pipeline; block bytes can differ only by fp16 rounding of d/m from
+// different reduction orders (sequential vs warp-shuffle), never by domain.
+// The paper's P_br bit-reversal is deliberately omitted: within a single
+// 128-wide quant group it is a coefficient permutation, which has no effect on
+// elementwise Lloyd-Max encoding or the permutation-invariant RMS scale.
 
 void dequantize_row_oscar2(const block_oscar2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_OSCAR2 == 0);

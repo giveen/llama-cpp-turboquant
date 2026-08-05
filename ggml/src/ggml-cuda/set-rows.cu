@@ -1250,8 +1250,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 }
 
 
-// OSCAR2 set-rows: per-vector (128-dim) min-max asymmetric INT2 quantize + scatter.
-// 128 threads per block, one per element. No rotation (done separately as GEMM).
+// OSCAR2 set-rows: per-vector (128-dim) Lloyd-Max INT2 quantize + scatter.
+// 128 threads per block, one per element. Applies the normalized Hadamard
+// transform; the calibrated rotation (if any) is done separately as a GEMM.
 template <typename idx_t>
 static __global__ void set_rows_cuda_oscar2(
         const char * src0, const char * src1, char * dst,

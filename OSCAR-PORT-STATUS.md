@@ -24,7 +24,7 @@ Cross-port vLLM's OSCAR INT2 quantization (`GGML_TYPE_OSCAR2`) into
 
 OSCAR differs from the existing q2_0 KV cache type:
 - **q2_0**: Lloyd-Max centroids, block_size=32, 128-wide Hadamard groups, mean subtraction
-- **OSCAR2**: Asymmetric min-max linear quantization, block_size=128, no Hadamard
+- **OSCAR2**: Lloyd-Max INT2 (block_size=128) in the Hadamard domain, per-block mean
 
 **Hardware**: RTX 5090 (Blackwell), 32GB VRAM
 **Model**: Gemma-4-12B-it (rotated KV, D=256/512 head dim)
@@ -304,14 +304,17 @@ python3 scripts/oscar-rotation/generate_and_bake_rot.py \
 
 ## CPU/GPU Quant Divergence Note
 
-The CPU and GPU quant paths for oscar2 produce **different block semantics**:
-- **CPU** (`quantize_row_oscar2_ref` in `ggml-quants.c`): applies optional
-  P_br (bit-reversal) permutation but NO Hadamard transform. Natural domain values.
-- **GPU** (`set_rows_cuda_oscar2` in `set-rows.cu`): applies forward
-  normalized Hadamard (mean subtract -> H -> /sqrt(128)) but NO P_br. Hadamard domain.
+The CPU and GPU quant paths for oscar2 run the **same pipeline**: subtract mean ->
+forward normalized Hadamard (H/sqrt(128)) -> RMS scale -> Lloyd-Max encode, with
+no P_br permutation. Both paths therefore produce Hadamard-domain blocks and the
+fused FA kernels consume them directly.
 
-Internally consistent within each path, but blocks from one path MUST NOT cross into
-the other. The `P_BR_DEV` table was removed from `fattn-oscar2.cuh` as dead code.
+The only divergence is numerical, not semantic: CPU reduces the mean/RMS
+sequentially, CUDA uses warp shuffles, so the fp16 `d`/`m` fields can round
+differently at the last bit. Blocks from one path are still decodable by the
+other; there is no domain mismatch. (The old claim that CPU stores natural-domain
+values with P_br and GPU stores Hadamard-domain values is wrong for the current
+code and was removed.)
 
 ---
 

@@ -478,17 +478,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // inverse Hadamard transform, so set_rows-stored Hadamard-domain values would
     // be incorrectly interpreted as natural-domain values. The dedicated FA kernel
     // (BEST_FATTN_KERNEL_OSCAR2) is the only correct path.
-    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2)  // DISABLED
-    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_F16)     // DISABLED
-    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_OSCAR2)    // DISABLED
-    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0)    // DISABLED
-    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_OSCAR2)   // DISABLED
-    // D=512 (Gemma4) OSCAR2 VEC combinatorics — DISABLED
-    // FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2)    // DISABLED
-    // FATTN_VEC_CASE(512, GGML_TYPE_F16,    GGML_TYPE_OSCAR2)    // DISABLED
-    // FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_F16)       // DISABLED
-    // FATTN_VEC_CASE(512, GGML_TYPE_Q8_0,   GGML_TYPE_OSCAR2)    // DISABLED
-    // FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0)      // DISABLED
 
     GGML_ABORT("fatal error");
 }
@@ -500,37 +489,14 @@ static void ggml_cuda_flash_attn_ext_oscar2(ggml_backend_cuda_context & ctx, ggm
 
     const int32_t D = Q->ne[0];
 
-    const ggml_type type_K = K->type;
-    const ggml_type type_V = V->type;
+    // Only K=V=OSCAR2 reaches this dispatch (ggml_cuda_get_best_fattn_kernel).
+    // The kernel reads both K and V as block_oscar2; keep the explicit check
+    // so a future dispatch change fails loudly instead of misreading types.
+    GGML_ASSERT(K->type == GGML_TYPE_OSCAR2 && V->type == GGML_TYPE_OSCAR2);
 
-#define DISPATCH_OSCAR2(DIM)                                                        \
-    switch (type_K) {                                                               \
-        case GGML_TYPE_OSCAR2:                                                      \
-            switch (type_V) {                                                       \
-                case GGML_TYPE_OSCAR2: ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return; \
-                case GGML_TYPE_F16:  ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_F16> (ctx, dst); return; \
-                case GGML_TYPE_Q8_0: ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ctx, dst); return; \
-                default: break;                                                     \
-            }                                                                       \
-            break;                                                                  \
-        case GGML_TYPE_F16:                                                         \
-            if (type_V == GGML_TYPE_OSCAR2) {                                       \
-                ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ctx, dst); return; \
-            }                                                                       \
-            break;                                                                  \
-        case GGML_TYPE_Q8_0:                                                        \
-            if (type_V == GGML_TYPE_OSCAR2) {                                       \
-                ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_Q8_0, GGML_TYPE_OSCAR2>(ctx, dst); return; \
-            }                                                                       \
-            break;                                                                  \
-        default: break;                                                             \
-    }
-
-    if (D == 128) { DISPATCH_OSCAR2(128); }
-    if (D == 256) { DISPATCH_OSCAR2(256); }
-    if (D == 512) { DISPATCH_OSCAR2(512); }
-
-#undef DISPATCH_OSCAR2
+    if (D == 128) { ggml_cuda_flash_attn_ext_oscar2_case<128>(ctx, dst); return; }
+    if (D == 256) { ggml_cuda_flash_attn_ext_oscar2_case<256>(ctx, dst); return; }
+    if (D == 512) { ggml_cuda_flash_attn_ext_oscar2_case<512>(ctx, dst); return; }
 
     GGML_ABORT("fatal error");
 }
@@ -613,10 +579,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // D=64 is not supported because QK_OSCAR2=128 and the kernel template enforces
     // D >= QK_OSCAR2 && D % QK_OSCAR2 == 0 via static_assert; fall through to NONE.
     // TILE/VEC/MMA paths lack inverse Hadamard and would produce garbage for
-    // Hadamard-domain OSCAR2 values.
+    // Hadamard-domain OSCAR2 values. The kernel always reads both K and V as
+    // block_oscar2, so a mixed pairing (K=OSCAR2, V=f16/q8_0 or vice versa) is
+    // unsupported and must NOT reach the oscar2 kernel: return NONE and let the
+    // graph fall back / fail instead of silently misreading the other tensor.
     if (K->type == GGML_TYPE_OSCAR2 || V->type == GGML_TYPE_OSCAR2) {
         const int D = K->ne[0];
-        if (D == 128 || D == 256 || D == 512) {
+        if (K->type == GGML_TYPE_OSCAR2 && V->type == GGML_TYPE_OSCAR2 &&
+                (D == 128 || D == 256 || D == 512)) {
             return BEST_FATTN_KERNEL_OSCAR2;
         }
         return BEST_FATTN_KERNEL_NONE;

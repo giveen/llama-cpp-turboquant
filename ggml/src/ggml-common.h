@@ -295,7 +295,8 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 // separately; the centered Hadamard coefficients have a ~0 DC bin.
 // P_br (paper R.H.P_br) is omitted: with a single 128-wide quant group the
 // permutation has no numerical effect, and omitting it keeps CPU/CUDA stores
-// byte-identical.
+// numerically consistent (block bytes can differ only by fp16 rounding of d/m
+// from different reduction orders).
 #define QK_OSCAR2 128
 typedef struct {
     uint8_t    qs[QK_OSCAR2 / 4];   // 32 bytes: 4 two-bit codes per byte

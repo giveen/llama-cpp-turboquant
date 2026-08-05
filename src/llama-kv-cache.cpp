@@ -164,24 +164,23 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // oscar2 auto-alignment: the dedicated oscar2 FA kernel always reads both K
-    // and V as block_oscar2 (ignoring its type_K/type_V template params) and
-    // Hadamard-transforms Q. The only non-oscar2 type the dispatch supports is
-    // f16 (f32 is promoted to f16). Any other quantized type (q8_0, turbo4, etc.)
-    // causes a fatal error in the oscar2 FA dispatch. Force-alignment to oscar2.
+    // oscar2 auto-alignment: the dedicated oscar2 FA kernel reads both K and V
+    // as block_oscar2 and Hadamard-transforms Q, so it only supports
+    // K=V=OSCAR2 (ggml_cuda_get_best_fattn_kernel rejects every mixed pairing,
+    // including f16/f32, which the kernel would otherwise misread as quantized
+    // blocks). When exactly one side is oscar2, upgrade the other side so the
+    // FA path runs instead of falling back to an abort on CPU.
     {
         const bool k_is_oscar2 = (type_k == GGML_TYPE_OSCAR2);
         const bool v_is_oscar2 = (type_v == GGML_TYPE_OSCAR2);
-        const bool k_is_f16    = (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_F32);
-        const bool v_is_f16    = (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_F32);
-        if (k_is_oscar2 && !v_is_oscar2 && !v_is_f16) {
-            LLAMA_LOG_WARN("%s: oscar2 FA dispatch only accepts oscar2 or f16 — "
+        if (k_is_oscar2 && !v_is_oscar2) {
+            LLAMA_LOG_WARN("%s: oscar2 FA requires K=V=OSCAR2 — "
                            "upgrading V from %s to oscar2\n",
                            __func__, ggml_type_name(type_v));
             type_v = GGML_TYPE_OSCAR2;
         }
-        if (v_is_oscar2 && !k_is_oscar2 && !k_is_f16) {
-            LLAMA_LOG_WARN("%s: oscar2 FA dispatch only accepts oscar2 or f16 — "
+        if (v_is_oscar2 && !k_is_oscar2) {
+            LLAMA_LOG_WARN("%s: oscar2 FA requires K=V=OSCAR2 — "
                            "upgrading K from %s to oscar2\n",
                            __func__, ggml_type_name(type_k));
             type_k = GGML_TYPE_OSCAR2;
