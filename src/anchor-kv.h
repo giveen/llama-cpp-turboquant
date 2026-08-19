@@ -167,4 +167,15 @@ int anchor_kv_max_residuals(int S, int D, int W, float theta);
  */
 void anchor_kv_get_wht_signs(float * signs, int d, uint32_t seed = ANCHOR_KV_SEED);
 
+/*
+ * Dequantize a single 2-bit residual from packed codes.
+ * Used by the decode kernel to reconstruct KV on-the-fly.
+ */
+void anchor_kv_dequantize_residual(
+    const uint8_t * codes,  /* [D/4] packed 2-bit codes */
+    int D,
+    float scale,            /* absmax scale */
+    float * out             /* [D] reconstructed residual */
+);
+
 #endif /* ANCHOR_KV_H */

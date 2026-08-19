@@ -203,6 +203,14 @@ static utility_scores_t score_utilities(
     return util;
 }
 
+void anchor_kv_dequantize_residual(
+    const uint8_t * codes, int D, float scale, float * out
+) {
+    std::vector<float> signs(D);
+    anchor_kv_get_wht_signs(signs.data(), D, ANCHOR_KV_SEED);
+    dequantize_residual_2bit(codes, D, scale, signs.data(), out);
+}
+
 /* ---------- Per-head compression ---------- */
 
 static anchor_kv_head compress_head(
