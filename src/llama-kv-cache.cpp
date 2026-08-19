@@ -618,6 +618,15 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // AnchorKV: enable via ANCHOR_KV_THETA env var (e.g. "0.1" for 10x compression)
+    const char * anchor_theta_env = getenv("ANCHOR_KV_THETA");
+    if (anchor_theta_env) {
+        anchor_kv_enabled = true;
+        anchor_kv_params.theta = atof(anchor_theta_env);
+        LLAMA_LOG_INFO("%s: AnchorKV enabled, theta=%.3f (%.1fx compression)\n",
+                       __func__, anchor_kv_params.theta, 1.0f / anchor_kv_params.theta);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1476,6 +1485,56 @@ ggml_type llama_kv_cache::type_k() const {
 
 ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
+}
+
+/* ---------- AnchorKV compression ---------- */
+
+void llama_kv_cache::anchor_kv_compress_all() {
+    if (!anchor_kv_enabled) return;
+
+    const int32_t n_layer = (int32_t) layers.size();
+    anchor_kv_data.resize(n_layer);
+
+    for (int32_t il = 0; il < n_layer; il++) {
+        const kv_layer & layer = layers[il];
+
+        /* Get tensor dimensions */
+        const int64_t S = layer.k->ne[1];  /* kv_size (sequence length) */
+        const int32_t n_embd_k_gqa = (int32_t) layer.k->ne[0];
+        const int32_t n_embd_v_gqa = (int32_t) layer.v->ne[0];
+        const uint32_t head_k = hparams.n_embd_head_k(il);
+        const uint32_t head_v = hparams.n_embd_head_v(il);
+        const int32_t n_head_kv_k = n_embd_k_gqa / head_k;
+        const int32_t n_head_kv_v = n_embd_v_gqa / head_v;
+
+        /* Read dense K/V from GPU/CPU into float arrays */
+        std::vector<float> keys(n_head_kv_k * S * head_k);
+        std::vector<float> values(n_head_kv_v * S * head_v);
+
+        ggml_backend_tensor_get(layer.k, keys.data(), 0, keys.size() * sizeof(float));
+        ggml_backend_tensor_get(layer.v, values.data(), 0, values.size() * sizeof(float));
+
+        /* Compress */
+        anchor_kv_data[il] = anchor_kv_compress(
+            keys.data(), values.data(),
+            (int)S, (int)head_k, n_head_kv_k,
+            anchor_kv_params
+        );
+
+        LLAMA_LOG_INFO("%s: layer %d compressed: %d heads, %d anchors, "
+                       "K residuals=%d, V residuals=%d\n",
+                       __func__, il, n_head_kv_k,
+                       anchor_kv_data[il].heads[0].k,
+                       anchor_kv_data[il].heads[0].n_K,
+                       anchor_kv_data[il].heads[0].n_V);
+    }
+}
+
+const anchor_kv_layer * llama_kv_cache::get_anchor_kv_layer(int32_t il) const {
+    if (!anchor_kv_enabled || il < 0 || (size_t) il >= anchor_kv_data.size()) {
+        return nullptr;
+    }
+    return &anchor_kv_data[il];
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {

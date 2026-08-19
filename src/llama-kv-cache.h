@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "anchor-kv.h"
 
 #include <unordered_map>
 #include <vector>
@@ -163,6 +164,11 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // AnchorKV: compress the dense cache after prefill
+    void anchor_kv_compress_all();
+    bool get_anchor_kv_enabled() const { return anchor_kv_enabled; }
+    const anchor_kv_layer * get_anchor_kv_layer(int32_t il) const;
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
     //
     // graph_build API
@@ -299,6 +305,11 @@ private:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;
+
+    // AnchorKV: per-layer compressed representation (populated after prefill)
+    bool anchor_kv_enabled = false;
+    anchor_kv_params anchor_kv_params;
+    std::vector<anchor_kv_layer> anchor_kv_data;  // one per cache layer
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
