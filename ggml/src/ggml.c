@@ -6396,7 +6396,10 @@ struct ggml_tensor * ggml_anchor_decompress(
         struct ggml_tensor  * v_res_codes,
         struct ggml_tensor  * v_res_scales,
         bool                  is_k,
-        struct ggml_tensor  * prev_dep) {
+        struct ggml_tensor  * prev_dep,
+        int                   n_rot,
+        float                 freq_base,
+        float                 freq_scale) {
     GGML_ASSERT(dst->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
     GGML_ASSERT(anchors->type == GGML_TYPE_F32 && anchors->ne[1] == 2);
@@ -6449,6 +6452,9 @@ struct ggml_tensor * ggml_anchor_decompress(
 
     const int32_t is_k_i32 = is_k ? 1 : 0;
     ggml_set_op_params_i32(result, 0, is_k_i32);
+    ggml_set_op_params_i32(result, 1, n_rot);
+    ggml_set_op_params_f32(result, 2, freq_base);
+    ggml_set_op_params_f32(result, 3, freq_scale);
 
     return result;
 }

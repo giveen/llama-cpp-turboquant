@@ -2618,6 +2618,12 @@ extern "C" {
     //   dependency graph (src[]/topological order) forces this decompress to run
     //   after the previous layer's uses of the shared buffer are done, instead of
     //   relying on the incidental order graph-build calls happen to occur in.
+    // n_rot/freq_base/freq_scale: RoPE parameters for this layer (K side only -
+    //   ignored for V). The compressed representation is stored in PRE-RoPE
+    //   space (anchor selection/projection happens before RoPE is applied, see
+    //   llama_kv_cache::anchor_kv_compress_all), so reconstructed K rows need
+    //   the FORWARD per-position NEOX rotation re-applied here before they are
+    //   usable as real (post-RoPE) cache keys. Absolute position == row index t.
     GGML_API struct ggml_tensor * ggml_anchor_decompress(
             struct ggml_context * ctx,
             struct ggml_tensor  * dst,
@@ -2630,7 +2636,10 @@ extern "C" {
             struct ggml_tensor  * v_res_codes,
             struct ggml_tensor  * v_res_scales,
             bool                  is_k,
-            struct ggml_tensor  * prev_dep);
+            struct ggml_tensor  * prev_dep,
+            int                   n_rot,
+            float                 freq_base,
+            float                 freq_scale);
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

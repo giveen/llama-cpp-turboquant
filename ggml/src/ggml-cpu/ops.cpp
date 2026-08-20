@@ -11388,6 +11388,40 @@ static void anchor_cpu_wht_inverse(float * x, int d, const float * signs) {
     for (int i = 0; i < d; i++) x[i] *= signs[i];
 }
 
+// AnchorKV reconstruction must re-apply the per-position NEOX RoPE rotation to
+// the K side: the compressed representation stores anchor projections/residuals
+// in PRE-RoPE space (see anchor_kv_compress_all's inverse-RoPE pass in
+// llama-kv-cache.cpp), so every reconstructed key needs the FORWARD rotation for
+// its own absolute position before it can be used as a real (post-RoPE) cache
+// key. V is never rotated and must not go through this. Formula mirrors the
+// NEOX branch of ggml_rope_cache_init / rotate_pairs in this file exactly
+// (forward rotation: sin_sign = +1), just fused per-token instead of precomputed
+// into a cos/sin cache. dims >= n_rot (partial rotary) are left untouched.
+static void anchor_cpu_rope_forward_neox(float * x, int n_rot, int64_t t, float freq_base, float freq_scale) {
+    if (n_rot <= 0) {
+        return;
+    }
+
+    const float theta_scale = powf(freq_base, -2.0f / n_rot);
+    const int n_offset = n_rot / 2;
+
+    float theta = (float) t;
+    for (int i0 = 0; i0 < n_rot; i0 += 2) {
+        const float cos_theta = cosf(theta * freq_scale);
+        const float sin_theta = sinf(theta * freq_scale);
+
+        const int ic = i0 / 2;
+
+        const float x0 = x[ic];
+        const float x1 = x[ic + n_offset];
+
+        x[ic]            = x0 * cos_theta - x1 * sin_theta;
+        x[ic + n_offset] = x0 * sin_theta + x1 * cos_theta;
+
+        theta *= theta_scale;
+    }
+}
+
 static void ggml_compute_forward_anchor_decompress_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -11405,6 +11439,10 @@ static void ggml_compute_forward_anchor_decompress_f16(
 
     int is_k = 0;
     memcpy(&is_k, dst->op_params, sizeof(int));
+
+    const int   n_rot      = ggml_get_op_params_i32(dst, 1);
+    const float freq_base  = ggml_get_op_params_f32(dst, 2);
+    const float freq_scale = ggml_get_op_params_f32(dst, 3);
 
     const int n_heads = (int) anchors->ne[0];
     const int k       = (int) anchors->ne[2];
@@ -11460,14 +11498,27 @@ static void ggml_compute_forward_anchor_decompress_f16(
                 }
                 anchor_cpu_wht_inverse(deq, D, signs);
                 const float scale = scales[0];
+
+                float tilde[128];
                 for (int d = 0; d < D; d++) {
-                    const float val = g * anchor_vec[d] + deq[d] * scale;
-                    dst_data[t * n_embd + h * D + d] = ggml_fp32_to_fp16(val);
+                    tilde[d] = g * anchor_vec[d] + deq[d] * scale;
+                }
+                if (side == 0) {
+                    anchor_cpu_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);
+                }
+                for (int d = 0; d < D; d++) {
+                    dst_data[t * n_embd + h * D + d] = ggml_fp32_to_fp16(tilde[d]);
                 }
             } else {
+                float tilde[128];
                 for (int d = 0; d < D; d++) {
-                    const float val = g * anchor_vec[d];
-                    dst_data[t * n_embd + h * D + d] = ggml_fp32_to_fp16(val);
+                    tilde[d] = g * anchor_vec[d];
+                }
+                if (side == 0) {
+                    anchor_cpu_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);
+                }
+                for (int d = 0; d < D; d++) {
+                    dst_data[t * n_embd + h * D + d] = ggml_fp32_to_fp16(tilde[d]);
                 }
             }
         }

@@ -164,6 +164,16 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // AnchorKV: RoPE needs the live cparams (freq_base/freq_scale overrides,
+    // yarn settings) for both the pre-compression inverse rotation and the
+    // in-graph reconstruction rotation. llama_kv_cache is constructed without
+    // a cparams reference (see the ctor above), so llama_context sets this
+    // once right after creating the memory object (see llama-context.cpp,
+    // just after model.create_memory()). cparams lives for the lifetime of
+    // the owning llama_context, which always outlives this cache, so storing
+    // the pointer is safe.
+    void anchor_kv_set_cparams(const llama_cparams & cparams) { anchor_cparams = &cparams; }
+
     // AnchorKV: compress the dense cache after prefill
     void anchor_kv_compress_all();
     bool get_anchor_kv_enabled() const { return anchor_kv_enabled; }
@@ -254,6 +264,11 @@ public:
 private:
     const llama_model & model;
     const llama_hparams & hparams;
+
+    // AnchorKV: set post-construction via anchor_kv_set_cparams() - see the
+    // doc comment on that method for why this can't be a constructor param
+    // or a plain reference member.
+    const llama_cparams * anchor_cparams = nullptr;
 
     struct kv_layer {
         // layer index in the model

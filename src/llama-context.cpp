@@ -419,6 +419,19 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // AnchorKV: llama_kv_cache is constructed without a cparams reference
+        // (it only takes model/hparams - see llama_model::create_memory call
+        // sites), but anchor_kv_compress_all() and anchor_kv_build_decompress()
+        // need the live freq_base/freq_scale/yarn settings (including any
+        // --rope-freq-* overrides) to correctly invert/re-apply RoPE around
+        // the compressed representation. Wire it in once here, right after
+        // construction; `cparams` outlives `memory` for the lifetime of this
+        // llama_context, so storing a pointer to it is safe. No-op for memory
+        // types other than the plain KV cache (dynamic_cast returns nullptr).
+        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+            kv->anchor_kv_set_cparams(cparams);
+        }
     }
 
     // init backends

@@ -57,6 +57,39 @@ __device__ void anchor_decompress_wht_inverse(float * x, int d) {
     for (int i = 0; i < d; i++) x[i] *= ANCHOR_DECOMPRESS_SIGNS[i];
 }
 
+// AnchorKV reconstruction must re-apply the per-position NEOX RoPE rotation to
+// the K side: the compressed representation stores anchor projections/residuals
+// in PRE-RoPE space (see anchor_kv_compress_all's inverse-RoPE pass in
+// llama-kv-cache.cpp), so every reconstructed key needs the FORWARD rotation for
+// its own absolute position before it can be used as a real (post-RoPE) cache
+// key. V is never rotated and must not go through this. Must match the CPU
+// reference exactly (ggml/src/ggml-cpu/ops.cpp, anchor_cpu_rope_forward_neox).
+// dims >= n_rot (partial rotary) are left untouched.
+__device__ void anchor_decompress_rope_forward_neox(float * x, int n_rot, int64_t t, float freq_base, float freq_scale) {
+    if (n_rot <= 0) {
+        return;
+    }
+
+    const float theta_scale = powf(freq_base, -2.0f / n_rot);
+    const int n_offset = n_rot / 2;
+
+    float theta = (float) t;
+    for (int i0 = 0; i0 < n_rot; i0 += 2) {
+        const float cos_theta = cosf(theta * freq_scale);
+        const float sin_theta = sinf(theta * freq_scale);
+
+        const int ic = i0 / 2;
+
+        const float x0 = x[ic];
+        const float x1 = x[ic + n_offset];
+
+        x[ic]            = x0 * cos_theta - x1 * sin_theta;
+        x[ic + n_offset] = x0 * sin_theta + x1 * cos_theta;
+
+        theta *= theta_scale;
+    }
+}
+
 // One thread per KV position. Reconstructs every head of that position.
 __global__ void anchor_decompress_kernel(
     const float * __restrict__ anchors,       // [n_heads, 2, k, D] f32
@@ -69,7 +102,8 @@ __global__ void anchor_decompress_kernel(
     const float * __restrict__ v_res_scales,  // [n_heads, n_V] f32
     __half * __restrict__ dst,                // [n_embd_gqa, kv_size] f16
     int S, int D, int k, int n_heads, int n_K, int n_V,
-    int64_t n_embd, int64_t kv_size, int side) {
+    int64_t n_embd, int64_t kv_size, int side,
+    int n_rot, float freq_base, float freq_scale) {
 
     const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     // Only positions [0, S) hold compressed data. Positions >= S are never
@@ -101,14 +135,27 @@ __global__ void anchor_decompress_kernel(
             }
             anchor_decompress_wht_inverse(deq, D);
             const float scale = scales[0];
+
+            float tilde[128];
             for (int d = 0; d < D; d++) {
-                const float val = g * anchor_vec[d] + deq[d] * scale;
-                dst[t * n_embd + h * D + d] = __float2half(val);
+                tilde[d] = g * anchor_vec[d] + deq[d] * scale;
+            }
+            if (side == 0) {
+                anchor_decompress_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);
+            }
+            for (int d = 0; d < D; d++) {
+                dst[t * n_embd + h * D + d] = __float2half(tilde[d]);
             }
         } else {
+            float tilde[128];
             for (int d = 0; d < D; d++) {
-                const float val = g * anchor_vec[d];
-                dst[t * n_embd + h * D + d] = __float2half(val);
+                tilde[d] = g * anchor_vec[d];
+            }
+            if (side == 0) {
+                anchor_decompress_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);
+            }
+            for (int d = 0; d < D; d++) {
+                dst[t * n_embd + h * D + d] = __float2half(tilde[d]);
             }
         }
     }
@@ -126,6 +173,10 @@ void ggml_cuda_anchor_decompress(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     int is_k = 0;
     memcpy(&is_k, dst->op_params, sizeof(int));
+
+    const int   n_rot      = ggml_get_op_params_i32(dst, 1);
+    const float freq_base  = ggml_get_op_params_f32(dst, 2);
+    const float freq_scale = ggml_get_op_params_f32(dst, 3);
 
     const int n_heads = (int) anchors->ne[0];
     const int k       = (int) anchors->ne[2];
@@ -154,5 +205,6 @@ void ggml_cuda_anchor_decompress(ggml_backend_cuda_context & ctx, ggml_tensor * 
         (const float *)   v_res_scales->data,
         (__half *)        dst->data,
         S, D, k, n_heads, n_K, n_V,
-        n_embd, kv_size, side);
+        n_embd, kv_size, side,
+        n_rot, freq_base, freq_scale);
 }

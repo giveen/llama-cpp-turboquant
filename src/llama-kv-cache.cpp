@@ -5,6 +5,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-cpu.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1552,6 +1554,107 @@ static void anchor_kv_relayout(
     }
 }
 
+// AnchorKV: invert the per-position RoPE rotation on dense K data in place.
+//
+// `keys` is the raw dense-cache layout [S, n_embd_k_gqa] (position-major,
+// head-major within a row - i.e. keys[t*n_embd_k_gqa + h*head_k + d]), the
+// same layout ggml_backend_tensor_get produced it in. Only the K side is
+// ever rotated by RoPE in this codebase - never call this for V.
+//
+// For Qwen3 (and every other RoPE model here), the dense K written into the
+// cache by cpy_k is POST-RoPE (RoPE is applied to Kcur before it's cached -
+// see e.g. src/models/qwen3.cpp). AnchorKV's anchor selection and per-token
+// gamma projection (anchor_kv_compress, src/anchor-kv.cpp) assume the
+// cosine-similarity structure of an UN-rotated key space (paper section 3.1);
+// RoPE is a per-ABSOLUTE-POSITION rotation, so it scrambles that structure
+// for every non-anchor token. This function undoes that rotation before the
+// compressor ever sees the data.
+//
+// Implementation: runs the REAL ggml_rope_ext CPU op with NEGATED position
+// (pos[t] = -t) instead of hand-deriving the inverse rotation formula. RoPE's
+// angle is linear in position (theta(p) = p * theta_scale^k), so running the
+// real forward op at position -t composes exactly to the inverse of the
+// rotation applied at position +t - this also means YaRN (if active) is
+// handled correctly for free, since YaRN's ramp/attn-factor depend on
+// frequency index, not the sign of the position.
+static void anchor_kv_invert_rope_k(
+        std::vector<float> & keys,
+        uint32_t S_used,
+        int      n_embd_k_gqa,
+        uint32_t head_k,
+        int      n_head_kv_k,
+        uint32_t n_rot,
+        uint32_t n_embd_nope,
+        int      rope_type,
+        int      n_ctx_orig,
+        float    freq_base,
+        float    freq_scale,
+        float    ext_factor,
+        float    attn_factor,
+        float    beta_fast,
+        float    beta_slow,
+        ggml_tensor * rope_factors) {
+    if (n_rot == 0) {
+        return;
+    }
+
+    const size_t mem_size =
+            (size_t) n_head_kv_k * S_used * n_rot * sizeof(float) * 2 +
+            (size_t) S_used * sizeof(int32_t) +
+            ggml_graph_overhead() +
+            16 * ggml_tensor_overhead() +
+            4096;
+
+    ggml_init_params rp = {
+        /* .mem_size   = */ mem_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+
+    ggml_context * rctx = ggml_init(rp);
+    if (!rctx) {
+        throw std::runtime_error("failed to create AnchorKV rope-inversion scratch context");
+    }
+
+    ggml_tensor * k_rot = ggml_new_tensor_3d(rctx, GGML_TYPE_F32, (int64_t) n_rot, n_head_kv_k, (int64_t) S_used);
+    ggml_tensor * pos   = ggml_new_tensor_1d(rctx, GGML_TYPE_I32, (int64_t) S_used);
+
+    // gather: pull just the n_rot rotary dims of every head/position out of
+    // the strided dense layout into a compact tensor rope can operate on
+    float   * k_rot_data = (float *)   k_rot->data;
+    int32_t * pos_data   = (int32_t *) pos->data;
+    for (uint32_t t = 0; t < S_used; t++) {
+        for (int h = 0; h < n_head_kv_k; h++) {
+            const float * src = &keys[(size_t) t * n_embd_k_gqa + (size_t) h * head_k + n_embd_nope];
+            float * dst = k_rot_data + ((size_t) t * n_head_kv_k + h) * n_rot;
+            memcpy(dst, src, n_rot * sizeof(float));
+        }
+        pos_data[t] = -(int32_t) t;
+    }
+
+    ggml_tensor * k_inv = ggml_rope_ext(rctx, k_rot, pos, rope_factors,
+            (int) n_rot, rope_type, n_ctx_orig,
+            freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+    ggml_cgraph * rgf = ggml_new_graph(rctx);
+    ggml_build_forward_expand(rgf, k_inv);
+    ggml_graph_compute_with_ctx(rctx, rgf, 1);
+
+    // scatter the inverted rotary dims back into their strided positions;
+    // the non-rotary dims (n_embd_nope of them, if any) are left untouched
+    const float * k_inv_data = (const float *) k_inv->data;
+    for (uint32_t t = 0; t < S_used; t++) {
+        for (int h = 0; h < n_head_kv_k; h++) {
+            float * dst = &keys[(size_t) t * n_embd_k_gqa + (size_t) h * head_k + n_embd_nope];
+            const float * src = k_inv_data + ((size_t) t * n_head_kv_k + h) * n_rot;
+            memcpy(dst, src, n_rot * sizeof(float));
+        }
+    }
+
+    ggml_free(rctx);
+}
+
 // helper: upload one layer's compressed representation as ggml tensors on the
 // layer's backend. Layouts are chosen to keep the decompress op at 8 srcs.
 void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
@@ -1745,6 +1848,49 @@ void llama_kv_cache::anchor_kv_compress_all() {
             }
         }
 
+        // AnchorKV: undo RoPE on K before compression - see anchor_kv_invert_rope_k
+        // doc above for why. V is never rotated, so `values` is untouched.
+        if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+            const uint32_t n_rot_layer = hparams.n_rot(layer.il);
+            const uint32_t n_embd_nope = hparams.n_lora_kv > 0 ? head_k - n_rot_layer : 0;
+
+            // MROPE/IMROPE workaround: same as build_rope_shift (see comment there) -
+            // a normal NEOX rotation is correct here too, we just need the ordering.
+            const int rope_type_eff =
+                (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE)
+                    ? LLAMA_ROPE_TYPE_NEOX
+                    : hparams.rope_type;
+
+            if (!anchor_cparams) {
+                LLAMA_LOG_WARN("%s: layer %d: AnchorKV cparams not set (anchor_kv_set_cparams was "
+                        "never called) - cannot invert RoPE before compression; compressing "
+                        "POST-RoPE keys, which is known to produce incoherent reconstructions\n",
+                        __func__, il);
+            } else {
+                const llama_cparams & cp = *anchor_cparams;
+
+                const float freq_base_l  = model.get_rope_freq_base (cp, layer.il);
+                const float freq_scale_l = model.get_rope_freq_scale(cp, layer.il);
+                ggml_tensor * rope_factors = model.get_rope_factors(cp, layer.il);
+
+                if (cp.yarn_ext_factor != 0.0f) {
+                    LLAMA_LOG_WARN("%s: layer %d: YaRN is active (ext_factor=%.3f) - the RoPE "
+                            "inversion below reuses the real ggml_rope_ext op so YaRN is handled "
+                            "correctly here, but the in-graph reconstruction kernel "
+                            "(GGML_OP_ANCHOR_DECOMPRESS) only implements the plain linear-scale "
+                            "rotation, so reconstructed keys will not exactly match under "
+                            "YaRN-extended contexts (out of scope for this fix)\n",
+                            __func__, il, cp.yarn_ext_factor);
+                }
+
+                anchor_kv_invert_rope_k(keys, S_used, n_embd_k_gqa, head_k, n_head_kv_k,
+                        n_rot_layer, n_embd_nope, rope_type_eff, (int) cp.n_ctx_orig_yarn,
+                        freq_base_l, freq_scale_l,
+                        cp.yarn_ext_factor, cp.yarn_attn_factor, cp.yarn_beta_fast, cp.yarn_beta_slow,
+                        rope_factors);
+            }
+        }
+
         // re-layout cache columns -> compressor head-major order
         std::vector<float> keys_hl((size_t) n_head_kv_k * S_used * head_k);
         std::vector<float> values_hl((size_t) n_head_kv_v * S_used * head_v);
@@ -1870,12 +2016,31 @@ ggml_tensor * llama_kv_cache::anchor_kv_build_decompress(ggml_context * ctx, int
     // so there is no previous-layer dependency to add.
     ggml_tensor *& chain = is_k ? anchor_chain_k : anchor_chain_v;
 
+    // AnchorKV: the compressed representation is stored in PRE-RoPE space (see
+    // anchor_kv_compress_all), so the K side needs the forward per-position
+    // NEOX rotation re-applied on reconstruction - see ggml_anchor_decompress
+    // doc and the CPU/CUDA kernels. V is never rotated; n_rot/freq_base/
+    // freq_scale are simply unused by the kernel when is_k is false, but we
+    // still compute them the same way for both to keep this call site simple.
+    const int n_rot = (int) hparams.n_rot(il);
+
+    float freq_base  = hparams.rope_freq_base_train;
+    float freq_scale = hparams.rope_freq_scale_train;
+    if (anchor_cparams) {
+        freq_base  = model.get_rope_freq_base (*anchor_cparams, il);
+        freq_scale = model.get_rope_freq_scale(*anchor_cparams, il);
+    } else {
+        LLAMA_LOG_WARN("%s: AnchorKV cparams not set (anchor_kv_set_cparams never called) - "
+                "falling back to trained freq_base/freq_scale, ignoring any --rope-freq-* overrides\n", __func__);
+    }
+
     ggml_tensor * result = ggml_anchor_decompress(
         ctx,
         /* dst = */ is_k ? anchor_scratch_k : anchor_scratch_v,
         g.anchors, g.anchor_of, g.gamma, g.slot_of,
         g.k_res_codes, g.k_res_scales, g.v_res_codes, g.v_res_scales,
-        is_k, /* prev_dep = */ chain);
+        is_k, /* prev_dep = */ chain,
+        n_rot, freq_base, freq_scale);
 
     chain = result;
 
@@ -3378,7 +3543,22 @@ bool llama_kv_cache_context::apply() {
     // fully written by the previous graph compute, so the cells are all real.
     if (kv->get_anchor_kv_enabled() && !kv->get_anchor_kv_compressed()) {
         const auto & ub = ubatches[i_cur];
-        if (ub.n_seq_tokens == 1) {
+        // NOTE: this used to check ub.n_seq_tokens == 1, on the assumption that
+        // n_seq_tokens reliably distinguishes a real decode step (one token per
+        // active sequence) from a prefill chunk (many tokens per sequence).
+        // That holds for split_equal() ubatches (multi-stream), but AnchorKV
+        // only supports n_stream == 1 (checked in anchor_kv_compress_all()),
+        // which always goes through split_simple() instead - and split_simple
+        // ubatches report n_seq_tokens == 1 UNCONDITIONALLY regardless of the
+        // actual chunk size (verified empirically: a 512-token prefill chunk
+        // ubatch reported n_tokens=512, n_seq_tokens=1). That made this check
+        // fire on the very first prefill chunk of any prompt longer than
+        // ANCHOR_KV_W tokens, compressing only that first chunk and silently
+        // discarding the rest of the prompt from the cache. ub.n_tokens == 1
+        // (the actual total token count of the ubatch) is the correct signal
+        // for "this is a real one-new-token decode step" in the single-stream
+        // case this feature is scoped to.
+        if (ub.n_tokens == 1) {
             LLAMA_LOG_INFO("%s: compressing KV cache after prefill...\n", __func__);
             kv->anchor_kv_compress_all();
             LLAMA_LOG_INFO("%s: compression complete\n", __func__);
