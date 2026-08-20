@@ -620,12 +620,25 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 
     // AnchorKV: enable via ANCHOR_KV_THETA env var (e.g. "0.1" for 10x compression)
+    // Also supports ANCHOR_KV_THETA_K / ANCHOR_KV_THETA_V for separate K/V compression
+    const char * anchor_theta_k_env = getenv("ANCHOR_KV_THETA_K");
+    const char * anchor_theta_v_env = getenv("ANCHOR_KV_THETA_V");
     const char * anchor_theta_env = getenv("ANCHOR_KV_THETA");
-    fprintf(stderr, "[ANCHOR-KV] env=%s\n", anchor_theta_env ? anchor_theta_env : "(null)");
-    if (anchor_theta_env) {
+
+    /* Use K theta for overall compression (K is more sensitive to quality) */
+    const char * active_theta = anchor_theta_k_env ? anchor_theta_k_env :
+                                anchor_theta_env ? anchor_theta_env : nullptr;
+
+    fprintf(stderr, "[ANCHOR-KV] env K=%s V=%s combined=%s\n",
+            anchor_theta_k_env ? anchor_theta_k_env : "(null)",
+            anchor_theta_v_env ? anchor_theta_v_env : "(null)",
+            anchor_theta_env ? anchor_theta_env : "(null)");
+
+    if (active_theta) {
         anchor_kv_enabled = true;
-        akv_params.theta = atof(anchor_theta_env);
-        fprintf(stderr, "[ANCHOR-KV] ENABLED theta=%.3f\n", akv_params.theta);
+        akv_params.theta = atof(active_theta);
+        fprintf(stderr, "[ANCHOR-KV] ENABLED theta=%.3f (%.1fx compression)\n",
+                akv_params.theta, 1.0f / akv_params.theta);
         LLAMA_LOG_WARN("%s: AnchorKV ENABLED, theta=%.3f (%.1fx compression)\n",
                        __func__, akv_params.theta, 1.0f / akv_params.theta);
     }

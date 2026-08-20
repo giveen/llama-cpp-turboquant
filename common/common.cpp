@@ -1724,10 +1724,22 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    // AnchorKV: set env var from cache type if anchor mode
-    if (params.cache_anchor_kv_theta > 0.0f) {
+    // AnchorKV: set env vars from cache types if anchor mode
+    if (params.cache_anchor_kv_theta_k > 0.0f) {
         char buf[32];
-        snprintf(buf, sizeof(buf), "%.3f", params.cache_anchor_kv_theta);
+        snprintf(buf, sizeof(buf), "%.3f", params.cache_anchor_kv_theta_k);
+        setenv("ANCHOR_KV_THETA_K", buf, 1);
+    }
+    if (params.cache_anchor_kv_theta_v > 0.0f) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f", params.cache_anchor_kv_theta_v);
+        setenv("ANCHOR_KV_THETA_V", buf, 1);
+    }
+    // Also set combined env var for backward compatibility
+    if (params.cache_anchor_kv_theta_k > 0.0f || params.cache_anchor_kv_theta_v > 0.0f) {
+        float theta = params.cache_anchor_kv_theta_k > 0.0f ? params.cache_anchor_kv_theta_k : params.cache_anchor_kv_theta_v;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f", theta);
         setenv("ANCHOR_KV_THETA", buf, 1);
     }
 

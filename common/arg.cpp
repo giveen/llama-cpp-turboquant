@@ -2424,7 +2424,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.cache_type_k = kv_cache_type_from_str(value);
             float theta = anchor_kv_theta_from_str(value);
-            if (theta > 0.0f) params.cache_anchor_kv_theta = theta;
+            if (theta > 0.0f) params.cache_anchor_kv_theta_k = theta;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2439,7 +2439,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.cache_type_v = kv_cache_type_from_str(value);
             float theta = anchor_kv_theta_from_str(value);
-            if (theta > 0.0f) params.cache_anchor_kv_theta = theta;
+            if (theta > 0.0f) params.cache_anchor_kv_theta_v = theta;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(

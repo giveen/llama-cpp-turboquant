@@ -602,7 +602,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
-    float cache_anchor_kv_theta = 0.0f;    // AnchorKV compression ratio (0 = disabled)
+    float cache_anchor_kv_theta_k = 0.0f;  // AnchorKV K compression ratio (0 = disabled)
+    float cache_anchor_kv_theta_v = 0.0f;  // AnchorKV V compression ratio (0 = disabled)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
