@@ -544,6 +544,16 @@ static anchor_kv_head compress_head(
         head.v_slot_positions[i] = (uint16_t)t;
     }
 
+    /* Precompute slot indices for GPU decompression */
+    head.k_slot_of.assign(S, -1);
+    head.v_slot_of.assign(S, -1);
+    for (int i = 0; i < (int)sel_K.size(); i++) {
+        head.k_slot_of[sel_K[i]] = i;
+    }
+    for (int i = 0; i < (int)sel_V.size(); i++) {
+        head.v_slot_of[sel_V[i]] = i;
+    }
+
     return head;
 }
 

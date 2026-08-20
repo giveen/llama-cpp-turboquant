@@ -86,6 +86,10 @@ struct anchor_kv_head {
     std::vector<float>    v_res_scales;      /* per-token absmax scale */
     std::vector<uint16_t> v_slot_positions;  /* position index per V residual slot */
 
+    /* Precomputed slot indices for GPU decompression */
+    std::vector<int>      k_slot_of;         /* [S] slot index (-1 if no residual) */
+    std::vector<int>      v_slot_of;         /* [S] slot index (-1 if no residual) */
+
     /* Budget info */
     int n_K;            /* number of key residuals stored */
     int n_V;            /* number of value residuals stored */

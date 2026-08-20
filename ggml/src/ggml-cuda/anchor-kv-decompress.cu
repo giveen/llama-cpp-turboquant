@@ -92,10 +92,9 @@ __global__ void anchor_kv_decompress_kernel(
     const float * anchor_vecs,   // [k, D] anchor K or V vectors
     const int   * anchor_ids,    // [S] anchor index per position
     const float * gamma,         // [S] projection coefficient
-    const uint64_t * res_mask,   // [ceil(S/64)] residual bitmask
+    const int   * slot_of,       // [S] precomputed slot index (-1 if no residual)
     const uint8_t * res_codes,   // [N_res * D/4] packed residual codes
     const float * res_scales,    // [N_res] per-token absmax scale
-    const int   * res_positions, // [N_res] position->slot lookup (NULL for K side)
     int S, int D, int k,
     // Output
     float * out_dense            // [S * D] dense output in fp32
@@ -111,18 +110,9 @@ __global__ void anchor_kv_decompress_kernel(
         out_dense[t * D + d] = g * anchor_vecs[anchor_idx * D + d];
     }
 
-    // Add residual if this position has one
-    // Check bitmask
-    int mask_word = t / 64;
-    int mask_bit = t % 64;
-    if (res_mask[mask_word] & (1ULL << mask_bit)) {
-        // Find slot index by counting set bits up to t
-        int slot = 0;
-        for (int j = 0; j < t; j++) {
-            int w = j / 64;
-            if (res_mask[w] & (1ULL << (j % 64))) slot++;
-        }
-
+    // Add residual if this position has one (O(1) lookup via precomputed slot)
+    int slot = slot_of[t];
+    if (slot >= 0) {
         // Dequantize residual
         float deq[128];
         size_t codes_per_res = (size_t)D / 4;
@@ -149,8 +139,8 @@ extern "C" void anchor_kv_decompress_gpu(
     const int   * d_v_anchor_of,   // [n_heads, S]
     const float * d_k_gamma,       // [n_heads, S]
     const float * d_v_gamma,       // [n_heads, S]
-    const uint64_t * d_k_res_mask, // [n_heads, ceil(S/64)]
-    const uint64_t * d_v_res_mask, // [n_heads, ceil(S/64)]
+    const int   * d_k_slot_of,     // [n_heads, S] precomputed slot indices
+    const int   * d_v_slot_of,     // [n_heads, S] precomputed slot indices
     const uint8_t * d_k_res_codes, // [n_heads, N_K * D/4]
     const float * d_k_res_scales,  // [n_heads, N_K]
     const uint8_t * d_v_res_codes, // [n_heads, N_V * D/4]
@@ -171,10 +161,9 @@ extern "C" void anchor_kv_decompress_gpu(
             d_anchor_keys + (size_t)h * k * D,
             d_k_anchor_of + (size_t)h * S,
             d_k_gamma + (size_t)h * S,
-            d_k_res_mask + (size_t)h * ((S + 63) / 64),
+            d_k_slot_of + (size_t)h * S,
             d_k_res_codes + (size_t)h * n_K * (D / 4),
             d_k_res_scales + (size_t)h * n_K,
-            NULL,  // K side doesn't need position lookup
             S, D, k,
             d_out_k + (size_t)h * S * D
         );
@@ -184,10 +173,9 @@ extern "C" void anchor_kv_decompress_gpu(
             d_anchor_values + (size_t)h * k * D,
             d_v_anchor_of + (size_t)h * S,
             d_v_gamma + (size_t)h * S,
-            d_v_res_mask + (size_t)h * ((S + 63) / 64),
+            d_v_slot_of + (size_t)h * S,
             d_v_res_codes + (size_t)h * n_V * (D / 4),
             d_v_res_scales + (size_t)h * n_V,
-            NULL,  // Simplified: position lookup not needed for this path
             S, D, k,
             d_out_v + (size_t)h * S * D
         );
