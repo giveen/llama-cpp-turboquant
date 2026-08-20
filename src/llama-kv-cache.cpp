@@ -1644,17 +1644,6 @@ extern "C" {
     );
     void anchor_kv_clear_current_layer();
     int anchor_kv_is_enabled();
-    void anchor_kv_decompress_gpu(
-        cudaStream_t stream,
-        const float * d_anchor_keys, const float * d_anchor_values,
-        const int * d_k_anchor_of, const int * d_v_anchor_of,
-        const float * d_k_gamma, const float * d_v_gamma,
-        const int * d_k_slot_of, const int * d_v_slot_of,
-        const uint8_t * d_k_res_codes, const float * d_k_res_scales,
-        const uint8_t * d_v_res_codes, const float * d_v_res_scales,
-        float * d_out_k, float * d_out_v,
-        int S, int D, int k, int n_heads, int n_K, int n_V
-    );
 }
 
 void llama_kv_cache::anchor_kv_upload_compressed(int32_t il) {
@@ -1663,73 +1652,8 @@ void llama_kv_cache::anchor_kv_upload_compressed(int32_t il) {
     const anchor_kv_layer & layer = anchor_kv_data[il];
 
     /* Upload compressed data to GPU and set the static global for FA */
-    /* For now, just set the current layer data for the FA kernel */
-    /* TODO: proper GPU buffer allocation through ggml_backend */
-
-    const anchor_kv_head & head = layer.heads[0];
-    int S = head.S;
-    int D = head.D;
-    int k = head.k;
-
-    /* Upload anchor keys to GPU */
-    float * d_ak;
-    cudaMalloc(&d_ak, head.k * D * sizeof(float));
-    cudaMemcpy(d_ak, head.anchor_keys.data(), head.k * D * sizeof(float), cudaMemcpyHostToDevice);
-
-    float * d_av;
-    cudaMalloc(&d_av, head.k * D * sizeof(float));
-    cudaMemcpy(d_av, head.anchor_values.data(), head.k * D * sizeof(float), cudaMemcpyHostToDevice);
-
-    int * d_kao;
-    cudaMalloc(&d_kao, S * sizeof(int));
-    cudaMemcpy(d_kao, head.k_anchor_of.data(), S * sizeof(int), cudaMemcpyHostToDevice);
-
-    int * d_vao;
-    cudaMalloc(&d_vao, S * sizeof(int));
-    cudaMemcpy(d_vao, head.v_anchor_of.data(), S * sizeof(int), cudaMemcpyHostToDevice);
-
-    float * d_kg;
-    cudaMalloc(&d_kg, S * sizeof(float));
-    cudaMemcpy(d_kg, head.k_gamma.data(), S * sizeof(float), cudaMemcpyHostToDevice);
-
-    float * d_vg;
-    cudaMalloc(&d_vg, S * sizeof(float));
-    cudaMemcpy(d_vg, head.v_gamma.data(), S * sizeof(float), cudaMemcpyHostToDevice);
-
-    int * d_ks;
-    cudaMalloc(&d_ks, S * sizeof(int));
-    cudaMemcpy(d_ks, head.k_slot_of.data(), S * sizeof(int), cudaMemcpyHostToDevice);
-
-    int * d_vs;
-    cudaMalloc(&d_vs, S * sizeof(int));
-    cudaMemcpy(d_vs, head.v_slot_of.data(), S * sizeof(int), cudaMemcpyHostToDevice);
-
-    size_t codes_per_res = (size_t)D / 4;
-    uint8_t * d_krc;
-    cudaMalloc(&d_krc, head.n_K * codes_per_res);
-    cudaMemcpy(d_krc, head.k_res_codes.data(), head.n_K * codes_per_res, cudaMemcpyHostToDevice);
-
-    float * d_krs;
-    cudaMalloc(&d_krs, head.n_K * sizeof(float));
-    cudaMemcpy(d_krs, head.k_res_scales.data(), head.n_K * sizeof(float), cudaMemcpyHostToDevice);
-
-    uint8_t * d_vrc;
-    cudaMalloc(&d_vrc, head.n_V * codes_per_res);
-    cudaMemcpy(d_vrc, head.v_res_codes.data(), head.n_V * codes_per_res, cudaMemcpyHostToDevice);
-
-    float * d_vrs;
-    cudaMalloc(&d_vrs, head.n_V * sizeof(float));
-    cudaMemcpy(d_vrs, head.v_res_scales.data(), head.n_V * sizeof(float), cudaMemcpyHostToDevice);
-
-    /* Set the static global for the FA kernel */
-    anchor_kv_set_current_layer(
-        d_ak, d_av, d_kao, d_vao, d_kg, d_vg, d_ks, d_vs,
-        d_krc, d_krs, d_vrc, d_vrs,
-        S, D, k, head.n_K, head.n_V
-    );
-
-    fprintf(stderr, "[ANCHOR-KV] layer %d: uploaded compressed data to GPU (%d anchors, %d K_res, %d V_res)\n",
-            il, k, head.n_K, head.n_V);
+    /* TODO: move to anchor-kv-decompress.cu with proper CUDA headers */
+    fprintf(stderr, "[ANCHOR-KV] layer %d: compressed data ready (GPU upload pending)\n", il);
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
