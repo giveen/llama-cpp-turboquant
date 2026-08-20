@@ -63,6 +63,8 @@ struct anchor_kv_head {
     int S;              /* sequence length */
     int D;              /* head dimension */
     int n_kv_heads;     /* number of KV heads (for cross-head pooling) */
+    bool compress_k = true;  /* true when the K side is stored compressed */
+    bool compress_v = true;  /* true when the V side is stored compressed */
 
     /* Anchor data */
     std::vector<uint32_t> anchor_positions;  /* [k] position indices */
@@ -111,6 +113,8 @@ struct anchor_kv_params {
     int   k_frac;       /* anchor budget fraction (default 128) */
     float rho;          /* scored anchor fraction (default 0.7) */
     int   kappa;        /* pooling kernel width (default 7) */
+    bool  compress_k;   /* store the K side compressed (default true) */
+    bool  compress_v;   /* store the V side compressed (default true) */
 
     anchor_kv_params()
         : theta(0.05f)
@@ -118,6 +122,8 @@ struct anchor_kv_params {
         , k_frac(ANCHOR_KV_K_FRAC)
         , rho(ANCHOR_KV_RHO)
         , kappa(ANCHOR_KV_KAPPA)
+        , compress_k(true)
+        , compress_v(true)
     {}
 };
 
@@ -164,6 +170,12 @@ void anchor_kv_decompress_head(
  * Returns the number of residuals that fit.
  */
 int anchor_kv_max_residuals(int S, int D, int W, float theta);
+
+/*
+ * Per-side byte budget for K-only/V-only compression (is_v selects the side).
+ * Returns the residual count whose storage fits the single side's theta budget.
+ */
+int anchor_kv_max_residuals_side(int S, int D, int W, float theta, bool is_v);
 
 /*
  * WHT sign array generation (deterministic from seed).

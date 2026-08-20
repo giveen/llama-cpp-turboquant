@@ -119,22 +119,30 @@ static void dequantize_residual_2bit(
 
 /* ---------- Byte budget (Eq. 9, Table 1) ---------- */
 
-int anchor_kv_max_residuals(int S, int D, int W, float theta) {
+// Combined (two-side) uncompressed size and base metadata for one KV head.
+// Mfull is both sides in bf16; Mbase is the per-token anchor/projection
+// metadata for both sides plus the shared anchor-position/mask/offset overhead.
+static void anchor_kv_budget_base(int S, int D, int W, float * Mfull, float * Mbase) {
     int k = S / ANCHOR_KV_K_FRAC;
     if (k < W) k = W;
     int P = S - W;
 
     /* Uncompressed: 2 sides * S * D * 2 bytes (bf16) */
-    float Mfull = 2.0f * S * D * 2.0f;
+    *Mfull = 2.0f * S * D * 2.0f;
 
     /* Base metadata (Eq. 13, single head) */
     int ba = 4;    /* int32 anchor index */
     int bgamma = 4; /* fp32 coefficient */
-    float Mbase = 4.0f * k * D           /* anchor keys + values (fp32 for CPU ref) */
-                + 8.0f * (k - W)         /* anchor positions (int32) */
-                + 2.0f * P * (ba + bgamma) /* per-token index + coefficient x2 sides */
-                + 24.0f * ((P + 63) / 64)  /* residual masks */
-                + 8.0f + 4.0f * P;         /* head offsets + position ids */
+    *Mbase = 4.0f * k * D           /* anchor keys + values (fp32 for CPU ref) */
+           + 8.0f * (k - W)         /* anchor positions (int32) */
+           + 2.0f * P * (ba + bgamma) /* per-token index + coefficient x2 sides */
+           + 24.0f * ((P + 63) / 64)  /* residual masks */
+           + 8.0f + 4.0f * P;         /* head offsets + position ids */
+}
+
+int anchor_kv_max_residuals(int S, int D, int W, float theta) {
+    float Mfull, Mbase;
+    anchor_kv_budget_base(S, D, W, &Mfull, &Mbase);
 
     float cK = D / 4.0f + 4.0f;  /* key residual: codes + fp32 scale */
     float cV = D / 4.0f + 5.0f;  /* value residual: codes + fp32 scale + uint16 pos */
@@ -144,6 +152,24 @@ int anchor_kv_max_residuals(int S, int D, int W, float theta) {
 
     float N = floorf(budget / ((cK + cV) / 2.0f));
     return (int)N;
+}
+
+// Per-side residual budget for K-only/V-only compression. A single side's
+// compressed size (metadata + residuals) targets theta * (S*D*2 bf16), so
+// --cache-type-v anchor3 hits its own 20x ratio instead of inheriting the
+// combined two-side budget. The per-side metadata is half the combined base
+// metadata (the shared anchor-position/mask/offset overhead is split evenly
+// between the two sides in the paper's accounting).
+int anchor_kv_max_residuals_side(int S, int D, int W, float theta, bool is_v) {
+    float Mfull, Mbase;
+    anchor_kv_budget_base(S, D, W, &Mfull, &Mbase);
+
+    const float c = is_v ? (D / 4.0f + 5.0f) : (D / 4.0f + 4.0f);
+
+    float budget = theta * (Mfull / 2.0f) - (Mbase / 2.0f);
+    if (budget <= 0) return 0;
+
+    return (int) floorf(budget / c);
 }
 
 /* ---------- Utility scoring (Eq. 6) ---------- */
@@ -223,6 +249,8 @@ static anchor_kv_head compress_head(
     head.S = S;
     head.D = D;
     head.theta = params.theta;
+    head.compress_k = params.compress_k;
+    head.compress_v = params.compress_v;
 
     int k_budget = S / params.k_frac;
     if (k_budget < params.W) k_budget = params.W;
@@ -304,13 +332,21 @@ static anchor_kv_head compress_head(
 
     head.anchor_positions.assign(anchor_positions.begin(), anchor_positions.end());
 
-    /* Store exact anchor K/V */
-    head.anchor_keys.resize(head.k * D);
-    head.anchor_values.resize(head.k * D);
+    /* Store exact anchor K/V (only the sides being compressed) */
+    if (params.compress_k) {
+        head.anchor_keys.resize(head.k * D);
+    }
+    if (params.compress_v) {
+        head.anchor_values.resize(head.k * D);
+    }
     for (int a = 0; a < head.k; a++) {
         int pos = anchor_positions[a];
-        memcpy(&head.anchor_keys[a * D], &keys[pos * D], D * sizeof(float));
-        memcpy(&head.anchor_values[a * D], &values[pos * D], D * sizeof(float));
+        if (params.compress_k) {
+            memcpy(&head.anchor_keys[a * D], &keys[pos * D], D * sizeof(float));
+        }
+        if (params.compress_v) {
+            memcpy(&head.anchor_values[a * D], &values[pos * D], D * sizeof(float));
+        }
     }
 
     /* Reverse lookup: token position -> anchor index */
@@ -321,10 +357,10 @@ static anchor_kv_head compress_head(
 
     /* --- Step 2: Compute projections (Eq. 1-2) --- */
 
-    head.k_anchor_of.resize(S);
-    head.v_anchor_of.resize(S);
-    head.k_gamma.resize(S, 0.0f);
-    head.v_gamma.resize(S, 0.0f);
+    head.k_anchor_of.assign(S, -1);
+    head.v_anchor_of.assign(S, -1);
+    head.k_gamma.assign(S, 0.0f);
+    head.v_gamma.assign(S, 0.0f);
 
     std::vector<float> residual_K(S * D);
     std::vector<float> residual_V(S * D);
@@ -386,11 +422,13 @@ static anchor_kv_head compress_head(
         }
     };
 
-    /* K projection */
-    compute_proj(keys, head.k_anchor_of.data(), head.k_gamma.data(), residual_K.data());
+    /* K projection (only when the K side is compressed) */
+    if (params.compress_k) {
+        compute_proj(keys, head.k_anchor_of.data(), head.k_gamma.data(), residual_K.data());
+    }
 
-    /* V projection (recompute with V anchors) */
-    {
+    /* V projection (recompute with V anchors, only when V is compressed) */
+    if (params.compress_v) {
         for (int t = 0; t < S; t++) {
             if (is_anchor[t]) {
                 head.v_anchor_of[t] = pos_to_anchor_idx[t];
@@ -452,9 +490,17 @@ static anchor_kv_head compress_head(
 
     /* --- Step 4: Compute residual budget (Eq. 9) --- */
 
-    int N = anchor_kv_max_residuals(S, D, params.W, params.theta);
-    head.n_K = N / 2;
-    head.n_V = N - head.n_K;
+    if (params.compress_k && params.compress_v) {
+        const int N = anchor_kv_max_residuals(S, D, params.W, params.theta);
+        head.n_K = N / 2;
+        head.n_V = N - head.n_K;
+    } else if (params.compress_k) {
+        head.n_K = anchor_kv_max_residuals_side(S, D, params.W, params.theta, /*is_v=*/false);
+        head.n_V = 0;
+    } else {
+        head.n_K = 0;
+        head.n_V = anchor_kv_max_residuals_side(S, D, params.W, params.theta, /*is_v=*/true);
+    }
 
     /* --- Step 5: Select residuals by utility --- */
 
@@ -602,7 +648,8 @@ void anchor_kv_decompress_head(
     const int * k_slot = head.k_slot_of.data();
     const int * v_slot = head.v_slot_of.data();
 
-    /* Reconstruct K */
+    /* Reconstruct K (only when stored compressed) */
+    if (head.compress_k) {
     for (int t = 0; t < S; t++) {
         if (is_anchor[t]) {
             /* Anchor: stored exactly */
@@ -628,7 +675,10 @@ void anchor_kv_decompress_head(
         }
     }
 
-    /* Reconstruct V */
+    }
+
+    /* Reconstruct V (only when stored compressed) */
+    if (head.compress_v) {
     for (int t = 0; t < S; t++) {
         if (is_anchor[t]) {
             int a = head.v_anchor_of[t];
@@ -651,5 +701,6 @@ void anchor_kv_decompress_head(
                 }
             }
         }
+    }
     }
 }

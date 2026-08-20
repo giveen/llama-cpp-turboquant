@@ -137,6 +137,11 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // AnchorKV: parse the theta env vars before the dense cache tensors are
+    // allocated - V-only/K-only compression needs K and V in separate buffers
+    // so a single side can be freed after compression.
+    anchor_kv_parse_env();
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
@@ -184,10 +189,21 @@ llama_kv_cache::llama_kv_cache(
             return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
         }
     };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    // K and V normally share one context (and buffer) per buffer type. When
+    // AnchorKV is enabled the two sides get separate contexts so that, after
+    // compression, a single side's dense buffer can be freed while the other
+    // side stays dense.
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map_k;
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map_v;
 
-    // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+    // create a context for each buffer type (and side)
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, bool is_k) -> ggml_context * {
+        if (!anchor_kv_enabled) {
+            is_k = false; // shared context for both sides
+        }
+
+        auto & ctx_map = is_k ? ctx_map_k : ctx_map_v;
+
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
@@ -308,8 +324,9 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
-        if (!ctx) {
+        ggml_context * ctx   = ctx_for_buft(buft, true);  // K side (also holds turbo rotation)
+        ggml_context * ctx_v = ctx_for_buft(buft, false); // V side
+        if (!ctx || !ctx_v) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
@@ -412,8 +429,8 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx,   layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx_v, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -422,8 +439,8 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa_eff, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx,   k, n_embd_k_gqa_eff, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx_v, v, n_embd_v_gqa_eff, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
@@ -469,7 +486,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
+    auto alloc_ctx_bufs = [&](ggml_backend_buffer_type_t buft, ggml_context_ptr ctx, int side) {
         ggml_backend_buffer_t buf;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
@@ -487,15 +504,10 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
 
-        // Fill turbo rotation matrices AFTER buffer clear (clear zeroes everything)
-        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
+        // Fill turbo rotation matrices AFTER buffer clear (clear zeroes everything);
+        // the rotation tensors live in the K (side 0) context.
+        if (side == 0 && turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
             #include "turbo-rotation-data.h"
-            // ggml is column-major; C arrays are row-major. Storing a row-major matrix
-            // into ggml implicitly transposes it. ggml_mul_mat(A, x) computes A^T @ x.
-            // To get R @ q: store R^T → ggml sees (R^T)^T_col = R → mul_mat gives R @ q. Wait no —
-            // store R so ggml col-major reads it as R^T, then mul_mat gives (R^T)^T = R. ✓
-            // Store R for Q forward rotation, R^T for V inverse rotation
-            // ggml_mul_mat(A,x) computes A@x for row-major stored A (verified by test)
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
 
@@ -508,7 +520,14 @@ llama_kv_cache::llama_kv_cache(
 
             LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
         }
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
+        ctxs_bufs.push_back({ std::move(ctx), ggml_backend_buffer_ptr(buf), side });
+    };
+
+    for (auto & [buft, ctx] : ctx_map_k) {
+        alloc_ctx_bufs(buft, std::move(ctx), 0);
+    }
+    for (auto & [buft, ctx] : ctx_map_v) {
+        alloc_ctx_bufs(buft, std::move(ctx), 1);
     }
 
     {
@@ -620,25 +639,48 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
 
+void llama_kv_cache::anchor_kv_parse_env() {
     // AnchorKV: enable via ANCHOR_KV_THETA env var (e.g. "0.1" for 10x compression)
     // Also supports ANCHOR_KV_THETA_K / ANCHOR_KV_THETA_V for separate K/V compression
     const char * anchor_theta_k_env = getenv("ANCHOR_KV_THETA_K");
     const char * anchor_theta_v_env = getenv("ANCHOR_KV_THETA_V");
     const char * anchor_theta_env = getenv("ANCHOR_KV_THETA");
 
-    /* Use K theta for overall compression (K is more sensitive to quality) */
-    const char * active_theta = anchor_theta_k_env ? anchor_theta_k_env :
-                                anchor_theta_env ? anchor_theta_env : nullptr;
+    // The combined ANCHOR_KV_THETA only applies when neither per-side var is
+    // set (common.cpp mirrors a per-side theta into the combined var for
+    // backward compat, so the combined var must be ignored when a per-side
+    // var is present or V-only/K-only would silently compress both sides).
+    const bool has_k = anchor_theta_k_env != nullptr;
+    const bool has_v = anchor_theta_v_env != nullptr;
+
+    float theta_k = 0.0f;
+    float theta_v = 0.0f;
+    if (has_k) {
+        theta_k = atof(anchor_theta_k_env);
+    } else if (!has_v && anchor_theta_env) {
+        theta_k = atof(anchor_theta_env);
+    }
+    if (has_v) {
+        theta_v = atof(anchor_theta_v_env);
+    } else if (!has_k && anchor_theta_env) {
+        theta_v = atof(anchor_theta_env);
+    }
+
+    akv_params.compress_k = theta_k > 0.0f;
+    akv_params.compress_v = theta_v > 0.0f;
+    // Combined residual budget theta: prefer K (more sensitive to quality);
+    // when only one side is enabled this falls through to that side's theta.
+    akv_params.theta = theta_k > 0.0f ? theta_k : theta_v;
 
     fprintf(stderr, "[ANCHOR-KV] env K=%s V=%s combined=%s\n",
             anchor_theta_k_env ? anchor_theta_k_env : "(null)",
             anchor_theta_v_env ? anchor_theta_v_env : "(null)",
             anchor_theta_env ? anchor_theta_env : "(null)");
 
-    if (active_theta) {
+    if (akv_params.compress_k || akv_params.compress_v) {
         anchor_kv_enabled = true;
-        akv_params.theta = atof(active_theta);
 
         // AnchorKV reads the dense cache columns and decompresses into a
         // non-transposed scratch, so it needs the FA V layout and no MLA
@@ -652,10 +694,12 @@ llama_kv_cache::llama_kv_cache(
         }
 
         if (anchor_kv_enabled) {
-            fprintf(stderr, "[ANCHOR-KV] ENABLED theta=%.3f (%.1fx compression)\n",
-                    akv_params.theta, 1.0f / akv_params.theta);
-            LLAMA_LOG_WARN("%s: AnchorKV ENABLED, theta=%.3f (%.1fx compression)\n",
-                           __func__, akv_params.theta, 1.0f / akv_params.theta);
+            fprintf(stderr, "[ANCHOR-KV] ENABLED theta=%.3f (%.1fx compression) K=%d V=%d\n",
+                    akv_params.theta, 1.0f / akv_params.theta,
+                    akv_params.compress_k ? 1 : 0, akv_params.compress_v ? 1 : 0);
+            LLAMA_LOG_WARN("%s: AnchorKV ENABLED, theta=%.3f (%.1fx compression) K=%d V=%d\n",
+                           __func__, akv_params.theta, 1.0f / akv_params.theta,
+                           akv_params.compress_k ? 1 : 0, akv_params.compress_v ? 1 : 0);
         }
     }
 }
@@ -667,8 +711,8 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
-        for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+        for (auto & e : ctxs_bufs) {
+            ggml_backend_buffer_clear(e.buf.get(), 0);
         }
 
         // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
@@ -991,15 +1035,15 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [ctx, buf] : ctxs_bufs) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+    for (const auto & e : ctxs_bufs) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(e.buf.get());
 
         if (hparams.no_alloc) {
-            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            GGML_ASSERT(ggml_backend_buffer_get_base(e.buf.get()) == nullptr);
+            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(e.ctx.get(), buft);
         } else {
-            // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            // GGML_ASSERT(ggml_backend_buffer_get_base(e.buf.get()) != nullptr); // multi_buffer does not have a defined base
+            ret[buft] += ggml_backend_buffer_get_size(e.buf.get());
         }
     }
 
@@ -1540,6 +1584,29 @@ ggml_type llama_kv_cache::type_v() const {
 
 /* ---------- AnchorKV compression ---------- */
 
+// helper: read n elements of a dense cache tensor into a float buffer.
+// Handles f32 directly and everything else (f16/bf16/quant) through the
+// type's to_float dequantizer. Used for both the side being compressed
+// (must be f16/f32, so this is just a copy) and the opposite side when it is
+// only needed for anchor/utility scoring (e.g. a dense q8_0 K while only V is
+// compressed).
+static void anchor_kv_read_dense_float(const ggml_tensor * t, float * out, size_t n) {
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out, 0, n * sizeof(float));
+        return;
+    }
+
+    const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+    if (traits->to_float == nullptr) {
+        throw std::runtime_error("AnchorKV: no to_float dequantizer for cache type " +
+                std::string(ggml_type_name(t->type)));
+    }
+
+    std::vector<uint8_t> raw(ggml_row_size(t->type, (int64_t) n));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+    traits->to_float(raw.data(), out, (int64_t) n);
+}
+
 // helper: convert the dense cache layout [n_embd_gqa, S] (column-major,
 // heads interleaved within a column) to the compressor layout [n_heads, S, D]
 // (head-major, position-major)
@@ -1690,30 +1757,40 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
 
     const int cpr = D / 4;
 
+    // A side that is not compressed still needs a valid (1-element dummy) src
+    // tensor for the decompress op's fixed 8-src layout, but its decompress
+    // node is never built so the dummy is never read.
+    const int n_K_eff = akv_params.compress_k ? n_K_max : 1;
+    const int n_V_eff = akv_params.compress_v ? n_V_max : 1;
+
     g.anchors      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_heads, 2, k, D);
     g.anchor_of    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_heads, S);
     g.gamma        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, n_heads, S);
     g.slot_of      = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_heads, S);
-    g.k_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_K_max, cpr);
-    g.k_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_K_max);
-    g.v_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_V_max, cpr);
-    g.v_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_V_max);
+    g.k_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_K_eff, cpr);
+    g.k_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_K_eff);
+    g.v_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_V_eff, cpr);
+    g.v_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_V_eff);
 
     std::vector<float> anchors(n_heads * 2 * k * D, 0.0f);
     std::vector<int32_t> anchor_of(2 * n_heads * S, 0);
     std::vector<float> gamma(2 * n_heads * S, 0.0f);
     std::vector<int32_t> slot_of(2 * n_heads * S, -1);
-    std::vector<uint8_t> k_codes((size_t) n_heads * n_K_max * cpr, 0);
-    std::vector<float> k_scales((size_t) n_heads * n_K_max, 0.0f);
-    std::vector<uint8_t> v_codes((size_t) n_heads * n_V_max * cpr, 0);
-    std::vector<float> v_scales((size_t) n_heads * n_V_max, 0.0f);
+    std::vector<uint8_t> k_codes((size_t) n_heads * n_K_eff * cpr, 0);
+    std::vector<float> k_scales((size_t) n_heads * n_K_eff, 0.0f);
+    std::vector<uint8_t> v_codes((size_t) n_heads * n_V_eff * cpr, 0);
+    std::vector<float> v_scales((size_t) n_heads * n_V_eff, 0.0f);
 
     for (int h = 0; h < n_heads; h++) {
         const anchor_kv_head & head = layer.heads[h];
 
         for (int a = 0; a < head.k; a++) {
-            memcpy(&anchors[((h * 2 + 0) * k + a) * D], &head.anchor_keys[a * D],  D * sizeof(float));
-            memcpy(&anchors[((h * 2 + 1) * k + a) * D], &head.anchor_values[a * D], D * sizeof(float));
+            if (akv_params.compress_k) {
+                memcpy(&anchors[((h * 2 + 0) * k + a) * D], &head.anchor_keys[a * D],  D * sizeof(float));
+            }
+            if (akv_params.compress_v) {
+                memcpy(&anchors[((h * 2 + 1) * k + a) * D], &head.anchor_values[a * D], D * sizeof(float));
+            }
         }
 
         for (int t = 0; t < S; t++) {
@@ -1726,12 +1803,12 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
         }
 
         for (int i = 0; i < head.n_K; i++) {
-            memcpy(&k_codes[(size_t) (h * n_K_max + i) * cpr], &head.k_res_codes[i * cpr], cpr);
-            k_scales[h * n_K_max + i] = head.k_res_scales[i];
+            memcpy(&k_codes[(size_t) (h * n_K_eff + i) * cpr], &head.k_res_codes[i * cpr], cpr);
+            k_scales[h * n_K_eff + i] = head.k_res_scales[i];
         }
         for (int i = 0; i < head.n_V; i++) {
-            memcpy(&v_codes[(size_t) (h * n_V_max + i) * cpr], &head.v_res_codes[i * cpr], cpr);
-            v_scales[h * n_V_max + i] = head.v_res_scales[i];
+            memcpy(&v_codes[(size_t) (h * n_V_eff + i) * cpr], &head.v_res_codes[i * cpr], cpr);
+            v_scales[h * n_V_eff + i] = head.v_res_scales[i];
         }
     }
 
@@ -1769,8 +1846,14 @@ void llama_kv_cache::anchor_kv_compress_all() {
     }
 
     if (S_used < ANCHOR_KV_W) {
-        LLAMA_LOG_WARN("%s: AnchorKV requires at least %d tokens in the cache (%u found) - skipping compression\n",
-                __func__, ANCHOR_KV_W, S_used);
+        // compression is retried on every decode step until the cache reaches W
+        // tokens, so warn once instead of spamming one line per token
+        static bool warned_small = false;
+        if (!warned_small) {
+            LLAMA_LOG_WARN("%s: AnchorKV requires at least %d tokens in the cache (%u found) - skipping compression until the cache grows\n",
+                    __func__, ANCHOR_KV_W, S_used);
+            warned_small = true;
+        }
         return;
     }
 
@@ -1792,9 +1875,17 @@ void llama_kv_cache::anchor_kv_compress_all() {
     // pass 1: validate the layers are compressible and uniform
     for (int32_t il = 0; il < n_layer; il++) {
         const kv_layer & layer = layers[il];
-        if (layer.k->type != GGML_TYPE_F16 && layer.k->type != GGML_TYPE_F32) {
-            LLAMA_LOG_WARN("%s: layer %d: unsupported cache type %s - AnchorKV requires f16/f32, disabling\n",
+        // only the compressed side(s) must be f16/f32; the other side may stay
+        // in any dense type (it is only read for anchor/utility scoring)
+        if (akv_params.compress_k && layer.k->type != GGML_TYPE_F16 && layer.k->type != GGML_TYPE_F32) {
+            LLAMA_LOG_WARN("%s: layer %d: unsupported K cache type %s - AnchorKV K compression requires f16/f32, disabling\n",
                     __func__, il, ggml_type_name(layer.k->type));
+            anchor_kv_data.clear();
+            return;
+        }
+        if (akv_params.compress_v && layer.v->type != GGML_TYPE_F16 && layer.v->type != GGML_TYPE_F32) {
+            LLAMA_LOG_WARN("%s: layer %d: unsupported V cache type %s - AnchorKV V compression requires f16/f32, disabling\n",
+                    __func__, il, ggml_type_name(layer.v->type));
             anchor_kv_data.clear();
             return;
         }
@@ -1833,20 +1924,8 @@ void llama_kv_cache::anchor_kv_compress_all() {
 
         std::vector<float> keys((size_t) n_embd_k_gqa * S_used);
         std::vector<float> values((size_t) n_embd_v_gqa * S_used);
-
-        if (layer.k->type == GGML_TYPE_F32) {
-            ggml_backend_tensor_get(layer.k, keys.data(), 0, keys.size() * sizeof(float));
-            ggml_backend_tensor_get(layer.v, values.data(), 0, values.size() * sizeof(float));
-        } else {
-            std::vector<ggml_fp16_t> k_raw((size_t) n_embd_k_gqa * S_used);
-            std::vector<ggml_fp16_t> v_raw((size_t) n_embd_v_gqa * S_used);
-            ggml_backend_tensor_get(layer.k, k_raw.data(), 0, k_raw.size() * sizeof(ggml_fp16_t));
-            ggml_backend_tensor_get(layer.v, v_raw.data(), 0, v_raw.size() * sizeof(ggml_fp16_t));
-            for (size_t i = 0; i < keys.size(); i++) {
-                keys[i]   = ggml_fp16_to_fp32(k_raw[i]);
-                values[i] = ggml_fp16_to_fp32(v_raw[i]);
-            }
-        }
+        anchor_kv_read_dense_float(layer.k, keys.data(), keys.size());
+        anchor_kv_read_dense_float(layer.v, values.data(), values.size());
 
         // AnchorKV: undo RoPE on K before compression - see anchor_kv_invert_rope_k
         // doc above for why. V is never rotated, so `values` is untouched.
@@ -1925,13 +2004,17 @@ void llama_kv_cache::anchor_kv_compress_all() {
 
         const uint32_t kv_size = get_size();
 
-        anchor_scratch_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_k_gqa, kv_size);
-        anchor_scratch_v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_v_gqa, kv_size);
+        if (akv_params.compress_k) {
+            anchor_scratch_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_k_gqa, kv_size);
+        }
+        if (akv_params.compress_v) {
+            anchor_scratch_v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_v_gqa, kv_size);
+        }
 
         if (hparams.no_alloc) {
             anchor_buf = ggml_backend_buffer_ptr(ggml_backend_buft_alloc_buffer(buft_first, /*size =*/ 0));
-            anchor_scratch_k->buffer = anchor_buf.get();
-            anchor_scratch_v->buffer = anchor_buf.get();
+            if (anchor_scratch_k) anchor_scratch_k->buffer = anchor_buf.get();
+            if (anchor_scratch_v) anchor_scratch_v->buffer = anchor_buf.get();
         } else {
             anchor_buf = ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft_first));
         }
@@ -1943,8 +2026,9 @@ void llama_kv_cache::anchor_kv_compress_all() {
 
         anchor_ctx = ggml_context_ptr(ctx);
 
-        LLAMA_LOG_INFO("%s: anchor scratch: K %dx%d + V %dx%d f16 = %.2f MiB (shared across %d layers)\n",
-                __func__, n_embd_k_gqa, kv_size, n_embd_v_gqa, kv_size,
+        LLAMA_LOG_INFO("%s: anchor scratch (%s) = %.2f MiB (shared across %d layers)\n",
+                __func__,
+                (akv_params.compress_k && akv_params.compress_v) ? "K+V" : (akv_params.compress_k ? "K" : "V"),
                 (float) (ggml_backend_buffer_get_size(anchor_buf.get())) / (1024.0f * 1024.0f), n_layer);
     }
 
@@ -1956,7 +2040,8 @@ void llama_kv_cache::anchor_kv_compress_all() {
     // the dense per-layer KV buffers are no longer referenced by decode graphs
     anchor_kv_free_dense();
 
-    LLAMA_LOG_INFO("%s: compression complete (%d layers), dense KV buffers freed\n", __func__, n_layer);
+    LLAMA_LOG_INFO("%s: compression complete (%d layers), dense %s buffer(s) freed\n", __func__, n_layer,
+            (akv_params.compress_k && akv_params.compress_v) ? "K+V" : (akv_params.compress_k ? "K" : "V"));
 }
 
 const anchor_kv_layer * llama_kv_cache::get_anchor_kv_layer(int32_t il) const {
@@ -2048,15 +2133,25 @@ ggml_tensor * llama_kv_cache::anchor_kv_build_decompress(ggml_context * ctx, int
 }
 
 void llama_kv_cache::anchor_kv_free_dense() {
-    // decode graphs no longer reference the dense per-layer KV tensors
-    for (auto & [ctx, buf] : ctxs_bufs) {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+    // decode graphs no longer reference the freed dense per-layer KV tensors.
+    // With V-only/K-only compression the other side stays dense, so only the
+    // compressed side's buffers are freed (K and V are in separate buffers when
+    // AnchorKV is enabled - see the constructor's ctx_map_k/ctx_map_v split).
+    auto it = ctxs_bufs.begin();
+    while (it != ctxs_bufs.end()) {
+        const bool is_v   = it->side == 1;
+        const bool keep   = is_v ? !akv_params.compress_v : !akv_params.compress_k;
+        if (keep) {
+            ++it;
+            continue;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(it->ctx.get()); t != nullptr; t = ggml_get_next_tensor(it->ctx.get(), t)) {
             t->buffer = nullptr;
             t->data   = nullptr;
         }
-        buf.reset();
+        it->buf.reset();
+        it = ctxs_bufs.erase(it);
     }
-    ctxs_bufs.clear();
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -2110,7 +2205,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     // in llama-kv-cache.h). Falls back to the raw scratch tensor if the chain is
     // unexpectedly empty (e.g. called without anchor_kv_build_decompress having
     // run first for this layer/graph).
-    auto * k = get_anchor_kv_compressed() ? (anchor_chain_k ? anchor_chain_k : anchor_scratch_k) : layers[ikv].k;
+    auto * k = get_anchor_kv_compressed_k() ? (anchor_chain_k ? anchor_chain_k : anchor_scratch_k) : layers[ikv].k;
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -2137,7 +2232,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 
-    if (get_anchor_kv_compressed()) {
+    if (get_anchor_kv_compressed_k()) {
         // this read becomes the new tail of the chain so a later layer's
         // decompress (which threads in the chain as its prev_dep) is forced to
         // wait for this read to be scheduled first
@@ -2151,7 +2246,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const int32_t ikv = map_layer_ids.at(il);
 
     // AnchorKV: see get_k
-    auto * v = get_anchor_kv_compressed() ? (anchor_chain_v ? anchor_chain_v : anchor_scratch_v) : layers[ikv].v;
+    auto * v = get_anchor_kv_compressed_v() ? (anchor_chain_v ? anchor_chain_v : anchor_scratch_v) : layers[ikv].v;
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
@@ -2187,7 +2282,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
     }
 
-    if (get_anchor_kv_compressed()) {
+    if (get_anchor_kv_compressed_v()) {
         // see get_k: makes this read the new tail of the V chain
         anchor_chain_v = result;
     }
@@ -2201,7 +2296,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int32_t ikv = map_layer_ids.at(il);
 
     // AnchorKV: write the current batch into the shared scratch (see get_k)
-    ggml_tensor * k = get_anchor_kv_compressed() ? (anchor_chain_k ? anchor_chain_k : anchor_scratch_k) : layers[ikv].k;
+    ggml_tensor * k = get_anchor_kv_compressed_k() ? (anchor_chain_k ? anchor_chain_k : anchor_scratch_k) : layers[ikv].k;
 
     int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
@@ -2248,7 +2343,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         memcpy(result->op_params, &wht_group, sizeof(int32_t));
     }
 
-    if (get_anchor_kv_compressed()) {
+    if (get_anchor_kv_compressed_k()) {
         // see get_k: this write becomes the new chain tail (ancestor of get_k())
         anchor_chain_k = result;
     }
@@ -2262,7 +2357,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int32_t ikv = map_layer_ids.at(il);
 
     // AnchorKV: see cpy_k
-    auto * v = get_anchor_kv_compressed() ? (anchor_chain_v ? anchor_chain_v : anchor_scratch_v) : layers[ikv].v;
+    auto * v = get_anchor_kv_compressed_v() ? (anchor_chain_v ? anchor_chain_v : anchor_scratch_v) : layers[ikv].v;
 
     int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
@@ -2304,7 +2399,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             int32_t wht_group = 128;  // always 128 with padding
             memcpy(result->op_params, &wht_group, sizeof(int32_t));
         }
-        if (get_anchor_kv_compressed()) {
+        if (get_anchor_kv_compressed_v()) {
             // see cpy_k: this write becomes the new V chain tail
             anchor_chain_v = result;
         }
@@ -2331,7 +2426,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     ggml_tensor * result = ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 
-    if (get_anchor_kv_compressed()) {
+    if (get_anchor_kv_compressed_v()) {
         // see cpy_k: this write becomes the new V chain tail
         anchor_chain_v = result;
     }
@@ -2770,8 +2865,8 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
-    for (const auto & [_, buf] : ctxs_bufs) {
-        size += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & e : ctxs_bufs) {
+        size += ggml_backend_buffer_get_size(e.buf.get());
     }
 
     return size;
@@ -3613,6 +3708,14 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
 
 bool llama_kv_cache_context::get_anchor_active() const {
     return kv->get_anchor_kv_enabled() && kv->get_anchor_kv_compressed();
+}
+
+bool llama_kv_cache_context::get_anchor_active_k() const {
+    return kv->get_anchor_kv_compressed_k();
+}
+
+bool llama_kv_cache_context::get_anchor_active_v() const {
+    return kv->get_anchor_kv_compressed_v();
 }
 
 ggml_tensor * llama_kv_cache_context::build_anchor_k(ggml_context * ctx, int32_t il) const {

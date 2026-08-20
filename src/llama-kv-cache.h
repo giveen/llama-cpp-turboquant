@@ -174,10 +174,18 @@ public:
     // the pointer is safe.
     void anchor_kv_set_cparams(const llama_cparams & cparams) { anchor_cparams = &cparams; }
 
+    // AnchorKV: parse ANCHOR_KV_THETA(_K/_V) env vars into anchor_kv_enabled and
+    // akv_params.compress_k/compress_v. Must run before the dense cache tensors
+    // are allocated so K and V can be placed in separate buffers when only one
+    // side is compressed.
+    void anchor_kv_parse_env();
+
     // AnchorKV: compress the dense cache after prefill
     void anchor_kv_compress_all();
     bool get_anchor_kv_enabled() const { return anchor_kv_enabled; }
     bool get_anchor_kv_compressed() const { return !anchor_kv_data.empty(); }
+    bool get_anchor_kv_compressed_k() const { return !anchor_kv_data.empty() && akv_params.compress_k; }
+    bool get_anchor_kv_compressed_v() const { return !anchor_kv_data.empty() && akv_params.compress_v; }
     const anchor_kv_layer * get_anchor_kv_layer(int32_t il) const;
 
     // AnchorKV: build the in-graph decompress node for one layer. The op writes
@@ -311,8 +319,16 @@ private:
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
-    // ggml contexts for the KV cache along with the allocated backend buffers:
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    // ggml contexts for the KV cache along with the allocated backend buffers.
+    // side is 0 for K (or the shared K+V buffer when AnchorKV is off) and 1 for
+    // a separate V buffer (AnchorKV on), so a single side can be freed after
+    // compression while the other stays dense.
+    struct kv_ctx_buf {
+        ggml_context_ptr      ctx;
+        ggml_backend_buffer_ptr buf;
+        int side = 0;
+    };
+    std::vector<kv_ctx_buf> ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
@@ -479,6 +495,11 @@ public:
     // AnchorKV: true when decode graphs must read from the compressed
     // representation (compression happened) instead of the dense cache
     bool get_anchor_active() const override;
+
+    // AnchorKV: per-side variants - true only when that specific side is
+    // stored compressed (e.g. V-only compression keeps K dense)
+    bool get_anchor_active_k() const;
+    bool get_anchor_active_v() const;
 
     // AnchorKV: build the in-graph decompress node for one layer (expanded by
     // the caller before cpy_k/cpy_v so it executes first)
