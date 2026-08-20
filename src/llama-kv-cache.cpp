@@ -1767,18 +1767,18 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
     const int n_K_eff = akv_params.compress_k ? n_K_max : 1;
     const int n_V_eff = akv_params.compress_v ? n_V_max : 1;
 
-    g.anchors      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_heads, 2, k, D);
+    g.anchors      = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, n_heads, 2, k, D);
     g.anchor_of    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_heads, S);
-    g.gamma        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, n_heads, S);
+    g.gamma        = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, n_heads, S);
     g.slot_of      = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_heads, S);
     g.k_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_K_eff, cpr);
     g.k_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_K_eff);
     g.v_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_V_eff, cpr);
     g.v_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_V_eff);
 
-    std::vector<float> anchors(n_heads * 2 * k * D, 0.0f);
+    std::vector<ggml_bf16_t> anchors(n_heads * 2 * k * D, ggml_fp32_to_bf16(0.0f));
     std::vector<int32_t> anchor_of(2 * n_heads * S, 0);
-    std::vector<float> gamma(2 * n_heads * S, 0.0f);
+    std::vector<ggml_fp16_t> gamma(2 * n_heads * S, ggml_fp32_to_fp16(0.0f));
     std::vector<int32_t> slot_of(2 * n_heads * S, -1);
     std::vector<uint8_t> k_codes((size_t) n_heads * n_K_eff * cpr, 0);
     std::vector<float> k_scales((size_t) n_heads * n_K_eff, 0.0f);
@@ -1790,18 +1790,20 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
 
         for (int a = 0; a < head.k; a++) {
             if (akv_params.compress_k) {
-                memcpy(&anchors[((h * 2 + 0) * k + a) * D], &head.anchor_keys[a * D],  D * sizeof(float));
+                ggml_fp32_to_bf16_row(&head.anchor_keys[a * D],
+                        &anchors[((h * 2 + 0) * k + a) * D], D);
             }
             if (akv_params.compress_v) {
-                memcpy(&anchors[((h * 2 + 1) * k + a) * D], &head.anchor_values[a * D], D * sizeof(float));
+                ggml_fp32_to_bf16_row(&head.anchor_values[a * D],
+                        &anchors[((h * 2 + 1) * k + a) * D], D);
             }
         }
 
         for (int t = 0; t < S; t++) {
             anchor_of[(0 * n_heads + h) * S + t] = head.k_anchor_of[t];
             anchor_of[(1 * n_heads + h) * S + t] = head.v_anchor_of[t];
-            gamma[(0 * n_heads + h) * S + t]     = head.k_gamma[t];
-            gamma[(1 * n_heads + h) * S + t]     = head.v_gamma[t];
+            gamma[(0 * n_heads + h) * S + t]     = ggml_fp32_to_fp16(head.k_gamma[t]);
+            gamma[(1 * n_heads + h) * S + t]     = ggml_fp32_to_fp16(head.v_gamma[t]);
             slot_of[(0 * n_heads + h) * S + t]   = head.k_slot_of[t];
             slot_of[(1 * n_heads + h) * S + t]   = head.v_slot_of[t];
         }
@@ -1828,9 +1830,9 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
         throw std::runtime_error("failed to allocate buffer for AnchorKV compressed data");
     }
 
-    ggml_backend_tensor_set(g.anchors,      anchors.data(), 0, anchors.size() * sizeof(float));
+    ggml_backend_tensor_set(g.anchors,      anchors.data(), 0, anchors.size() * sizeof(ggml_bf16_t));
     ggml_backend_tensor_set(g.anchor_of,    anchor_of.data(), 0, anchor_of.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(g.gamma,        gamma.data(), 0, gamma.size() * sizeof(float));
+    ggml_backend_tensor_set(g.gamma,        gamma.data(), 0, gamma.size() * sizeof(ggml_fp16_t));
     ggml_backend_tensor_set(g.slot_of,      slot_of.data(), 0, slot_of.size() * sizeof(int32_t));
     ggml_backend_tensor_set(g.k_res_codes,  k_codes.data(), 0, k_codes.size());
     ggml_backend_tensor_set(g.k_res_scales, k_scales.data(), 0, k_scales.size() * sizeof(float));
@@ -1857,6 +1859,21 @@ void llama_kv_cache::anchor_kv_compress_all() {
             LLAMA_LOG_WARN("%s: AnchorKV requires at least %d tokens in the cache (%u found) - skipping compression until the cache grows\n",
                     __func__, ANCHOR_KV_W, S_used);
             warned_small = true;
+        }
+        return;
+    }
+
+    // The paper targets long contexts. Once S exceeds the exact recency
+    // window, do not replace old tokens with projections until the byte budget
+    // can buy at least one residual on every compressed side.
+    if (!layers.empty() && !anchor_kv_budget_ready(
+            (int) S_used, (int) hparams.n_embd_head_k(layers.front().il), akv_params,
+            (int) hparams.n_head_kv(layers.front().il))) {
+        static bool warned_budget = false;
+        if (!warned_budget) {
+            LLAMA_LOG_WARN("%s: AnchorKV budget has no residual capacity at S=%u - "
+                    "skipping compression until the cache grows\n", __func__, S_used);
+            warned_budget = true;
         }
         return;
     }
@@ -1930,6 +1947,7 @@ void llama_kv_cache::anchor_kv_compress_all() {
         std::vector<float> values((size_t) n_embd_v_gqa * S_used);
         anchor_kv_read_dense_float(layer.k, keys.data(), keys.size());
         anchor_kv_read_dense_float(layer.v, values.data(), values.size());
+        const std::vector<float> keys_score = keys;
 
         // AnchorKV: undo RoPE on K before compression - see anchor_kv_invert_rope_k
         // doc above for why. V is never rotated, so `values` is untouched.
@@ -1976,21 +1994,28 @@ void llama_kv_cache::anchor_kv_compress_all() {
 
         // re-layout cache columns -> compressor head-major order
         std::vector<float> keys_hl((size_t) n_head_kv_k * S_used * head_k);
+        std::vector<float> keys_score_hl((size_t) n_head_kv_k * S_used * head_k);
         std::vector<float> values_hl((size_t) n_head_kv_v * S_used * head_v);
         anchor_kv_relayout(keys.data(), keys_hl.data(), n_head_kv_k, (int) S_used, (int) head_k);
+        anchor_kv_relayout(keys_score.data(), keys_score_hl.data(), n_head_kv_k, (int) S_used, (int) head_k);
         anchor_kv_relayout(values.data(), values_hl.data(), n_head_kv_v, (int) S_used, (int) head_v);
 
         anchor_kv_data[il] = anchor_kv_compress(
             keys_hl.data(), values_hl.data(),
             (int) S_used, (int) head_k, n_head_kv_k,
-            akv_params
+            akv_params, keys_score_hl.data()
         );
 
+        int total_K_res = 0;
+        int total_V_res = 0;
+        for (const anchor_kv_head & head : anchor_kv_data[il].heads) {
+            total_K_res += head.n_K;
+            total_V_res += head.n_V;
+        }
         LLAMA_LOG_INFO("%s: layer %d: %d heads, %d anchors, K_res=%d V_res=%d\n",
                 __func__, il, n_head_kv_k,
                 anchor_kv_data[il].heads[0].k,
-                anchor_kv_data[il].heads[0].n_K,
-                anchor_kv_data[il].heads[0].n_V);
+                total_K_res, total_V_res);
     }
 
     // allocate the shared dense scratch buffers (one layer's worth of K and V)

@@ -11428,9 +11428,9 @@ static void ggml_compute_forward_anchor_decompress_f16(
     GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
     GGML_ASSERT(dst->type == GGML_TYPE_F16);
 
-    const ggml_tensor * anchors      = dst->src[0]; // [n_heads, 2, k, D] f32
+    const ggml_tensor * anchors      = dst->src[0]; // [n_heads, 2, k, D] bf16
     const ggml_tensor * anchor_of    = dst->src[1]; // [2, n_heads, S] i32
-    const ggml_tensor * gamma        = dst->src[2]; // [2, n_heads, S] f32
+    const ggml_tensor * gamma        = dst->src[2]; // [2, n_heads, S] f16
     const ggml_tensor * slot_of      = dst->src[3]; // [2, n_heads, S] i32
     const ggml_tensor * k_res_codes  = dst->src[4]; // [n_heads, n_K, D/4] u8
     const ggml_tensor * k_res_scales = dst->src[5]; // [n_heads, n_K] f32
@@ -11457,9 +11457,9 @@ static void ggml_compute_forward_anchor_decompress_f16(
     GGML_ASSERT(n_embd == (int64_t) n_heads * D);
     GGML_ASSERT((int) anchors->ne[1] == 2);
 
-    const float * anchors_data      = (const float *) anchors->data;
+    const ggml_bf16_t * anchors_data = (const ggml_bf16_t *) anchors->data;
     const int32_t * anchor_of_data  = (const int32_t *) anchor_of->data;
-    const float * gamma_data        = (const float *) gamma->data;
+    const ggml_fp16_t * gamma_data  = (const ggml_fp16_t *) gamma->data;
     const int32_t * slot_of_data    = (const int32_t *) slot_of->data;
     const uint8_t * k_codes_data    = (const uint8_t *) k_res_codes->data;
     const float * k_scales_data     = (const float *) k_res_scales->data;
@@ -11482,10 +11482,10 @@ static void ggml_compute_forward_anchor_decompress_f16(
     for (int64_t t = t_start; t < t_end; t++) {
         for (int h = 0; h < n_heads; h++) {
             const int a = anchor_of_data[(side * n_heads + h) * S + t];
-            const float g = gamma_data[(side * n_heads + h) * S + t];
+            const float g = GGML_CPU_FP16_TO_FP32(gamma_data[(side * n_heads + h) * S + t]);
             const int slot = slot_of_data[(side * n_heads + h) * S + t];
 
-            const float * anchor_vec = anchors_data + ((h * 2 + side) * k + a) * D;
+            const ggml_bf16_t * anchor_vec = anchors_data + ((h * 2 + side) * k + a) * D;
 
             if (slot >= 0) {
                 const uint8_t * codes  = (side == 0 ? k_codes_data  : v_codes_data)  + (h * (side == 0 ? n_K : n_V) + slot) * cpr;
@@ -11501,7 +11501,7 @@ static void ggml_compute_forward_anchor_decompress_f16(
 
                 float tilde[128];
                 for (int d = 0; d < D; d++) {
-                    tilde[d] = g * anchor_vec[d] + deq[d] * scale;
+                    tilde[d] = g * ggml_bf16_to_fp32(anchor_vec[d]) + deq[d] * scale;
                 }
                 if (side == 0) {
                     anchor_cpu_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);
@@ -11512,7 +11512,7 @@ static void ggml_compute_forward_anchor_decompress_f16(
             } else {
                 float tilde[128];
                 for (int d = 0; d < D; d++) {
-                    tilde[d] = g * anchor_vec[d];
+                    tilde[d] = g * ggml_bf16_to_fp32(anchor_vec[d]);
                 }
                 if (side == 0) {
                     anchor_cpu_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);

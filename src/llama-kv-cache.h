@@ -365,9 +365,9 @@ private:
     struct anchor_kv_gpu {
         ggml_context_ptr ctx;                    // context owning the tensors
         ggml_backend_buffer_ptr buf;             // backing buffer (device or CPU)
-        ggml_tensor * anchors      = nullptr;    // [n_heads, 2, k, D] f32
+        ggml_tensor * anchors      = nullptr;    // [n_heads, 2, k, D] bf16
         ggml_tensor * anchor_of    = nullptr;    // [2, n_heads, S] i32
-        ggml_tensor * gamma        = nullptr;    // [2, n_heads, S] f32
+        ggml_tensor * gamma        = nullptr;    // [2, n_heads, S] f16
         ggml_tensor * slot_of      = nullptr;    // [2, n_heads, S] i32
         ggml_tensor * k_res_codes  = nullptr;    // [n_heads, n_K, D/4] u8
         ggml_tensor * k_res_scales = nullptr;    // [n_heads, n_K] f32

@@ -51,28 +51,52 @@ int main() {
     p.rho = 0.5f;
     p.kappa = 8;
 
+    // The paper's long-context budget must not activate while the cache
+    // contains only a few positions beyond the exact recency window.
+    {
+        anchor_kv_params short_p;
+        if (!anchor_kv_budget_ready(ANCHOR_KV_W, D, short_p) ||
+            anchor_kv_budget_ready(48, D, short_p)) {
+            printf("FAIL: short-cache budget gate is wrong\\n");
+            return 1;
+        }
+        if (!anchor_kv_budget_ready(16384, D, short_p)) {
+            printf("FAIL: viable long-context budget was rejected\\n");
+            return 1;
+        }
+    }
+
     // V-only
     {
         p.compress_k = false;
         p.compress_v = true;
         anchor_kv_layer layer = anchor_kv_compress(keys.data(), values.data(), S, D, n_heads, p);
         const anchor_kv_head & h = layer.heads[0];
-        printf("V-only: k=%d n_K=%d n_V=%d anchor_keys=%zu anchor_values=%zu\n",
-               h.k, h.n_K, h.n_V, h.anchor_keys.size(), h.anchor_values.size());
-        if (h.n_K != 0 || h.anchor_keys.size() != 0 || h.n_V == 0 || h.anchor_values.size() == 0) {
+        int n_v_actual = 0;
+        bool v_storage = false;
+        for (const anchor_kv_head & head : layer.heads) {
+            if (head.n_K != 0 || !head.anchor_keys.empty()) {
+                printf("FAIL: V-only stored K data\n");
+                return 1;
+            }
+            n_v_actual += head.n_V;
+            v_storage |= !head.anchor_values.empty();
+        }
+        printf("V-only: k=%d head0_n_V=%d total_n_V=%d\n", h.k, h.n_V, n_v_actual);
+        if (n_v_actual == 0 || !v_storage) {
             printf("FAIL: V-only flags/storage wrong\n");
             return 1;
         }
-        // per-side budget, not the combined two-side budget
-        const int n_v_side  = anchor_kv_max_residuals_side(S, D, p.W, p.theta, true);
-        const int n_combined = anchor_kv_max_residuals(S, D, p.W, p.theta);
-        printf("V-only budget: n_V=%d (side) vs combined=%d\n", n_v_side, n_combined);
-        if (h.n_V != n_v_side) {
-            printf("FAIL: V-only n_V=%d does not match per-side budget %d\n", h.n_V, n_v_side);
+        // per-side layer budget, not one combined budget per head
+        const int n_v_side  = anchor_kv_max_residuals_side_layer(S, D, p.W, p.theta, true, n_heads, p.k_frac);
+        const int n_combined = anchor_kv_max_residuals_layer(S, D, p.W, p.theta, n_heads, p.k_frac);
+        printf("V-only budget: total_n_V=%d (side) vs combined=%d\n", n_v_actual, n_combined);
+        if (n_v_actual != n_v_side) {
+            printf("FAIL: V-only total n_V=%d does not match layer budget %d\n", n_v_actual, n_v_side);
             return 1;
         }
-        if (h.n_V >= n_combined) {
-            printf("FAIL: V-only still uses the combined budget (n_V=%d >= %d)\n", h.n_V, n_combined);
+        if (n_v_actual >= n_combined) {
+            printf("FAIL: V-only still uses the combined budget (n_V=%d >= %d)\n", n_v_actual, n_combined);
             return 1;
         }
         std::vector<float> out_k((size_t) S * D, -123.0f);
@@ -92,16 +116,25 @@ int main() {
         p.compress_v = false;
         anchor_kv_layer layer = anchor_kv_compress(keys.data(), values.data(), S, D, n_heads, p);
         const anchor_kv_head & h = layer.heads[0];
-        printf("K-only: k=%d n_K=%d n_V=%d anchor_keys=%zu anchor_values=%zu\n",
-               h.k, h.n_K, h.n_V, h.anchor_keys.size(), h.anchor_values.size());
-        if (h.n_V != 0 || h.anchor_values.size() != 0 || h.n_K == 0 || h.anchor_keys.size() == 0) {
+        int n_k_actual = 0;
+        bool k_storage = false;
+        for (const anchor_kv_head & head : layer.heads) {
+            if (head.n_V != 0 || !head.anchor_values.empty()) {
+                printf("FAIL: K-only stored V data\n");
+                return 1;
+            }
+            n_k_actual += head.n_K;
+            k_storage |= !head.anchor_keys.empty();
+        }
+        printf("K-only: k=%d head0_n_K=%d total_n_K=%d\n", h.k, h.n_K, n_k_actual);
+        if (n_k_actual == 0 || !k_storage) {
             printf("FAIL: K-only flags/storage wrong\n");
             return 1;
         }
-        const int n_k_side = anchor_kv_max_residuals_side(S, D, p.W, p.theta, false);
-        printf("K-only budget: n_K=%d (side)\n", n_k_side);
-        if (h.n_K != n_k_side) {
-            printf("FAIL: K-only n_K=%d does not match per-side budget %d\n", h.n_K, n_k_side);
+        const int n_k_side = anchor_kv_max_residuals_side_layer(S, D, p.W, p.theta, false, n_heads, p.k_frac);
+        printf("K-only budget: total_n_K=%d (side)\n", n_k_side);
+        if (n_k_actual != n_k_side) {
+            printf("FAIL: K-only total n_K=%d does not match layer budget %d\n", n_k_actual, n_k_side);
             return 1;
         }
         std::vector<float> out_k((size_t) S * D, 0.0f);
@@ -124,13 +157,19 @@ int main() {
         p.theta_v = 0.18f;
         anchor_kv_layer layer = anchor_kv_compress(keys.data(), values.data(), S, D, n_heads, p);
         const anchor_kv_head & h = layer.heads[0];
-        const int n_k_side = anchor_kv_max_residuals_side(S, D, p.W, p.theta_k, false);
-        const int n_v_side = anchor_kv_max_residuals_side(S, D, p.W, p.theta_v, true);
-        printf("Asym theta: k=%d n_K=%d (budget %d) n_V=%d (budget %d)\n",
-               h.k, h.n_K, n_k_side, h.n_V, n_v_side);
-        if (h.n_K != n_k_side || h.n_V != n_v_side) {
+        int n_k_actual = 0;
+        int n_v_actual = 0;
+        for (const anchor_kv_head & head : layer.heads) {
+            n_k_actual += head.n_K;
+            n_v_actual += head.n_V;
+        }
+        const int n_k_side = anchor_kv_max_residuals_side_layer(S, D, p.W, p.theta_k, false, n_heads, p.k_frac);
+        const int n_v_side = anchor_kv_max_residuals_side_layer(S, D, p.W, p.theta_v, true, n_heads, p.k_frac);
+        printf("Asym theta: k=%d total_n_K=%d (budget %d) total_n_V=%d (budget %d)\n",
+               h.k, n_k_actual, n_k_side, n_v_actual, n_v_side);
+        if (n_k_actual != n_k_side || n_v_actual != n_v_side) {
             printf("FAIL: asymmetric theta budget mismatch (n_K=%d vs %d, n_V=%d vs %d)\n",
-                   h.n_K, n_k_side, h.n_V, n_v_side);
+                   n_k_actual, n_k_side, n_v_actual, n_v_side);
             return 1;
         }
         if (n_k_side >= n_v_side) {

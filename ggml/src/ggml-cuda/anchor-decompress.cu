@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 // Lloyd-Max 2-bit centroids for a unit Gaussian source (src/anchor-kv.cpp)
 __constant__ float ANCHOR_DECOMPRESS_CENTROIDS[4] = {
@@ -92,9 +93,9 @@ __device__ void anchor_decompress_rope_forward_neox(float * x, int n_rot, int64_
 
 // One thread per KV position. Reconstructs every head of that position.
 __global__ void anchor_decompress_kernel(
-    const float * __restrict__ anchors,       // [n_heads, 2, k, D] f32
+    const __nv_bfloat16 * __restrict__ anchors, // [n_heads, 2, k, D] bf16
     const int32_t * __restrict__ anchor_of,   // [2, n_heads, S] i32
-    const float * __restrict__ gamma,         // [2, n_heads, S] f32
+    const __half * __restrict__ gamma,        // [2, n_heads, S] f16
     const int32_t * __restrict__ slot_of,     // [2, n_heads, S] i32
     const uint8_t * __restrict__ k_res_codes, // [n_heads, n_K, D/4] u8
     const float * __restrict__ k_res_scales,  // [n_heads, n_K] f32
@@ -118,10 +119,10 @@ __global__ void anchor_decompress_kernel(
 
     for (int h = 0; h < n_heads; h++) {
         const int a    = anchor_of[(side * n_heads + h) * S + t];
-        const float g  = gamma[(side * n_heads + h) * S + t];
+        const float g  = __half2float(gamma[(side * n_heads + h) * S + t]);
         const int slot = slot_of[(side * n_heads + h) * S + t];
 
-        const float * anchor_vec = anchors + ((h * 2 + side) * k + a) * D;
+        const __nv_bfloat16 * anchor_vec = anchors + ((h * 2 + side) * k + a) * D;
 
         if (slot >= 0) {
             const int n_res = (side == 0) ? n_K : n_V;
@@ -138,7 +139,7 @@ __global__ void anchor_decompress_kernel(
 
             float tilde[128];
             for (int d = 0; d < D; d++) {
-                tilde[d] = g * anchor_vec[d] + deq[d] * scale;
+                tilde[d] = g * __bfloat162float(anchor_vec[d]) + deq[d] * scale;
             }
             if (side == 0) {
                 anchor_decompress_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);
@@ -149,7 +150,7 @@ __global__ void anchor_decompress_kernel(
         } else {
             float tilde[128];
             for (int d = 0; d < D; d++) {
-                tilde[d] = g * anchor_vec[d];
+                tilde[d] = g * __bfloat162float(anchor_vec[d]);
             }
             if (side == 0) {
                 anchor_decompress_rope_forward_neox(tilde, n_rot, t, freq_base, freq_scale);
@@ -195,9 +196,9 @@ void ggml_cuda_anchor_decompress(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int side = is_k ? 0 : 1;
 
     anchor_decompress_kernel<<<grid, block, 0, ctx.stream()>>>(
-        (const float *)   anchors->data,
+        (const __nv_bfloat16 *) anchors->data,
         (const int32_t *) anchor_of->data,
-        (const float *)   gamma->data,
+        (const __half *)  gamma->data,
         (const int32_t *) slot_of->data,
         (const uint8_t *) k_res_codes->data,
         (const float *)   k_res_scales->data,

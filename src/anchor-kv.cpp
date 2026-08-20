@@ -122,8 +122,8 @@ static void dequantize_residual_2bit(
 // Combined (two-side) uncompressed size and base metadata for one KV head.
 // Mfull is both sides in bf16; Mbase is the per-token anchor/projection
 // metadata for both sides plus the shared anchor-position/mask/offset overhead.
-static void anchor_kv_budget_base(int S, int D, int W, float * Mfull, float * Mbase) {
-    int k = S / ANCHOR_KV_K_FRAC;
+static void anchor_kv_budget_base(int S, int D, int W, int k_frac, float * Mfull, float * Mbase) {
+    int k = S / k_frac;
     if (k < W) k = W;
     int P = S - W;
 
@@ -132,17 +132,17 @@ static void anchor_kv_budget_base(int S, int D, int W, float * Mfull, float * Mb
 
     /* Base metadata (Eq. 13, single head) */
     int ba = 4;    /* int32 anchor index */
-    int bgamma = 4; /* fp32 coefficient */
-    *Mbase = 4.0f * k * D           /* anchor keys + values (fp32 for CPU ref) */
+    int bgamma = 2; /* fp16 coefficient */
+    *Mbase = 4.0f * k * D           /* two bf16 anchor arrays */
            + 8.0f * (k - W)         /* anchor positions (int32) */
            + 2.0f * P * (ba + bgamma) /* per-token index + coefficient x2 sides */
            + 24.0f * ((P + 63) / 64)  /* residual masks */
            + 8.0f + 4.0f * P;         /* head offsets + position ids */
 }
 
-int anchor_kv_max_residuals(int S, int D, int W, float theta) {
+int anchor_kv_max_residuals(int S, int D, int W, float theta, int k_frac) {
     float Mfull, Mbase;
-    anchor_kv_budget_base(S, D, W, &Mfull, &Mbase);
+    anchor_kv_budget_base(S, D, W, k_frac, &Mfull, &Mbase);
 
     float cK = D / 4.0f + 4.0f;  /* key residual: codes + fp32 scale */
     float cV = D / 4.0f + 5.0f;  /* value residual: codes + fp32 scale + uint16 pos */
@@ -160,9 +160,9 @@ int anchor_kv_max_residuals(int S, int D, int W, float theta) {
 // combined two-side budget. The per-side metadata is half the combined base
 // metadata (the shared anchor-position/mask/offset overhead is split evenly
 // between the two sides in the paper's accounting).
-int anchor_kv_max_residuals_side(int S, int D, int W, float theta, bool is_v) {
+int anchor_kv_max_residuals_side(int S, int D, int W, float theta, bool is_v, int k_frac) {
     float Mfull, Mbase;
-    anchor_kv_budget_base(S, D, W, &Mfull, &Mbase);
+    anchor_kv_budget_base(S, D, W, k_frac, &Mfull, &Mbase);
 
     const float c = is_v ? (D / 4.0f + 5.0f) : (D / 4.0f + 4.0f);
 
@@ -170,6 +170,55 @@ int anchor_kv_max_residuals_side(int S, int D, int W, float theta, bool is_v) {
     if (budget <= 0) return 0;
 
     return (int) floorf(budget / c);
+}
+
+int anchor_kv_max_residuals_layer(int S, int D, int W, float theta, int n_heads, int k_frac) {
+    float Mfull, Mbase;
+    anchor_kv_budget_base(S, D, W, k_frac, &Mfull, &Mbase);
+    Mfull *= n_heads;
+    Mbase *= n_heads;
+
+    const float cK = D / 4.0f + 4.0f;
+    const float cV = D / 4.0f + 5.0f;
+    const float budget = theta * Mfull - Mbase;
+    return budget <= 0.0f ? 0 : (int) floorf(budget / ((cK + cV) / 2.0f));
+}
+
+int anchor_kv_max_residuals_side_layer(int S, int D, int W, float theta, bool is_v, int n_heads, int k_frac) {
+    float Mfull, Mbase;
+    anchor_kv_budget_base(S, D, W, k_frac, &Mfull, &Mbase);
+    Mfull *= n_heads;
+    Mbase *= n_heads;
+
+    const float c = is_v ? (D / 4.0f + 5.0f) : (D / 4.0f + 4.0f);
+    const float budget = theta * (Mfull / 2.0f) - (Mbase / 2.0f);
+    return budget <= 0.0f ? 0 : (int) floorf(budget / c);
+}
+
+bool anchor_kv_budget_ready(int S, int D, const anchor_kv_params & params, int n_heads) {
+    if (S <= params.W) {
+        return true;
+    }
+
+    const float t_k = params.theta_k > 0.0f ? params.theta_k : params.theta;
+    const float t_v = params.theta_v > 0.0f ? params.theta_v : params.theta;
+
+    if (params.compress_k && params.compress_v) {
+        if (params.theta_k > 0.0f && params.theta_v > 0.0f) {
+            return anchor_kv_max_residuals_side_layer(S, D, params.W, params.theta_k, false, n_heads, params.k_frac) > 0 &&
+                   anchor_kv_max_residuals_side_layer(S, D, params.W, params.theta_v, true,  n_heads, params.k_frac) > 0;
+        }
+        return anchor_kv_max_residuals_layer(S, D, params.W, params.theta, n_heads, params.k_frac) > 0;
+    }
+
+    if (params.compress_k) {
+        return anchor_kv_max_residuals_side_layer(S, D, params.W, t_k, false, n_heads, params.k_frac) > 0;
+    }
+    if (params.compress_v) {
+        return anchor_kv_max_residuals_side_layer(S, D, params.W, t_v, true, n_heads, params.k_frac) > 0;
+    }
+
+    return false;
 }
 
 /* ---------- Utility scoring (Eq. 6) ---------- */
@@ -240,8 +289,9 @@ void anchor_kv_dequantize_residual(
 /* ---------- Per-head compression ---------- */
 
 static anchor_kv_head compress_head(
-    const float * keys,     /* [S * D] */
-    const float * values,   /* [S * D] */
+    const float * keys,       /* [S * D] pre-RoPE */
+    const float * values,     /* [S * D] */
+    const float * keys_score, /* [S * D] post-RoPE scoring keys */
     int S, int D,
     const anchor_kv_params & params
 ) {
@@ -276,7 +326,7 @@ static anchor_kv_head compress_head(
         for (int q = S - params.W; q < S; q++) {
             float dot = 0.0f;
             for (int d = 0; d < D; d++) {
-                dot += keys[q * D + d] * keys[t * D + d];
+                dot += keys_score[q * D + d] * keys_score[t * D + d];
             }
             score_sum += expf(dot * inv_sqrt_d);
         }
@@ -488,32 +538,17 @@ static anchor_kv_head compress_head(
         is_anchor.data(), S, D
     );
 
-    /* --- Step 4: Compute residual budget (Eq. 9) --- */
+    // Keep the projections and utilities until all heads in the layer have
+    // been prepared. The paper pools residual selection across KV heads.
+    head.k_residual_raw = std::move(residual_K);
+    head.v_residual_raw = std::move(residual_V);
+    head.k_utility = std::move(util.uK);
+    head.v_utility = std::move(util.uV);
+    head.is_anchor.assign(is_anchor.begin(), is_anchor.end());
+    head.n_K = 0;
+    head.n_V = 0;
 
-    // A single side falls back to the combined theta when its per-side theta
-    // is unset (back-compat for callers that only set params.theta).
-    const float t_k = params.theta_k > 0.0f ? params.theta_k : params.theta;
-    const float t_v = params.theta_v > 0.0f ? params.theta_v : params.theta;
-
-    if (params.compress_k && params.compress_v) {
-        if (params.theta_k > 0.0f && params.theta_v > 0.0f && fabsf(params.theta_k - params.theta_v) > 1e-6f) {
-            // asymmetric K/V thetas: each side gets its own byte budget
-            head.n_K = anchor_kv_max_residuals_side(S, D, params.W, params.theta_k, /*is_v=*/false);
-            head.n_V = anchor_kv_max_residuals_side(S, D, params.W, params.theta_v, /*is_v=*/true);
-        } else {
-            const int N = anchor_kv_max_residuals(S, D, params.W, params.theta);
-            head.n_K = N / 2;
-            head.n_V = N - head.n_K;
-        }
-    } else if (params.compress_k) {
-        head.n_K = anchor_kv_max_residuals_side(S, D, params.W, t_k, /*is_v=*/false);
-        head.n_V = 0;
-    } else {
-        head.n_K = 0;
-        head.n_V = anchor_kv_max_residuals_side(S, D, params.W, t_v, /*is_v=*/true);
-    }
-
-    /* --- Step 5: Select residuals by utility --- */
+    /* --- Step 4: Residual selection is finalized layer-wide --- */
 
     /* Collect non-anchor positions */
     std::vector<int> non_anchors;
@@ -614,22 +649,140 @@ static anchor_kv_head compress_head(
     return head;
 }
 
+static void finalize_head(anchor_kv_head & head, const float * signs) {
+    const int S = head.S;
+    const int D = head.D;
+    const size_t codes_per_res = (size_t) D / 4;
+
+    head.n_K = (int) head.k_selected_positions.size();
+    head.n_V = (int) head.v_selected_positions.size();
+
+    const int n_mask_words = (S + 63) / 64;
+    head.k_residual_mask.assign(n_mask_words, 0);
+    head.v_residual_mask.assign(n_mask_words, 0);
+    head.k_slot_of.assign(S, -1);
+    head.v_slot_of.assign(S, -1);
+
+    head.k_res_codes.resize((size_t) head.n_K * codes_per_res);
+    head.k_res_scales.resize(head.n_K);
+    for (int i = 0; i < head.n_K; i++) {
+        const int t = head.k_selected_positions[i];
+        head.k_residual_mask[t / 64] |= 1ULL << (t % 64);
+        head.k_slot_of[t] = i;
+        head.k_res_scales[i] = quantize_residual_2bit(
+                &head.k_residual_raw[(size_t) t * D], D,
+                signs, &head.k_res_codes[(size_t) i * codes_per_res]);
+    }
+
+    head.v_res_codes.resize((size_t) head.n_V * codes_per_res);
+    head.v_res_scales.resize(head.n_V);
+    head.v_slot_positions.resize(head.n_V);
+    for (int i = 0; i < head.n_V; i++) {
+        const int t = head.v_selected_positions[i];
+        head.v_residual_mask[t / 64] |= 1ULL << (t % 64);
+        head.v_slot_of[t] = i;
+        head.v_res_scales[i] = quantize_residual_2bit(
+                &head.v_residual_raw[(size_t) t * D], D,
+                signs, &head.v_res_codes[(size_t) i * codes_per_res]);
+        head.v_slot_positions[i] = (uint16_t) t;
+    }
+
+    head.k_residual_raw.clear();
+    head.v_residual_raw.clear();
+    head.k_utility.clear();
+    head.v_utility.clear();
+    head.is_anchor.clear();
+    head.k_selected_positions.clear();
+    head.v_selected_positions.clear();
+}
+
 /* ---------- Public API ---------- */
 
 anchor_kv_layer anchor_kv_compress(
     const float * keys,
     const float * values,
     int S, int D, int n_heads,
-    const anchor_kv_params & params
+    const anchor_kv_params & params,
+    const float * keys_score
 ) {
     anchor_kv_layer layer;
     layer.n_heads = n_heads;
     layer.heads.resize(n_heads);
 
     for (int h = 0; h < n_heads; h++) {
-        const float * h_keys   = keys + (size_t)h * S * D;
-        const float * h_values = values + (size_t)h * S * D;
-        layer.heads[h] = compress_head(h_keys, h_values, S, D, params);
+        const float * h_keys   = keys + (size_t) h * S * D;
+        const float * h_values = values + (size_t) h * S * D;
+        const float * h_keys_score = keys_score != nullptr ? keys_score + (size_t) h * S * D : h_keys;
+        layer.heads[h] = compress_head(h_keys, h_values, h_keys_score, S, D, params);
+    }
+
+    int total_K = 0;
+    int total_V = 0;
+    if (params.compress_k && params.compress_v) {
+        if (params.theta_k > 0.0f && params.theta_v > 0.0f) {
+            total_K = anchor_kv_max_residuals_side_layer(S, D, params.W, params.theta_k, false, n_heads, params.k_frac);
+            total_V = anchor_kv_max_residuals_side_layer(S, D, params.W, params.theta_v, true,  n_heads, params.k_frac);
+        } else {
+            const int total = anchor_kv_max_residuals_layer(S, D, params.W, params.theta, n_heads, params.k_frac);
+            total_K = total / 2;
+            total_V = total - total_K;
+        }
+    } else if (params.compress_k) {
+        const float theta = params.theta_k > 0.0f ? params.theta_k : params.theta;
+        total_K = anchor_kv_max_residuals_side_layer(S, D, params.W, theta, false, n_heads, params.k_frac);
+    } else if (params.compress_v) {
+        const float theta = params.theta_v > 0.0f ? params.theta_v : params.theta;
+        total_V = anchor_kv_max_residuals_side_layer(S, D, params.W, theta, true, n_heads, params.k_frac);
+    }
+
+    struct candidate {
+        float utility;
+        int head;
+        int position;
+    };
+
+    std::vector<candidate> candidates_K;
+    std::vector<candidate> candidates_V;
+    for (int h = 0; h < n_heads; h++) {
+        const anchor_kv_head & head = layer.heads[h];
+        for (int t = 0; t < S; t++) {
+            if (head.is_anchor[t]) {
+                continue;
+            }
+            if (params.compress_k) {
+                candidates_K.push_back({ head.k_utility[t], h, t });
+            }
+            if (params.compress_v) {
+                candidates_V.push_back({ head.v_utility[t], h, t });
+            }
+        }
+    }
+
+    const auto candidate_less = [](const candidate & a, const candidate & b) {
+        if (a.utility != b.utility) {
+            return a.utility > b.utility;
+        }
+        if (a.head != b.head) {
+            return a.head < b.head;
+        }
+        return a.position < b.position;
+    };
+    std::sort(candidates_K.begin(), candidates_K.end(), candidate_less);
+    std::sort(candidates_V.begin(), candidates_V.end(), candidate_less);
+
+    for (int i = 0; i < std::min(total_K, (int) candidates_K.size()); i++) {
+        const candidate & c = candidates_K[i];
+        layer.heads[c.head].k_selected_positions.push_back(c.position);
+    }
+    for (int i = 0; i < std::min(total_V, (int) candidates_V.size()); i++) {
+        const candidate & c = candidates_V[i];
+        layer.heads[c.head].v_selected_positions.push_back(c.position);
+    }
+
+    std::vector<float> signs(D);
+    anchor_kv_get_wht_signs(signs.data(), D, ANCHOR_KV_SEED);
+    for (anchor_kv_head & head : layer.heads) {
+        finalize_head(head, signs.data());
     }
 
     return layer;

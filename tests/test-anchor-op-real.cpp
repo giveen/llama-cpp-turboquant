@@ -50,9 +50,9 @@ static void op_decompress_layer(
         float * out_k, float * out_v) {
     int k = layer.heads[0].k;
 
-    std::vector<float> anchors(n_heads * 2 * k * D, 0.0f);
+    std::vector<ggml_bf16_t> anchors(n_heads * 2 * k * D, ggml_fp32_to_bf16(0.0f));
     std::vector<int32_t> anchor_of(2 * n_heads * S, 0);
-    std::vector<float> gamma(2 * n_heads * S, 0.0f);
+    std::vector<ggml_fp16_t> gamma(2 * n_heads * S, ggml_fp32_to_fp16(0.0f));
     std::vector<int32_t> slot_of(2 * n_heads * S, -1);
 
     int n_K_max = 0, n_V_max = 0;
@@ -69,14 +69,16 @@ static void op_decompress_layer(
     for (int h = 0; h < n_heads; h++) {
         const anchor_kv_head & head = layer.heads[h];
         for (int a = 0; a < head.k; a++) {
-            memcpy(&anchors[((h * 2 + 0) * k + a) * D], &head.anchor_keys[a * D],  D * sizeof(float));
-            memcpy(&anchors[((h * 2 + 1) * k + a) * D], &head.anchor_values[a * D], D * sizeof(float));
+            ggml_fp32_to_bf16_row(&head.anchor_keys[a * D],
+                    &anchors[((h * 2 + 0) * k + a) * D], D);
+            ggml_fp32_to_bf16_row(&head.anchor_values[a * D],
+                    &anchors[((h * 2 + 1) * k + a) * D], D);
         }
         for (int t = 0; t < S; t++) {
             anchor_of[(0 * n_heads + h) * S + t] = head.k_anchor_of[t];
             anchor_of[(1 * n_heads + h) * S + t] = head.v_anchor_of[t];
-            gamma[(0 * n_heads + h) * S + t]     = head.k_gamma[t];
-            gamma[(1 * n_heads + h) * S + t]     = head.v_gamma[t];
+            gamma[(0 * n_heads + h) * S + t]     = ggml_fp32_to_fp16(head.k_gamma[t]);
+            gamma[(1 * n_heads + h) * S + t]     = ggml_fp32_to_fp16(head.v_gamma[t]);
             slot_of[(0 * n_heads + h) * S + t]   = head.k_slot_of[t];
             slot_of[(1 * n_heads + h) * S + t]   = head.v_slot_of[t];
         }
@@ -99,9 +101,9 @@ static void op_decompress_layer(
         for (int h = 0; h < n_heads; h++) {
             for (int side = 0; side < 2; side++) {
                 const int a = anchor_of[(side * n_heads + h) * S + t];
-                const float g = gamma[(side * n_heads + h) * S + t];
+                const float g = ggml_fp16_to_fp32(gamma[(side * n_heads + h) * S + t]);
                 const int slot = slot_of[(side * n_heads + h) * S + t];
-                const float * anchor_vec = &anchors[((h * 2 + side) * k + a) * D];
+                const ggml_bf16_t * anchor_vec = &anchors[((h * 2 + side) * k + a) * D];
 
                 float * out = side == 0 ? out_k : out_v;
 
@@ -117,11 +119,11 @@ static void op_decompress_layer(
                     op_wht_inverse(deq, D, signs);
                     const float scale = scales[0];
                     for (int d = 0; d < D; d++) {
-                        out[t * n_embd + h * D + d] = g * anchor_vec[d] + deq[d] * scale;
+                        out[t * n_embd + h * D + d] = g * ggml_bf16_to_fp32(anchor_vec[d]) + deq[d] * scale;
                     }
                 } else {
                     for (int d = 0; d < D; d++) {
-                        out[t * n_embd + h * D + d] = g * anchor_vec[d];
+                        out[t * n_embd + h * D + d] = g * ggml_bf16_to_fp32(anchor_vec[d]);
                     }
                 }
             }
@@ -244,7 +246,7 @@ int main(int argc, char ** argv) {
     printf("op vs orig: K mse=%.4f cos=%.6f | V mse=%.4f cos=%.6f\n",
            mse_orig_k, cos_orig_k, mse_orig_v, cos_orig_v);
 
-    const bool pass = mse_k < 1e-6f && mse_v < 1e-6f;
+    const bool pass = mse_k < 1e-5f && mse_v < 1e-5f && max_k < 1e-2f && max_v < 1e-2f;
     printf(pass ? "PASS: op matches reference\n" : "FAIL: op diverges from reference\n");
     return pass ? 0 : 1;
 }

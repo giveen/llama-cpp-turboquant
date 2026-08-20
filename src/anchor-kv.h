@@ -92,6 +92,15 @@ struct anchor_kv_head {
     std::vector<int>      k_slot_of;         /* [S] slot index (-1 if no residual) */
     std::vector<int>      v_slot_of;         /* [S] slot index (-1 if no residual) */
 
+    /* Temporary CPU state used for layer-wide residual allocation */
+    std::vector<float>    k_residual_raw;
+    std::vector<float>    v_residual_raw;
+    std::vector<float>    k_utility;
+    std::vector<float>    v_utility;
+    std::vector<uint8_t>  is_anchor;
+    std::vector<int>      k_selected_positions;
+    std::vector<int>      v_selected_positions;
+
     /* Budget info */
     int n_K;            /* number of key residuals stored */
     int n_V;            /* number of value residuals stored */
@@ -152,10 +161,11 @@ struct anchor_kv_params {
  * the storage format.
  */
 anchor_kv_layer anchor_kv_compress(
-    const float * keys,     /* [n_heads * S * D] interleaved */
-    const float * values,   /* [n_heads * S * D] interleaved */
+    const float * keys,          /* [n_heads * S * D] pre-RoPE keys */
+    const float * values,        /* [n_heads * S * D] values */
     int S, int D, int n_heads,
-    const anchor_kv_params & params
+    const anchor_kv_params & params,
+    const float * keys_score = nullptr /* post-RoPE keys for anchor scoring */
 );
 
 /*
@@ -173,13 +183,23 @@ void anchor_kv_decompress_head(
  * Compute byte budget for a given configuration.
  * Returns the number of residuals that fit.
  */
-int anchor_kv_max_residuals(int S, int D, int W, float theta);
+int anchor_kv_max_residuals(int S, int D, int W, float theta, int k_frac = ANCHOR_KV_K_FRAC);
 
 /*
  * Per-side byte budget for K-only/V-only compression (is_v selects the side).
  * Returns the residual count whose storage fits the single side's theta budget.
  */
-int anchor_kv_max_residuals_side(int S, int D, int W, float theta, bool is_v);
+int anchor_kv_max_residuals_side(int S, int D, int W, float theta, bool is_v, int k_frac = ANCHOR_KV_K_FRAC);
+
+/* Layer-wide budgets pooled across all KV heads. */
+int anchor_kv_max_residuals_layer(int S, int D, int W, float theta, int n_heads, int k_frac = ANCHOR_KV_K_FRAC);
+int anchor_kv_max_residuals_side_layer(int S, int D, int W, float theta, bool is_v, int n_heads, int k_frac = ANCHOR_KV_K_FRAC);
+
+/*
+ * Return true when compression is exact at the window or has residual capacity
+ * for every configured compressed side.
+ */
+bool anchor_kv_budget_ready(int S, int D, const anchor_kv_params & params, int n_heads = 1);
 
 /*
  * WHT sign array generation (deterministic from seed).
