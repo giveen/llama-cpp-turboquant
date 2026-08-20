@@ -23,6 +23,7 @@
 
 #include "common.cuh"
 #include "anchor-kv-common.cuh"
+#include "anchor-kv-fa-state.h"
 
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -131,19 +132,75 @@ __global__ void anchor_kv_decompress_kernel(
 }
 
 // Static global for FA kernel to access compressed data
-// Set by anchor_kv_set_current_layer() before each FA call
+// Set by anchor_kv_upload_compressed() before each FA call
 anchor_kv_data_t g_anchor_kv_current_data = {};
-static int g_anchor_kv_enabled = 0;
 
-extern "C" void anchor_kv_set_current_layer(
-    const float * d_anchor_keys, const float * d_anchor_values,
-    const int * d_k_anchor_of, const int * d_v_anchor_of,
-    const float * d_k_gamma, const float * d_v_gamma,
-    const int * d_k_slot_of, const int * d_v_slot_of,
-    const uint8_t * d_k_res_codes, const float * d_k_res_scales,
-    const uint8_t * d_v_res_codes, const float * d_v_res_scales,
+extern "C" void anchor_kv_upload_compressed(
+    // CPU pointers to upload
+    const float * anchor_keys,     // [k, D]
+    const float * anchor_values,   // [k, D]
+    const int   * k_anchor_of,     // [S]
+    const int   * v_anchor_of,     // [S]
+    const float * k_gamma,         // [S]
+    const float * v_gamma,         // [S]
+    const int   * k_slot_of,       // [S]
+    const int   * v_slot_of,       // [S]
+    const uint8_t * k_res_codes,   // [n_K * D/4]
+    const float * k_res_scales,    // [n_K]
+    const uint8_t * v_res_codes,   // [n_V * D/4]
+    const float * v_res_scales,    // [n_V]
     int S, int D, int k, int n_K, int n_V
 ) {
+    float * d_anchor_keys;
+    cudaMalloc(&d_anchor_keys, (size_t)k * D * sizeof(float));
+    cudaMemcpy(d_anchor_keys, anchor_keys, (size_t)k * D * sizeof(float), cudaMemcpyHostToDevice);
+
+    float * d_anchor_values;
+    cudaMalloc(&d_anchor_values, (size_t)k * D * sizeof(float));
+    cudaMemcpy(d_anchor_values, anchor_values, (size_t)k * D * sizeof(float), cudaMemcpyHostToDevice);
+
+    int * d_k_anchor_of;
+    cudaMalloc(&d_k_anchor_of, (size_t)S * sizeof(int));
+    cudaMemcpy(d_k_anchor_of, k_anchor_of, (size_t)S * sizeof(int), cudaMemcpyHostToDevice);
+
+    int * d_v_anchor_of;
+    cudaMalloc(&d_v_anchor_of, (size_t)S * sizeof(int));
+    cudaMemcpy(d_v_anchor_of, v_anchor_of, (size_t)S * sizeof(int), cudaMemcpyHostToDevice);
+
+    float * d_k_gamma;
+    cudaMalloc(&d_k_gamma, (size_t)S * sizeof(float));
+    cudaMemcpy(d_k_gamma, k_gamma, (size_t)S * sizeof(float), cudaMemcpyHostToDevice);
+
+    float * d_v_gamma;
+    cudaMalloc(&d_v_gamma, (size_t)S * sizeof(float));
+    cudaMemcpy(d_v_gamma, v_gamma, (size_t)S * sizeof(float), cudaMemcpyHostToDevice);
+
+    int * d_k_slot_of;
+    cudaMalloc(&d_k_slot_of, (size_t)S * sizeof(int));
+    cudaMemcpy(d_k_slot_of, k_slot_of, (size_t)S * sizeof(int), cudaMemcpyHostToDevice);
+
+    int * d_v_slot_of;
+    cudaMalloc(&d_v_slot_of, (size_t)S * sizeof(int));
+    cudaMemcpy(d_v_slot_of, v_slot_of, (size_t)S * sizeof(int), cudaMemcpyHostToDevice);
+
+    size_t cpr = (size_t)D / 4;
+    uint8_t * d_k_res_codes;
+    cudaMalloc(&d_k_res_codes, (size_t)n_K * cpr);
+    cudaMemcpy(d_k_res_codes, k_res_codes, (size_t)n_K * cpr, cudaMemcpyHostToDevice);
+
+    float * d_k_res_scales;
+    cudaMalloc(&d_k_res_scales, (size_t)n_K * sizeof(float));
+    cudaMemcpy(d_k_res_scales, k_res_scales, (size_t)n_K * sizeof(float), cudaMemcpyHostToDevice);
+
+    uint8_t * d_v_res_codes;
+    cudaMalloc(&d_v_res_codes, (size_t)n_V * cpr);
+    cudaMemcpy(d_v_res_codes, v_res_codes, (size_t)n_V * cpr, cudaMemcpyHostToDevice);
+
+    float * d_v_res_scales;
+    cudaMalloc(&d_v_res_scales, (size_t)n_V * sizeof(float));
+    cudaMemcpy(d_v_res_scales, v_res_scales, (size_t)n_V * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Set the shared FA state
     g_anchor_kv_current_data.anchor_keys = d_anchor_keys;
     g_anchor_kv_current_data.anchor_values = d_anchor_values;
     g_anchor_kv_current_data.k_anchor_of = d_k_anchor_of;
@@ -161,15 +218,16 @@ extern "C" void anchor_kv_set_current_layer(
     g_anchor_kv_current_data.k = k;
     g_anchor_kv_current_data.n_K = n_K;
     g_anchor_kv_current_data.n_V = n_V;
-    g_anchor_kv_enabled = 1;
+
+    // Also set the shared state header (used by FA dispatch)
+    anchor_kv_fa_set_state(g_anchor_kv_current_data);
+    fprintf(stderr, "[ANCHOR-KV] GPU upload done: S=%d D=%d k=%d n_K=%d n_V=%d, state enabled=%d\n",
+            S, D, k, n_K, n_V, anchor_kv_fa_is_enabled() ? 1 : 0);
 }
 
 extern "C" void anchor_kv_clear_current_layer() {
-    g_anchor_kv_enabled = 0;
-}
-
-extern "C" int anchor_kv_is_enabled() {
-    return g_anchor_kv_enabled;
+    anchor_kv_fa_clear_state();
+    g_anchor_kv_current_data = {};
 }
 
 extern "C" void anchor_kv_decompress_gpu(

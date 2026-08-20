@@ -1633,27 +1633,40 @@ void llama_kv_cache::anchor_kv_upload_and_decompress(int32_t il) {
 
 // External declarations for AnchorKV CUDA functions
 extern "C" {
-    void anchor_kv_set_current_layer(
-        const float * d_anchor_keys, const float * d_anchor_values,
-        const int * d_k_anchor_of, const int * d_v_anchor_of,
-        const float * d_k_gamma, const float * d_v_gamma,
-        const int * d_k_slot_of, const int * d_v_slot_of,
-        const uint8_t * d_k_res_codes, const float * d_k_res_scales,
-        const uint8_t * d_v_res_codes, const float * d_v_res_scales,
+    // Upload compressed KV data to GPU and set FA dispatch state
+    void anchor_kv_upload_compressed(
+        const float * anchor_keys, const float * anchor_values,
+        const int   * k_anchor_of, const int   * v_anchor_of,
+        const float * k_gamma,     const float * v_gamma,
+        const int   * k_slot_of,   const int   * v_slot_of,
+        const uint8_t * k_res_codes, const float * k_res_scales,
+        const uint8_t * v_res_codes, const float * v_res_scales,
         int S, int D, int k, int n_K, int n_V
     );
-    void anchor_kv_clear_current_layer();
-    int anchor_kv_is_enabled();
 }
 
 void llama_kv_cache::anchor_kv_upload_compressed(int32_t il) {
     if (!anchor_kv_enabled || il < 0 || (size_t) il >= anchor_kv_data.size()) return;
 
     const anchor_kv_layer & layer = anchor_kv_data[il];
+    if (layer.heads.empty()) return;
 
-    /* Upload compressed data to GPU and set the static global for FA */
-    /* TODO: move to anchor-kv-decompress.cu with proper CUDA headers */
-    fprintf(stderr, "[ANCHOR-KV] layer %d: compressed data ready (GPU upload pending)\n", il);
+    const anchor_kv_head & head = layer.heads[0];
+    int S = head.S;
+    int D = head.D;
+    int k = head.k;
+
+    /* Delegate to the CUDA upload function (anchor-kv-decompress.cu),
+     * which has CUDA API access and sets the shared FA state. */
+    ::anchor_kv_upload_compressed(
+        head.anchor_keys.data(), head.anchor_values.data(),
+        head.k_anchor_of.data(), head.v_anchor_of.data(),
+        head.k_gamma.data(),     head.v_gamma.data(),
+        head.k_slot_of.data(),   head.v_slot_of.data(),
+        head.k_res_codes.data(), head.k_res_scales.data(),
+        head.v_res_codes.data(), head.v_res_scales.data(),
+        S, D, k, head.n_K, head.n_V
+    );
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
