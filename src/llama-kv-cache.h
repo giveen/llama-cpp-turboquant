@@ -314,7 +314,7 @@ private:
 
     // AnchorKV GPU decompression buffers (per layer)
     struct anchor_kv_gpu {
-        ggml_backend_buffer_t buf = nullptr;  // backing buffer for all tensors
+        ggml_backend_buffer_t buf = nullptr;   // backing buffer for all tensors
         ggml_tensor * anchor_keys = nullptr;   // [k, D] fp32
         ggml_tensor * anchor_values = nullptr; // [k, D] fp32
         ggml_tensor * k_anchor_of = nullptr;   // [S] int32
