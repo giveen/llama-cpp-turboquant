@@ -750,6 +750,16 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<ggml_type> types;
                 for (const auto & t : p) {
+                    /* Handle AnchorKV types (not ggml_type, use F16 as placeholder) */
+                    if (t == "anchor1" || t == "anchor2" || t == "anchor3") {
+                        types.push_back(GGML_TYPE_F16);
+                        float theta = (t == "anchor1") ? 0.2f : (t == "anchor2") ? 0.1f : 0.05f;
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%.3f", theta);
+                        setenv("ANCHOR_KV_THETA_K", buf, 1);
+                        setenv("ANCHOR_KV_THETA", buf, 1);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
@@ -770,6 +780,16 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<ggml_type> types;
                 for (const auto & t : p) {
+                    /* Handle AnchorKV types (not ggml_type, use F16 as placeholder) */
+                    if (t == "anchor1" || t == "anchor2" || t == "anchor3") {
+                        types.push_back(GGML_TYPE_F16);
+                        float theta = (t == "anchor1") ? 0.2f : (t == "anchor2") ? 0.1f : 0.05f;
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%.3f", theta);
+                        setenv("ANCHOR_KV_THETA_V", buf, 1);
+                        setenv("ANCHOR_KV_THETA", buf, 1);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
