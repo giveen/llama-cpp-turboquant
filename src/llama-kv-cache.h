@@ -311,6 +311,27 @@ private:
     anchor_kv_params anchor_kv_params;
     std::vector<anchor_kv_layer> anchor_kv_data;  // one per cache layer
 
+    // AnchorKV GPU decompression buffers (per layer)
+    struct anchor_kv_gpu {
+        ggml_backend_buffer_t buf = nullptr;  // backing buffer for all tensors
+        ggml_tensor * anchor_keys = nullptr;   // [k, D] fp32
+        ggml_tensor * anchor_values = nullptr; // [k, D] fp32
+        ggml_tensor * k_anchor_of = nullptr;   // [S] int32
+        ggml_tensor * v_anchor_of = nullptr;   // [S] int32
+        ggml_tensor * k_gamma = nullptr;       // [S] fp32
+        ggml_tensor * v_gamma = nullptr;       // [S] fp32
+        ggml_tensor * k_slot_of = nullptr;     // [S] int32
+        ggml_tensor * v_slot_of = nullptr;     // [S] int32
+        ggml_tensor * k_res_codes = nullptr;   // [N_K * D/4] uint8
+        ggml_tensor * k_res_scales = nullptr;  // [N_K] fp32
+        ggml_tensor * v_res_codes = nullptr;   // [N_V * D/4] uint8
+        ggml_tensor * v_res_scales = nullptr;  // [N_V] fp32
+    };
+    std::vector<anchor_kv_gpu> anchor_kv_gpu_data;  // one per layer
+
+    // AnchorKV: upload compressed data to GPU and decompress to dense K/V
+    void anchor_kv_upload_and_decompress(int32_t il);
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 

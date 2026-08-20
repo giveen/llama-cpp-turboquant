@@ -1527,6 +1527,9 @@ void llama_kv_cache::anchor_kv_compress_all() {
                        anchor_kv_data[il].heads[0].k,
                        anchor_kv_data[il].heads[0].n_K,
                        anchor_kv_data[il].heads[0].n_V);
+
+        // Upload and decompress to dense K/V
+        anchor_kv_upload_and_decompress(il);
     }
 }
 
@@ -1535,6 +1538,35 @@ const anchor_kv_layer * llama_kv_cache::get_anchor_kv_layer(int32_t il) const {
         return nullptr;
     }
     return &anchor_kv_data[il];
+}
+
+void llama_kv_cache::anchor_kv_upload_and_decompress(int32_t il) {
+    if (!anchor_kv_enabled || il < 0 || (size_t) il >= anchor_kv_data.size()) return;
+
+    const anchor_kv_layer & layer = anchor_kv_data[il];
+    const anchor_kv_head & head = layer.heads[0];  // TODO: multi-head
+
+    // Allocate GPU buffers if not yet done
+    if ((size_t)il >= anchor_kv_gpu_data.size()) {
+        anchor_kv_gpu_data.resize(il + 1);
+    }
+    anchor_kv_gpu & gpu = anchor_kv_gpu_data[il];
+
+    if (gpu.buf == nullptr) {
+        // Allocate a single backend buffer for all AnchorKV tensors
+        // TODO: proper allocation through ggml_backend
+        LLAMA_LOG_INFO("%s: AnchorKV GPU allocation for layer %d (placeholder)\n", __func__, il);
+    }
+
+    // Upload compressed data to GPU
+    // TODO: use ggml_backend_tensor_set for each tensor
+    // For now, this is a stub that logs the intent
+    LLAMA_LOG_INFO("%s: uploading AnchorKV layer %d: %d anchors, %d K_res, %d V_res\n",
+                   __func__, il, head.k, head.n_K, head.n_V);
+
+    // Launch decompression kernel
+    // TODO: call anchor_kv_decompress_gpu() with device pointers
+    // The result should be written to layers[il].k and layers[il].v tensors
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
