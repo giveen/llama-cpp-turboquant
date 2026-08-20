@@ -1724,6 +1724,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    // AnchorKV: set env var from cache type if anchor mode
+    if (params.cache_anchor_kv_theta > 0.0f) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f", params.cache_anchor_kv_theta);
+        setenv("ANCHOR_KV_THETA", buf, 1);
+    }
+
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {
             case COMMON_MOE_CACHE_MODE_OFF:

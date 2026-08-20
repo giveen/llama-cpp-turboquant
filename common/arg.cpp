@@ -318,19 +318,47 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO4_0,
 };
 
+// AnchorKV cache types (not ggml_type, handled specially)
+static const std::vector<std::pair<std::string, float>> anchor_kv_types = {
+    {"anchor1", 0.2f},   // 5x compression, best quality
+    {"anchor2", 0.1f},   // 10x compression, good quality
+    {"anchor3", 0.05f},  // 20x compression, aggressive
+};
+
 static ggml_type kv_cache_type_from_str(const std::string & s) {
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
         }
     }
+    // Check AnchorKV types - return F16 as underlying tensor type
+    for (const auto & [name, theta] : anchor_kv_types) {
+        if (s == name) {
+            return GGML_TYPE_F16;  // AnchorKV uses f16 tensors + compression
+        }
+    }
     throw std::runtime_error("Unsupported cache type: " + s);
+}
+
+// Get AnchorKV theta from cache type string (0.0 if not an anchor type)
+static float anchor_kv_theta_from_str(const std::string & s) {
+    for (const auto & [name, theta] : anchor_kv_types) {
+        if (s == name) {
+            return theta;
+        }
+    }
+    return 0.0f;
 }
 
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+        msg << ggml_type_name(type) << ", ";
+    }
+    // Add AnchorKV types
+    for (size_t i = 0; i < anchor_kv_types.size(); i++) {
+        msg << anchor_kv_types[i].first;
+        if (i < anchor_kv_types.size() - 1) msg << ", ";
     }
     return msg.str();
 }
@@ -2395,6 +2423,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ),
         [](common_params & params, const std::string & value) {
             params.cache_type_k = kv_cache_type_from_str(value);
+            float theta = anchor_kv_theta_from_str(value);
+            if (theta > 0.0f) params.cache_anchor_kv_theta = theta;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2408,6 +2438,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ),
         [](common_params & params, const std::string & value) {
             params.cache_type_v = kv_cache_type_from_str(value);
+            float theta = anchor_kv_theta_from_str(value);
+            if (theta > 0.0f) params.cache_anchor_kv_theta = theta;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
