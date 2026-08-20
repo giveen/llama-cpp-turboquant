@@ -793,7 +793,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (anchor_kv_fa_enabled()) {
         const ggml_tensor * Q = dst->src[0];
         if (Q->ne[1] <= 4) {  // decode mode (single/multiple query)
-            fprintf(stderr, "[ANCHOR-KV] FA dispatch: using fused kernel (decode)\n");
             cudaStream_t stream = ctx.stream();
             const float * d_Q = (const float *)Q->data;
             float * d_out = (float *)dst->data;
