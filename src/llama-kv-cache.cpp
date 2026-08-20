@@ -673,6 +673,10 @@ void llama_kv_cache::anchor_kv_parse_env() {
     // Combined residual budget theta: prefer K (more sensitive to quality);
     // when only one side is enabled this falls through to that side's theta.
     akv_params.theta = theta_k > 0.0f ? theta_k : theta_v;
+    // Per-side thetas drive the per-side byte budgets in anchor-kv.cpp;
+    // asymmetric K/V ratios (e.g. anchor1 + anchor3) need both values.
+    akv_params.theta_k = theta_k;
+    akv_params.theta_v = theta_v;
 
     fprintf(stderr, "[ANCHOR-KV] env K=%s V=%s combined=%s\n",
             anchor_theta_k_env ? anchor_theta_k_env : "(null)",

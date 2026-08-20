@@ -108,7 +108,9 @@ struct anchor_kv_layer {
 /* ---------- Compression parameters ---------- */
 
 struct anchor_kv_params {
-    float theta;        /* retained fraction (e.g. 0.05 for 20x compression) */
+    float theta;        /* combined retained fraction (both sides share one) */
+    float theta_k;      /* K-side retained fraction (0 = not set) */
+    float theta_v;      /* V-side retained fraction (0 = not set) */
     int   W;            /* recency window (default ANCHOR_KV_W = 32) */
     int   k_frac;       /* anchor budget fraction (default 128) */
     float rho;          /* scored anchor fraction (default 0.7) */
@@ -118,6 +120,8 @@ struct anchor_kv_params {
 
     anchor_kv_params()
         : theta(0.05f)
+        , theta_k(0.0f)
+        , theta_v(0.0f)
         , W(ANCHOR_KV_W)
         , k_frac(ANCHOR_KV_K_FRAC)
         , rho(ANCHOR_KV_RHO)

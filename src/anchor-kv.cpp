@@ -490,16 +490,27 @@ static anchor_kv_head compress_head(
 
     /* --- Step 4: Compute residual budget (Eq. 9) --- */
 
+    // A single side falls back to the combined theta when its per-side theta
+    // is unset (back-compat for callers that only set params.theta).
+    const float t_k = params.theta_k > 0.0f ? params.theta_k : params.theta;
+    const float t_v = params.theta_v > 0.0f ? params.theta_v : params.theta;
+
     if (params.compress_k && params.compress_v) {
-        const int N = anchor_kv_max_residuals(S, D, params.W, params.theta);
-        head.n_K = N / 2;
-        head.n_V = N - head.n_K;
+        if (params.theta_k > 0.0f && params.theta_v > 0.0f && fabsf(params.theta_k - params.theta_v) > 1e-6f) {
+            // asymmetric K/V thetas: each side gets its own byte budget
+            head.n_K = anchor_kv_max_residuals_side(S, D, params.W, params.theta_k, /*is_v=*/false);
+            head.n_V = anchor_kv_max_residuals_side(S, D, params.W, params.theta_v, /*is_v=*/true);
+        } else {
+            const int N = anchor_kv_max_residuals(S, D, params.W, params.theta);
+            head.n_K = N / 2;
+            head.n_V = N - head.n_K;
+        }
     } else if (params.compress_k) {
-        head.n_K = anchor_kv_max_residuals_side(S, D, params.W, params.theta, /*is_v=*/false);
+        head.n_K = anchor_kv_max_residuals_side(S, D, params.W, t_k, /*is_v=*/false);
         head.n_V = 0;
     } else {
         head.n_K = 0;
-        head.n_V = anchor_kv_max_residuals_side(S, D, params.W, params.theta, /*is_v=*/true);
+        head.n_V = anchor_kv_max_residuals_side(S, D, params.W, t_v, /*is_v=*/true);
     }
 
     /* --- Step 5: Select residuals by utility --- */

@@ -115,6 +115,31 @@ int main() {
         if (cos < 0.5f) { printf("FAIL: K-only recon too poor\n"); return 1; }
     }
 
+    // Asymmetric K/V thetas (both sides compressed, different ratios)
+    {
+        p.compress_k = true;
+        p.compress_v = true;
+        p.theta = 0.2f;
+        p.theta_k = 0.15f;
+        p.theta_v = 0.18f;
+        anchor_kv_layer layer = anchor_kv_compress(keys.data(), values.data(), S, D, n_heads, p);
+        const anchor_kv_head & h = layer.heads[0];
+        const int n_k_side = anchor_kv_max_residuals_side(S, D, p.W, p.theta_k, false);
+        const int n_v_side = anchor_kv_max_residuals_side(S, D, p.W, p.theta_v, true);
+        printf("Asym theta: k=%d n_K=%d (budget %d) n_V=%d (budget %d)\n",
+               h.k, h.n_K, n_k_side, h.n_V, n_v_side);
+        if (h.n_K != n_k_side || h.n_V != n_v_side) {
+            printf("FAIL: asymmetric theta budget mismatch (n_K=%d vs %d, n_V=%d vs %d)\n",
+                   h.n_K, n_k_side, h.n_V, n_v_side);
+            return 1;
+        }
+        if (n_k_side >= n_v_side) {
+            printf("FAIL: theta_k=0.15 should give fewer K residuals than theta_v=0.18 (%d >= %d)\n",
+                   n_k_side, n_v_side);
+            return 1;
+        }
+    }
+
     printf("PASS: asymmetric V-only/K-only roundtrip\n");
     return 0;
 }
