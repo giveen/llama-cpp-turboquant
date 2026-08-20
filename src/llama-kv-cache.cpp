@@ -1566,10 +1566,6 @@ void llama_kv_cache::anchor_kv_compress_all() {
 
         // Upload compressed data to GPU for fused FA kernel
         anchor_kv_upload_compressed(il);
-
-        // Also decompress to dense K/V for validation
-        // TODO: remove this once the fused kernel is fully validated
-        anchor_kv_upload_and_decompress(il);
     }
 }
 
@@ -1691,6 +1687,7 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
 
     return v_cells[seq_to_stream[seq_id]];
 }
+
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
