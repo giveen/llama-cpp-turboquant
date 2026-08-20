@@ -751,6 +751,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // AnchorKV: true once the cache is compressed - the decode graph topology
+    // changes (decompress nodes, scratch views) so reuse must be invalidated
+    bool anchor_active = false;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -845,7 +849,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            anchor_active == other.anchor_active;
     }
 };
 

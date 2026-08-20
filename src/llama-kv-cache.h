@@ -170,6 +170,24 @@ public:
     bool get_anchor_kv_compressed() const { return !anchor_kv_data.empty(); }
     const anchor_kv_layer * get_anchor_kv_layer(int32_t il) const;
 
+    // AnchorKV: build the in-graph decompress node for one layer. The op writes
+    // the reconstructed dense K (is_k=true) or V (is_k=false) into the shared
+    // scratch buffer; the result is a view of that scratch.
+    ggml_tensor * anchor_kv_build_decompress(ggml_context * ctx, int32_t il, bool is_k) const;
+
+    // AnchorKV: shared dense scratch buffers (one layer of dense K/V, reused
+    // across all layers so only a single layer's worth of memory is resident)
+    ggml_tensor * get_anchor_scratch_k() const { return anchor_scratch_k; }
+    ggml_tensor * get_anchor_scratch_v() const { return anchor_scratch_v; }
+
+    // AnchorKV: reset the per-graph-build dependency chain (see anchor_chain_k /
+    // anchor_chain_v below). Must be called exactly once before each new graph
+    // is built, since the cached tensors belong to the previous graph's
+    // ggml_context and must not be reused as src[] ancestors in a new one.
+    // Called from llama_kv_cache_context::apply(), which always runs before
+    // the graph for a ubatch is constructed.
+    void anchor_kv_reset_chain() const { anchor_chain_k = nullptr; anchor_chain_v = nullptr; }
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
     //
     // graph_build API
@@ -314,27 +332,47 @@ private:
 
     // AnchorKV GPU decompression buffers (per layer)
     struct anchor_kv_gpu {
-        ggml_backend_buffer_t buf = nullptr;   // backing buffer for all tensors
-        ggml_tensor * anchor_keys = nullptr;   // [k, D] fp32
-        ggml_tensor * anchor_values = nullptr; // [k, D] fp32
-        ggml_tensor * k_anchor_of = nullptr;   // [S] int32
-        ggml_tensor * v_anchor_of = nullptr;   // [S] int32
-        ggml_tensor * k_gamma = nullptr;       // [S] fp32
-        ggml_tensor * v_gamma = nullptr;       // [S] fp32
-        ggml_tensor * k_slot_of = nullptr;     // [S] int32
-        ggml_tensor * v_slot_of = nullptr;     // [S] int32
-        ggml_tensor * k_res_codes = nullptr;   // [N_K * D/4] uint8
-        ggml_tensor * k_res_scales = nullptr;  // [N_K] fp32
-        ggml_tensor * v_res_codes = nullptr;   // [N_V * D/4] uint8
-        ggml_tensor * v_res_scales = nullptr;  // [N_V] fp32
+        ggml_context_ptr ctx;                    // context owning the tensors
+        ggml_backend_buffer_ptr buf;             // backing buffer (device or CPU)
+        ggml_tensor * anchors      = nullptr;    // [n_heads, 2, k, D] f32
+        ggml_tensor * anchor_of    = nullptr;    // [2, n_heads, S] i32
+        ggml_tensor * gamma        = nullptr;    // [2, n_heads, S] f32
+        ggml_tensor * slot_of      = nullptr;    // [2, n_heads, S] i32
+        ggml_tensor * k_res_codes  = nullptr;    // [n_heads, n_K, D/4] u8
+        ggml_tensor * k_res_scales = nullptr;    // [n_heads, n_K] f32
+        ggml_tensor * v_res_codes  = nullptr;    // [n_heads, n_V, D/4] u8
+        ggml_tensor * v_res_scales = nullptr;    // [n_heads, n_V] f32
     };
     std::vector<anchor_kv_gpu> anchor_kv_gpu_data;  // one per layer
 
-    // AnchorKV: upload compressed data to GPU and decompress to dense K/V
-    void anchor_kv_upload_and_decompress(int32_t il);
+    // AnchorKV: shared dense scratch buffers + their context/buffer
+    ggml_context_ptr anchor_ctx;
+    ggml_backend_buffer_ptr anchor_buf;
+    ggml_tensor * anchor_scratch_k = nullptr;    // [n_embd_k_gqa, kv_size] f16
+    ggml_tensor * anchor_scratch_v = nullptr;    // [n_embd_v_gqa, kv_size] f16
+
+    // AnchorKV: per-graph-build chain state. Holds the most recently built
+    // tensor that touched anchor_scratch_k / anchor_scratch_v (decompress result,
+    // then cpy_k/cpy_v result, then get_k/get_v result, then next layer's
+    // decompress result, ...). anchor_kv_build_decompress/get_k/get_v/cpy_k/cpy_v
+    // read this as the base for their view/op instead of the raw scratch tensor,
+    // and write their own result back into it. This threads a REAL src[]/view_src
+    // ancestry chain through every reader and writer of the shared scratch buffer,
+    // across all layers, so ggml's topological order (not incidental call order)
+    // enforces layer-il decompress -> cpy -> get -> layer-(il+1) decompress -> ...
+    // Reset once per graph build via anchor_kv_reset_chain() (see above); must not
+    // be dereferenced or reused after the ggml_context it was built in is gone.
+    mutable ggml_tensor * anchor_chain_k = nullptr;
+    mutable ggml_tensor * anchor_chain_v = nullptr;
 
     // AnchorKV: upload compressed data to GPU for fused kernel
     void anchor_kv_upload_compressed(int32_t il);
+
+    // AnchorKV: build the per-layer GPU tensors for the in-graph decompress op
+    void anchor_kv_upload_layer(int32_t ikv);
+
+    // AnchorKV: free the dense per-layer KV buffers after compression
+    void anchor_kv_free_dense();
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -422,6 +460,19 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // AnchorKV: true when decode graphs must read from the compressed
+    // representation (compression happened) instead of the dense cache
+    bool get_anchor_active() const override;
+
+    // AnchorKV: build the in-graph decompress node for one layer (expanded by
+    // the caller before cpy_k/cpy_v so it executes first)
+    ggml_tensor * build_anchor_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * build_anchor_v(ggml_context * ctx, int32_t il) const;
+
+    // AnchorKV: shared dense scratch buffers
+    ggml_tensor * get_anchor_scratch_k() const { return kv->get_anchor_scratch_k(); }
+    ggml_tensor * get_anchor_scratch_v() const { return kv->get_anchor_scratch_v(); }
 
     // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;

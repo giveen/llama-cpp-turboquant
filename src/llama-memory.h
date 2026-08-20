@@ -73,6 +73,10 @@ struct llama_memory_context_i {
     // TurboQuant InnerQ: get per-channel scale_inv tensor for Q/V equalization
     // Returns nullptr when InnerQ is not active. Override in KV cache contexts.
     virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
+
+    // AnchorKV: true when decode graphs must read from the compressed
+    // representation instead of the dense cache. Changes invalidate graph reuse.
+    virtual bool get_anchor_active() const { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

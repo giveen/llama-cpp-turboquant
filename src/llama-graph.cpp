@@ -2847,6 +2847,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    // AnchorKV: expand the per-layer decompress nodes before cpy_k/cpy_v so
+    // they execute first and fill the shared scratch with the compressed
+    // history; cpy_k/cpy_v then append the current batch on top
+    const bool anchor_active = mctx_cur->get_anchor_active();
+    if (anchor_active) {
+        ggml_build_forward_expand(gf, mctx_cur->build_anchor_k(ctx0, il));
+        ggml_build_forward_expand(gf, mctx_cur->build_anchor_v(ctx0, il));
+    }
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();

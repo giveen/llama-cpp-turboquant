@@ -2728,21 +2728,22 @@ llm_graph_params llama_context::graph_params(
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
     return {
-        /*.arch        =*/ model.arch,
-        /*.hparams     =*/ model.hparams,
-        /*.cparams     =*/ cparams,
-        /*.ubatch      =*/ ubatch,
-        /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
-        /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.arch          =*/ model.arch,
+        /*.hparams       =*/ model.hparams,
+        /*.cparams       =*/ cparams,
+        /*.ubatch        =*/ ubatch,
+        /*.gtype         =*/ gtype,
+        /*.sched         =*/ sched.get(),
+        /*.backend_cpu   =*/ backend_cpu,
+        /*.cvec          =*/ cvec.get(),
+        /*.loras         =*/ loras.get(),
+        /*.mctx          =*/ mctx,
+        /*.cross         =*/ &cross,
+        /*.anchor_active =*/ mctx ? mctx->get_anchor_active() : false,
+        /*.samplers      =*/ sampling.samplers,
+        /*.n_outputs     =*/ n_outputs,
+        /*.cb            =*/ graph_get_cb(),
+        /*.res           =*/ res,
     };
 }
 
@@ -3862,6 +3863,18 @@ llama_context * llama_init_from_model(
         (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 ||
          params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
         LLAMA_LOG_WARN("%s: turbo cache types require flash_attn — enabling automatically\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    // AnchorKV cache types (F16 tensors + compressed representation) also
+    // require flash attention - the decompress path assumes the non-transposed
+    // V layout
+    const char * anchor_theta_env = getenv("ANCHOR_KV_THETA");
+    const char * anchor_theta_k_env = getenv("ANCHOR_KV_THETA_K");
+    const char * anchor_theta_v_env = getenv("ANCHOR_KV_THETA_V");
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
+        (anchor_theta_env || anchor_theta_k_env || anchor_theta_v_env)) {
+        LLAMA_LOG_WARN("%s: AnchorKV requires flash_attn — enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 

@@ -587,14 +587,12 @@ extern "C" {
         GGML_OP_MAP_CUSTOM2,
         GGML_OP_MAP_CUSTOM3,
 
-        GGML_OP_CUSTOM,
-
-        GGML_OP_CROSS_ENTROPY_LOSS,
+        GGML_OP_CUSTOM,        GGML_OP_CROSS_ENTROPY_LOSS,
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
-
         GGML_OP_GLU,
+        GGML_OP_ANCHOR_DECOMPRESS,
 
         GGML_OP_COUNT,
     };
@@ -2598,6 +2596,41 @@ extern "C" {
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // AnchorKV: reconstruct one dense KV layer from the compressed anchor-residual
+    // representation. Writes f16 into dst ([n_embd_gqa, kv_size]); positions past the
+    // compressed sequence length S are zeroed so flash attention's causal mask is safe.
+    // Inputs (all contiguous, 8 tensors):
+    //   anchors      - [n_heads, 2, k, D] f32  (side 0 = K anchors, 1 = V anchors)
+    //   anchor_of    - [2, n_heads, S] i32     (anchor index per position, per side)
+    //   gamma        - [2, n_heads, S] f32     (projection coefficient per position)
+    //   slot_of      - [2, n_heads, S] i32     (residual slot index, -1 = none)
+    //   k_res_codes  - [n_heads, n_K, D/4] u8  (packed 2-bit residual codes, K side)
+    //   k_res_scales - [n_heads, n_K] f32      (per-residual absmax scale, K side)
+    //   v_res_codes  - [n_heads, n_V, D/4] u8
+    //   v_res_scales - [n_heads, n_V] f32
+    // is_k: 1 decodes the K side into dst, 0 decodes the V side.
+    // prev_dep: optional (may be NULL) ordering-only dependency. dst is a shared
+    //   scratch buffer reused across layers, so the caller can pass the tensor
+    //   that was the last reader/writer of that scratch (typically the previous
+    //   layer's cpy_k/cpy_v or attention-read result) here. It carries no data
+    //   used by this op's math - it is wired into src[8] purely so ggml's real
+    //   dependency graph (src[]/topological order) forces this decompress to run
+    //   after the previous layer's uses of the shared buffer are done, instead of
+    //   relying on the incidental order graph-build calls happen to occur in.
+    GGML_API struct ggml_tensor * ggml_anchor_decompress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dst,
+            struct ggml_tensor  * anchors,
+            struct ggml_tensor  * anchor_of,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * slot_of,
+            struct ggml_tensor  * k_res_codes,
+            struct ggml_tensor  * k_res_scales,
+            struct ggml_tensor  * v_res_codes,
+            struct ggml_tensor  * v_res_scales,
+            bool                  is_k,
+            struct ggml_tensor  * prev_dep);
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

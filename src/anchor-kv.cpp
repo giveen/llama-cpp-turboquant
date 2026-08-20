@@ -595,26 +595,12 @@ void anchor_kv_decompress_head(
         is_anchor[head.anchor_positions[i]] = 1;
     }
 
-    /* Build position -> residual slot lookup */
-    std::vector<int> k_slot(S, -1);
-    std::vector<int> v_slot(S, -1);
-    for (int t = 0; t < S; t++) {
-        if (head.k_residual_mask[t / 64] & (1ULL << (t % 64))) {
-            /* Find slot index by counting set bits up to t */
-            int slot = 0;
-            for (int j = 0; j < t; j++) {
-                if (head.k_residual_mask[j / 64] & (1ULL << (j % 64))) slot++;
-            }
-            k_slot[t] = slot;
-        }
-        if (head.v_residual_mask[t / 64] & (1ULL << (t % 64))) {
-            int slot = 0;
-            for (int j = 0; j < t; j++) {
-                if (head.v_residual_mask[j / 64] & (1ULL << (j % 64))) slot++;
-            }
-            v_slot[t] = slot;
-        }
-    }
+    /* Position -> residual slot lookup: residual codes are stored in
+     * utility-selection order (sel_K/sel_V in compress_head), not ascending
+     * position order, so the slot index must come from the precomputed
+     * k_slot_of/v_slot_of arrays rather than from counting bitmask bits. */
+    const int * k_slot = head.k_slot_of.data();
+    const int * v_slot = head.v_slot_of.data();
 
     /* Reconstruct K */
     for (int t = 0; t < S; t++) {

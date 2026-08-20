@@ -1137,11 +1137,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
-
     "GLU",
+    "ANCHOR_DECOMPRESS",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1253,11 +1253,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
     "sgd(x)",
-
     "glu(x)",
+    "anchor_decompress(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6378,6 +6378,77 @@ struct ggml_tensor * ggml_turbo_wht(
     // Store direction and group_size in op_params
     memcpy(result->op_params + 0, &direction, sizeof(int));
     memcpy(result->op_params + sizeof(int), &group_size, sizeof(int));
+
+    return result;
+}
+
+// ggml_anchor_decompress
+
+struct ggml_tensor * ggml_anchor_decompress(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * dst,
+        struct ggml_tensor  * anchors,
+        struct ggml_tensor  * anchor_of,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * slot_of,
+        struct ggml_tensor  * k_res_codes,
+        struct ggml_tensor  * k_res_scales,
+        struct ggml_tensor  * v_res_codes,
+        struct ggml_tensor  * v_res_scales,
+        bool                  is_k,
+        struct ggml_tensor  * prev_dep) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(anchors->type == GGML_TYPE_F32 && anchors->ne[1] == 2);
+    GGML_ASSERT(anchor_of->type == GGML_TYPE_I32 && anchor_of->ne[0] == 2);
+    GGML_ASSERT(gamma->type     == GGML_TYPE_F32 && gamma->ne[0] == 2);
+    GGML_ASSERT(slot_of->type   == GGML_TYPE_I32 && slot_of->ne[0] == 2);
+    GGML_ASSERT(k_res_codes->type  == GGML_TYPE_I8);
+    GGML_ASSERT(k_res_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_res_codes->type  == GGML_TYPE_I8);
+    GGML_ASSERT(v_res_scales->type == GGML_TYPE_F32);
+
+    const int n_heads = (int) anchors->ne[0];
+    const int k       = (int) anchors->ne[2];
+    const int D       = (int) anchors->ne[3];
+    const int S       = (int) anchor_of->ne[2];
+
+    GGML_ASSERT(k > 0);
+    GGML_ASSERT(S > 0);
+    GGML_ASSERT(n_heads > 0);
+
+    GGML_ASSERT(anchor_of->ne[1] == n_heads);
+    GGML_ASSERT(gamma->ne[1]     == n_heads);
+    GGML_ASSERT(slot_of->ne[1]   == n_heads);
+    GGML_ASSERT(anchor_of->ne[2] == gamma->ne[2] && gamma->ne[2] == slot_of->ne[2]);
+    GGML_ASSERT(k_res_codes->ne[0] == n_heads && k_res_scales->ne[0] == n_heads);
+    GGML_ASSERT(v_res_codes->ne[0] == n_heads && v_res_scales->ne[0] == n_heads);
+    GGML_ASSERT(D % 4 == 0);
+    GGML_ASSERT(k_res_codes->ne[2] == D / 4 && v_res_codes->ne[2] == D / 4);
+    GGML_ASSERT(k_res_scales->ne[1] == k_res_codes->ne[1]);
+    GGML_ASSERT(v_res_scales->ne[1] == v_res_codes->ne[1]);
+    GGML_ASSERT(dst->ne[0] == n_heads * D);
+
+    // note: the result is a view of dst so the op writes in-place into the
+    //       pre-allocated scratch buffer shared across layers
+    struct ggml_tensor * result = ggml_view_tensor(ctx, dst);
+
+    result->op     = GGML_OP_ANCHOR_DECOMPRESS;
+    result->src[0] = anchors;
+    result->src[1] = anchor_of;
+    result->src[2] = gamma;
+    result->src[3] = slot_of;
+    result->src[4] = k_res_codes;
+    result->src[5] = k_res_scales;
+    result->src[6] = v_res_codes;
+    result->src[7] = v_res_scales;
+    // ordering-only edge: forces this node after whatever last touched the
+    // shared scratch buffer (dst) for the previous layer - see prev_dep doc
+    // above. Not read by the compute kernel.
+    result->src[8] = prev_dep;
+
+    const int32_t is_k_i32 = is_k ? 1 : 0;
+    ggml_set_op_params_i32(result, 0, is_k_i32);
 
     return result;
 }

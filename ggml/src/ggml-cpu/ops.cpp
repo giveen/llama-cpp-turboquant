@@ -11356,6 +11356,131 @@ void ggml_compute_forward_turbo_wht(
     }
 }
 
+// ggml_compute_forward_anchor_decompress
+
+// AnchorKV 2-bit residual codec constants (must match src/anchor-kv.cpp)
+static const float anchor_lloyd_centroids[4] = {
+    -1.510138f, -0.452823f, 0.452823f, 1.510138f
+};
+
+// deterministic WHT signs (LCG, seed 42 - must match anchor_kv_get_wht_signs)
+static void anchor_cpu_get_wht_signs(float * signs, int d) {
+    uint64_t state = 42;
+    for (int i = 0; i < d; i++) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        signs[i] = ((state >> 11) & 1) ? 1.0f : -1.0f;
+    }
+}
+
+// inverse WHT: 1/sqrt(d) -> butterfly -> signs (must match anchor_kv_wht_inverse)
+static void anchor_cpu_wht_inverse(float * x, int d, const float * signs) {
+    const float inv_sqrt_d = 1.0f / sqrtf((float) d);
+    for (int i = 0; i < d; i++) x[i] *= inv_sqrt_d;
+    for (int h = 1; h < d; h *= 2) {
+        for (int i = 0; i < d; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < d; i++) x[i] *= signs[i];
+}
+
+static void ggml_compute_forward_anchor_decompress_f16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+
+    const ggml_tensor * anchors      = dst->src[0]; // [n_heads, 2, k, D] f32
+    const ggml_tensor * anchor_of    = dst->src[1]; // [2, n_heads, S] i32
+    const ggml_tensor * gamma        = dst->src[2]; // [2, n_heads, S] f32
+    const ggml_tensor * slot_of      = dst->src[3]; // [2, n_heads, S] i32
+    const ggml_tensor * k_res_codes  = dst->src[4]; // [n_heads, n_K, D/4] u8
+    const ggml_tensor * k_res_scales = dst->src[5]; // [n_heads, n_K] f32
+    const ggml_tensor * v_res_codes  = dst->src[6]; // [n_heads, n_V, D/4] u8
+    const ggml_tensor * v_res_scales = dst->src[7]; // [n_heads, n_V] f32
+
+    int is_k = 0;
+    memcpy(&is_k, dst->op_params, sizeof(int));
+
+    const int n_heads = (int) anchors->ne[0];
+    const int k       = (int) anchors->ne[2];
+    const int D       = (int) anchors->ne[3];
+    const int S       = (int) anchor_of->ne[2];
+    const int n_K     = (int) k_res_codes->ne[1];
+    const int n_V     = (int) v_res_codes->ne[1];
+    const int cpr     = D / 4;
+    const int64_t n_embd = dst->ne[0];
+    const int64_t kv_size = dst->ne[1];
+
+    GGML_ASSERT(n_embd == (int64_t) n_heads * D);
+    GGML_ASSERT((int) anchors->ne[1] == 2);
+
+    const float * anchors_data      = (const float *) anchors->data;
+    const int32_t * anchor_of_data  = (const int32_t *) anchor_of->data;
+    const float * gamma_data        = (const float *) gamma->data;
+    const int32_t * slot_of_data    = (const int32_t *) slot_of->data;
+    const uint8_t * k_codes_data    = (const uint8_t *) k_res_codes->data;
+    const float * k_scales_data     = (const float *) k_res_scales->data;
+    const uint8_t * v_codes_data    = (const uint8_t *) v_res_codes->data;
+    const float * v_scales_data     = (const float *) v_res_scales->data;
+    ggml_fp16_t * dst_data          = (ggml_fp16_t *) dst->data;
+
+    float signs[128];
+    anchor_cpu_get_wht_signs(signs, D);
+
+    const int side = is_k ? 0 : 1; // 0 = K anchors/arrays, 1 = V anchors/arrays
+
+    // Only positions [0, S) hold compressed data. Positions >= S are never
+    // touched here: the scratch is zeroed once at allocation, and decode steps
+    // append new tokens at S, S+1, ... via cpy_k/cpy_v. Zeroing t >= S here
+    // would wipe previously appended tokens on every graph replay.
+    const int64_t t_start = (S * params->ith) / params->nth;
+    const int64_t t_end   = (S * (params->ith + 1)) / params->nth;
+
+    for (int64_t t = t_start; t < t_end; t++) {
+        for (int h = 0; h < n_heads; h++) {
+            const int a = anchor_of_data[(side * n_heads + h) * S + t];
+            const float g = gamma_data[(side * n_heads + h) * S + t];
+            const int slot = slot_of_data[(side * n_heads + h) * S + t];
+
+            const float * anchor_vec = anchors_data + ((h * 2 + side) * k + a) * D;
+
+            if (slot >= 0) {
+                const uint8_t * codes  = (side == 0 ? k_codes_data  : v_codes_data)  + (h * (side == 0 ? n_K : n_V) + slot) * cpr;
+                const float   * scales = (side == 0 ? k_scales_data : v_scales_data) +  h * (side == 0 ? n_K : n_V) + slot;
+
+                float deq[128];
+                for (int d = 0; d < D; d++) {
+                    const int idx = (codes[d / 4] >> ((d % 4) * 2)) & 0x3;
+                    deq[d] = anchor_lloyd_centroids[idx];
+                }
+                anchor_cpu_wht_inverse(deq, D, signs);
+                const float scale = scales[0];
+                for (int d = 0; d < D; d++) {
+                    const float val = g * anchor_vec[d] + deq[d] * scale;
+                    dst_data[t * n_embd + h * D + d] = ggml_fp32_to_fp16(val);
+                }
+            } else {
+                for (int d = 0; d < D; d++) {
+                    const float val = g * anchor_vec[d];
+                    dst_data[t * n_embd + h * D + d] = ggml_fp32_to_fp16(val);
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_anchor_decompress(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+    ggml_compute_forward_anchor_decompress_f16(params, dst);
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

@@ -513,9 +513,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
-    auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
+    auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only, size_t max_src = GGML_MAX_SRC) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
-        for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+        for (size_t i = 0; i < max_src; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
                 continue;
             }
@@ -1009,6 +1009,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_TURBO_WHT: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_ANCHOR_DECOMPRESS: {
+                // src[8] is a pure ordering dependency (forces this op after the
+                // previous layer's use of the shared scratch buffer - see
+                // ggml_anchor_decompress's prev_dep param); it carries no data
+                // relevant to this op's math and its split state need not agree
+                // with src[0..7], so exclude it from the generic check.
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false, /*max_src =*/ 8);
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
