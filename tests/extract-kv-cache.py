@@ -28,8 +28,11 @@ def main():
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B",
                         help="HuggingFace model name or path")
     parser.add_argument("--prompt", type=str,
-                        default="The quick brown fox jumps over the lazy dog. " * 100,
-                        help="Prompt to fill the KV cache")
+                        default=None,
+                        help="Prompt text (or --prompt-file for a text file)")
+    parser.add_argument("--prompt-file", type=str,
+                        default=None,
+                        help="Text file to use as prompt (e.g. wikitext)")
     parser.add_argument("--seq-len", type=int, default=4096,
                         help="Target sequence length (truncate/pad prompt)")
     parser.add_argument("--layer", type=int, default=0,
@@ -46,8 +49,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float32,
-        device_map="cpu",
+        dtype=torch.float32,
         trust_remote_code=True,
     )
     model.eval()
@@ -68,8 +70,18 @@ def main():
         print(f"Error: head {args.head} >= n_kv_head {n_kv_head}")
         sys.exit(1)
 
+    # Load prompt
+    if args.prompt_file:
+        with open(args.prompt_file, 'r') as f:
+            prompt = f.read()
+        print(f"  Loaded prompt from {args.prompt_file} ({len(prompt)} chars)")
+    elif args.prompt:
+        prompt = args.prompt
+    else:
+        prompt = "The quick brown fox jumps over the lazy dog. " * 100
+
     # Tokenize prompt
-    tokens = tokenizer.encode(args.prompt, return_tensors="pt")
+    tokens = tokenizer.encode(prompt, return_tensors="pt")
     if tokens.shape[1] > args.seq_len:
         tokens = tokens[:, :args.seq_len]
     elif tokens.shape[1] < args.seq_len:
