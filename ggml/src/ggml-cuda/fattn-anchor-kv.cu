@@ -15,25 +15,9 @@
 // use MMA instructions and pipeline stages like the existing turbo kernel.
 
 #include "common.cuh"
+#include "anchor-kv-common.cuh"
 #include <cuda_fp16.h>
 #include <cstdint>
-
-// AnchorKV compressed data layout (per head, in global memory):
-struct anchor_kv_data_t {
-    const float * anchor_keys;      // [k, D]
-    const float * anchor_values;    // [k, D]
-    const int   * k_anchor_of;      // [S] anchor index per position (K side)
-    const int   * v_anchor_of;      // [S] anchor index per position (V side)
-    const float * k_gamma;          // [S] projection coefficient (K side)
-    const float * v_gamma;          // [S] projection coefficient (V side)
-    const int   * k_slot_of;        // [S] residual slot index (-1 if none)
-    const int   * v_slot_of;        // [S] residual slot index (-1 if none)
-    const uint8_t * k_res_codes;    // [N_K * D/4] packed residual codes
-    const float * k_res_scales;     // [N_K] per-token scale
-    const uint8_t * v_res_codes;    // [N_V * D/4] packed residual codes
-    const float * v_res_scales;     // [N_V] per-token scale
-    int S, D, k, n_K, n_V;
-};
 
 // Lloyd-Max 2-bit centroids (constant memory)
 __constant__ float ANCHOR_CENTROIDS[4] = {-1.510138f, -0.452823f, 0.452823f, 1.510138f};
@@ -187,15 +171,15 @@ __global__ void anchor_kv_fa_decode_kernel(
 }
 
 // Host-side launcher
-extern "C" void anchor_kv_fa_decode_launch(
+void anchor_kv_launch_fa(
     cudaStream_t stream,
     const float * d_Q,           // [D] query
-    const anchor_kv_data_t & data,
+    const anchor_kv_data_t * data,
     float * d_out,               // [D] output
     int D
 ) {
     const int TILE_SIZE = 64;  // positions per tile
-    int n_tiles = (data.S + TILE_SIZE - 1) / TILE_SIZE;
+    int n_tiles = (data->S + TILE_SIZE - 1) / TILE_SIZE;
 
     // Temporary accumulation buffer
     float * d_acc;
@@ -208,7 +192,7 @@ extern "C" void anchor_kv_fa_decode_launch(
     size_t smem_size = 3 * D * sizeof(float);
 
     anchor_kv_fa_decode_kernel<128><<<grid, block, smem_size, stream>>>(
-        d_Q, data, d_acc, 0, TILE_SIZE
+        d_Q, *data, d_acc, 0, TILE_SIZE
     );
 
     // Reduce across tiles (simple sequential reduction)

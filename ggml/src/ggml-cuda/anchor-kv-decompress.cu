@@ -22,6 +22,7 @@
 // Output: dense K/V in f16, shape [D, S] per head
 
 #include "common.cuh"
+#include "anchor-kv-common.cuh"
 
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -129,7 +130,48 @@ __global__ void anchor_kv_decompress_kernel(
     }
 }
 
-// Host-side launch function
+// Static global for FA kernel to access compressed data
+// Set by anchor_kv_set_current_layer() before each FA call
+anchor_kv_data_t g_anchor_kv_current_data = {};
+static int g_anchor_kv_enabled = 0;
+
+extern "C" void anchor_kv_set_current_layer(
+    const float * d_anchor_keys, const float * d_anchor_values,
+    const int * d_k_anchor_of, const int * d_v_anchor_of,
+    const float * d_k_gamma, const float * d_v_gamma,
+    const int * d_k_slot_of, const int * d_v_slot_of,
+    const uint8_t * d_k_res_codes, const float * d_k_res_scales,
+    const uint8_t * d_v_res_codes, const float * d_v_res_scales,
+    int S, int D, int k, int n_K, int n_V
+) {
+    g_anchor_kv_current_data.anchor_keys = d_anchor_keys;
+    g_anchor_kv_current_data.anchor_values = d_anchor_values;
+    g_anchor_kv_current_data.k_anchor_of = d_k_anchor_of;
+    g_anchor_kv_current_data.v_anchor_of = d_v_anchor_of;
+    g_anchor_kv_current_data.k_gamma = d_k_gamma;
+    g_anchor_kv_current_data.v_gamma = d_v_gamma;
+    g_anchor_kv_current_data.k_slot_of = d_k_slot_of;
+    g_anchor_kv_current_data.v_slot_of = d_v_slot_of;
+    g_anchor_kv_current_data.k_res_codes = d_k_res_codes;
+    g_anchor_kv_current_data.k_res_scales = d_k_res_scales;
+    g_anchor_kv_current_data.v_res_codes = d_v_res_codes;
+    g_anchor_kv_current_data.v_res_scales = d_v_res_scales;
+    g_anchor_kv_current_data.S = S;
+    g_anchor_kv_current_data.D = D;
+    g_anchor_kv_current_data.k = k;
+    g_anchor_kv_current_data.n_K = n_K;
+    g_anchor_kv_current_data.n_V = n_V;
+    g_anchor_kv_enabled = 1;
+}
+
+extern "C" void anchor_kv_clear_current_layer() {
+    g_anchor_kv_enabled = 0;
+}
+
+extern "C" int anchor_kv_is_enabled() {
+    return g_anchor_kv_enabled;
+}
+
 extern "C" void anchor_kv_decompress_gpu(
     cudaStream_t stream,
     // Compressed data (device pointers)

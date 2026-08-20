@@ -333,6 +333,9 @@ private:
     // AnchorKV: upload compressed data to GPU and decompress to dense K/V
     void anchor_kv_upload_and_decompress(int32_t il);
 
+    // AnchorKV: upload compressed data to GPU for fused kernel
+    void anchor_kv_upload_compressed(int32_t il);
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
