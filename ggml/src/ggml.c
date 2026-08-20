@@ -6402,9 +6402,9 @@ struct ggml_tensor * ggml_anchor_decompress(
         float                 freq_scale) {
     GGML_ASSERT(dst->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(anchors->type == GGML_TYPE_F32 && anchors->ne[1] == 2);
+    GGML_ASSERT(anchors->type == GGML_TYPE_BF16 && anchors->ne[1] == 2);
     GGML_ASSERT(anchor_of->type == GGML_TYPE_I32 && anchor_of->ne[0] == 2);
-    GGML_ASSERT(gamma->type     == GGML_TYPE_F32 && gamma->ne[0] == 2);
+    GGML_ASSERT(gamma->type     == GGML_TYPE_F16 && gamma->ne[0] == 2);
     GGML_ASSERT(slot_of->type   == GGML_TYPE_I32 && slot_of->ne[0] == 2);
     GGML_ASSERT(k_res_codes->type  == GGML_TYPE_I8);
     GGML_ASSERT(k_res_scales->type == GGML_TYPE_F32);

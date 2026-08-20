@@ -5242,7 +5242,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] % 32 == 0;  // supports 32, 64, and 128 WHT groups
         case GGML_OP_ANCHOR_DECOMPRESS:
-            return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F32;
+            return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_BF16;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
