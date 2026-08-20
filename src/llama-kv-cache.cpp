@@ -1580,18 +1580,51 @@ void llama_kv_cache::anchor_kv_upload_and_decompress(int32_t il) {
     if (!anchor_kv_enabled || il < 0 || (size_t) il >= anchor_kv_data.size()) return;
 
     const anchor_kv_layer & layer = anchor_kv_data[il];
+    kv_layer & kvl = layers[il];
 
-    const int32_t n_head_kv_k = (int32_t) layer.heads.size();
+    const int64_t S = kvl.k->ne[1];
+    const uint32_t head_k = hparams.n_embd_head_k(il);
+    const uint32_t head_v = hparams.n_embd_head_v(il);
+    const int32_t n_embd_k_gqa = (int32_t) kvl.k->ne[0];
+    const int32_t n_embd_v_gqa = (int32_t) kvl.v->ne[0];
+    const int32_t n_head_kv_k = n_embd_k_gqa / head_k;
+    const int32_t n_head_kv_v = n_embd_v_gqa / head_v;
 
-    LLAMA_LOG_WARN("%s: layer %d: AnchorKV compressed %d heads, "
-                   "%d anchors, K_res=%d, V_res=%d\n",
-                   __func__, il, n_head_kv_k,
-                   layer.heads[0].k, layer.heads[0].n_K, layer.heads[0].n_V);
+    fprintf(stderr, "[ANCHOR-KV] layer %d: decompressing %d heads to dense f16\n", il, n_head_kv_k);
 
-    /* TODO: implement proper decompression when tensor types are handled.
-     * For now, just log that compression happened. The dense KV tensors
-     * remain unchanged -- AnchorKV data is stored for future use by
-     * the GPU decompression kernel. */
+    for (int h = 0; h < std::min(n_head_kv_k, (int32_t)layer.heads.size()); h++) {
+        const anchor_kv_head & head = layer.heads[h];
+
+        /* Decompress K */
+        std::vector<float> recon_k(S * head_k);
+        std::vector<float> recon_v(S * head_v);
+        anchor_kv_decompress_head(head, recon_k.data(), recon_v.data());
+
+        /* Convert to f16 and write to K tensor */
+        /* K tensor layout: [n_embd_k_gqa, kv_size] -> head h starts at row h*head_k */
+        if (kvl.k->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> k16(S * head_k);
+            for (size_t i = 0; i < k16.size(); i++) k16[i] = ggml_fp32_to_fp16(recon_k[i]);
+            size_t offset_k = (size_t)(h * head_k) * S * sizeof(ggml_fp16_t);
+            ggml_backend_tensor_set(kvl.k, k16.data(), offset_k, k16.size() * sizeof(ggml_fp16_t));
+        } else if (kvl.k->type == GGML_TYPE_F32) {
+            size_t offset_k = (size_t)(h * head_k) * S * sizeof(float);
+            ggml_backend_tensor_set(kvl.k, recon_k.data(), offset_k, recon_k.size() * sizeof(float));
+        }
+
+        /* Convert to f16 and write to V tensor */
+        if (kvl.v->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> v16(S * head_v);
+            for (size_t i = 0; i < v16.size(); i++) v16[i] = ggml_fp32_to_fp16(recon_v[i]);
+            size_t offset_v = (size_t)(h * head_v) * S * sizeof(ggml_fp16_t);
+            ggml_backend_tensor_set(kvl.v, v16.data(), offset_v, v16.size() * sizeof(ggml_fp16_t));
+        } else if (kvl.v->type == GGML_TYPE_F32) {
+            size_t offset_v = (size_t)(h * head_v) * S * sizeof(float);
+            ggml_backend_tensor_set(kvl.v, recon_v.data(), offset_v, recon_v.size() * sizeof(float));
+        }
+    }
+
+    fprintf(stderr, "[ANCHOR-KV] layer %d: decompression complete, dense KV updated\n", il);
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
