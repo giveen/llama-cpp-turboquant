@@ -2847,16 +2847,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // AnchorKV: expand the per-layer decompress nodes before cpy_k/cpy_v so
-    // they execute first and fill the shared scratch with the compressed
-    // history; cpy_k/cpy_v then append the current batch on top. V-only/K-only
-    // compression only builds the decompress node for the compressed side.
-    if (mctx_cur->get_anchor_active_k()) {
-        ggml_build_forward_expand(gf, mctx_cur->build_anchor_k(ctx0, il));
-    }
-    if (mctx_cur->get_anchor_active_v()) {
-        ggml_build_forward_expand(gf, mctx_cur->build_anchor_v(ctx0, il));
-    }
+    // AnchorKV: with the fused FA kernel, K/V are reconstructed on-the-fly
+    // inside the FA kernel, so we don't need decompress nodes in the graph.
+    // The fused FA kernel reads compressed data directly.
+    // No decompress nodes needed - skip the old decompress path.
 
     // store to KV cache
     {

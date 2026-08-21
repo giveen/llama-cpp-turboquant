@@ -2018,7 +2018,7 @@ void llama_kv_cache::anchor_kv_compress_all() {
                 total_K_res, total_V_res);
     }
 
-    // allocate the shared dense scratch buffers (one layer's worth of K and V)
+// allocate the shared dense scratch buffers (one layer's worth of K and V)
     {
         ggml_init_params params = {
             /* .mem_size   = */ 2 * ggml_tensor_overhead(),
@@ -2039,6 +2039,9 @@ void llama_kv_cache::anchor_kv_compress_all() {
         if (akv_params.compress_v) {
             anchor_scratch_v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_v_gqa, kv_size);
         }
+
+        if (anchor_scratch_k) anchor_scratch_k->buffer = anchor_buf.get();
+        if (anchor_scratch_v) anchor_scratch_v->buffer = anchor_buf.get();
 
         if (hparams.no_alloc) {
             anchor_buf = ggml_backend_buffer_ptr(ggml_backend_buft_alloc_buffer(buft_first, /*size =*/ 0));
@@ -2068,19 +2071,6 @@ void llama_kv_cache::anchor_kv_compress_all() {
 
     // the dense per-layer KV buffers are no longer referenced by decode graphs
     anchor_kv_free_dense();
-
-    // Replace the original dense K/V tensors with the scratch tensors
-    // so the compute graph never references the dense buffers.
-    if (akv_params.compress_k) {
-        for (auto & layer : layers) {
-            layer.k = anchor_scratch_k;
-        }
-    }
-    if (akv_params.compress_v) {
-        for (auto & layer : layers) {
-            layer.v = anchor_scratch_v;
-        }
-    }
 
     LLAMA_LOG_INFO("%s: compression complete (%d layers), dense %s buffer(s) freed\n", __func__, n_layer,
             (akv_params.compress_k && akv_params.compress_v) ? "K+V" : (akv_params.compress_k ? "K" : "V"));
