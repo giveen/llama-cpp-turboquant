@@ -2069,6 +2069,19 @@ void llama_kv_cache::anchor_kv_compress_all() {
     // the dense per-layer KV buffers are no longer referenced by decode graphs
     anchor_kv_free_dense();
 
+    // Replace the original dense K/V tensors with the scratch tensors
+    // so the compute graph never references the dense buffers.
+    if (akv_params.compress_k) {
+        for (auto & layer : layers) {
+            layer.k = anchor_scratch_k;
+        }
+    }
+    if (akv_params.compress_v) {
+        for (auto & layer : layers) {
+            layer.v = anchor_scratch_v;
+        }
+    }
+
     LLAMA_LOG_INFO("%s: compression complete (%d layers), dense %s buffer(s) freed\n", __func__, n_layer,
             (akv_params.compress_k && akv_params.compress_v) ? "K+V" : (akv_params.compress_k ? "K" : "V"));
 }
