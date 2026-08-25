@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local test artifacts
+/test-models/dflash/dflash-safetensors/model.safetensors
+test-models/dflash/
