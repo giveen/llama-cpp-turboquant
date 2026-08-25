@@ -4196,6 +4196,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
+        {"--spec-hybrid-dflash-model"}, "FNAME",
+        "DFlash draft model for hybrid MTP+DFlash speculative decoding (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.hybrid_dflash_model = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_HYBRID_DFLASH_MODEL"));
+    add_opt(common_arg(
+        {"--spec-hybrid-mtp-model"}, "FNAME",
+        "MTP draft model for hybrid MTP+DFlash speculative decoding (default: unused, uses target MTP head when available)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.hybrid_mtp_model = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_HYBRID_MTP_MODEL"));
+    add_opt(common_arg(
+        {"--hybrid-df-depth"}, "N",
+        string_format("max DFlash tree depth for hybrid MTP+DFlash (default: %d)", params.speculative.hybrid_df_max_depth),
+        [](common_params & params, int value) {
+            params.speculative.hybrid_df_max_depth = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_HYBRID_DF_DEPTH"));
+    add_opt(common_arg(
+        {"--hybrid-df-confidence"}, "F",
+        string_format("min DFlash node confidence to keep branch (default: %.2f)", (double)params.speculative.hybrid_df_confidence),
+        [](common_params & params, const std::string & value) {
+            params.speculative.hybrid_df_confidence = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_HYBRID_DF_CONFIDENCE"));
+    add_opt(common_arg(
+        {"--hybrid-mtp-length"}, "N",
+        string_format("MTP extension token count for hybrid MTP+DFlash (default: %d)", params.speculative.hybrid_mtp_extension),
+        [](common_params & params, int value) {
+            params.speculative.hybrid_mtp_extension = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_HYBRID_MTP_LENGTH"));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
         [](common_params & params, int value) {

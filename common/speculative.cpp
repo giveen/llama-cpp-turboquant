@@ -10,7 +10,7 @@
 #include "sampling.h"
 #include "speculative-adaptive.h"
 
-#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith / target layer ids
 
 #include <algorithm>
 #include <cassert>
@@ -38,6 +38,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-mtp-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+    {"draft-hybrid-mtp-dflash", COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -1302,6 +1303,215 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool need_embd() const override {
         return false;
     }
+};
+
+// Per-sequence composed state for the hybrid backend.
+struct draft_hybrid_state {
+    common_speculative_impl * df = nullptr;
+    common_speculative_impl * mtp = nullptr;
+    int32_t df_max_depth = 4;
+    float   df_confidence = 0.5f;
+    int32_t mtp_extension = 3;
+
+    std::vector<llama_token> draft_tokens;
+    std::vector<uint8_t>     provenance; // 0 = DFlash, 1 = MTP
+
+    size_t n_gen_df_tokens = 0;
+    size_t n_acc_df_tokens = 0;
+    size_t n_gen_mtp_tokens = 0;
+    size_t n_acc_mtp_tokens = 0;
+    int64_t t_draft_df_us = 0;
+    int64_t t_draft_mtp_us = 0;
+};
+
+// Hybrid MTP + DFlash: two-phase draft composed of a DFlash tree proposal
+// followed by an MTP flat extension. Provenance is tracked per token so
+// acceptance can update each backend's stats and KV independently.
+//
+// This impl does NOT load its own models. It wraps two existing impls that
+// are already owned by the same common_speculative instance:
+//   - a DFlash/DSpark impl
+//   - an MTP impl
+struct common_speculative_impl_hybrid_mtp_dflash : public common_speculative_impl {
+    common_params_speculative params;
+
+    // Sub-impls owned elsewhere in spec->impls
+    common_speculative_impl * df_impl;
+    common_speculative_impl * mtp_impl;
+
+    // Per-sequence composed state
+    std::vector<draft_hybrid_state> states;
+
+    common_speculative_impl_hybrid_mtp_dflash(
+        const common_params_speculative & p,
+        uint32_t n_seq,
+        common_speculative_impl * df,
+        common_speculative_impl * mtp)
+        : common_speculative_impl(
+            COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH, n_seq)
+        , params(p)
+        , df_impl(df)
+        , mtp_impl(mtp)
+    {
+        states.resize(n_seq);
+    }
+
+    ~common_speculative_impl_hybrid_mtp_dflash() override = default;
+
+    bool init() {
+        if (!df_impl || !mtp_impl) {
+            LOG_ERR("%s: hybrid requires both DFlash and MTP impls\n", __func__);
+            return false;
+        }
+        LOG_INF("%s: hybrid init - df=%s, mtp=%s\n", __func__,
+                common_speculative_type_to_str(df_impl->type).c_str(),
+                common_speculative_type_to_str(mtp_impl->type).c_str());
+        return true;
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) states.size()) {
+            return;
+        }
+
+        draft_hybrid_state & s = states[seq_id];
+        s.draft_tokens.clear();
+        s.provenance.clear();
+        
+        s.df_max_depth = std::max(1, params.hybrid_df_max_depth);
+        s.df_confidence = params.hybrid_df_confidence;
+        s.mtp_extension = std::max(1, params.hybrid_mtp_extension);
+    }
+
+    // Helper: truncate a sequence to a stable prefix using the
+    // longest matching prefix against accepted tokens.
+    static int matching_prefix_length(const llama_token * a, const llama_token * b, int n) {
+        int i = 0;
+        while (i < n && a[i] == b[i]) {
+            ++i;
+        }
+        return i;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        std::vector<std::vector<llama_token>> df_results(dparams.size());
+        std::vector<std::vector<llama_token>> mtp_results(dparams.size());
+        std::vector<llama_tokens *> orig_results;
+        orig_results.reserve(dparams.size());
+
+        // Save originals, then call DFlash first into scratch buffers.
+        for (size_t i = 0; i < dparams.size(); ++i) {
+            orig_results.push_back(dparams[i].result);
+            dparams[i].result = &df_results[i];
+        }
+        if (df_impl) {
+            df_impl->draft(dparams);
+        }
+
+        // Then call MTP into separate scratch buffers.
+        for (size_t i = 0; i < dparams.size(); ++i) {
+            dparams[i].result = &mtp_results[i];
+        }
+        if (mtp_impl) {
+            mtp_impl->draft(dparams);
+        }
+
+        // Restore original result pointers before composing.
+        for (size_t i = 0; i < dparams.size(); ++i) {
+            dparams[i].result = orig_results[i];
+        }
+
+        // Compose per sequence: DFlash prefix + MTP extension.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            draft_hybrid_state & s = states[seq_id];
+
+            int p = std::min((int) df_results[seq_id].size(), s.df_max_depth);
+            int t = std::min(s.mtp_extension, (int) mtp_results[seq_id].size());
+
+            s.draft_tokens.clear();
+            s.provenance.clear();
+            s.draft_tokens.reserve(p + t);
+            s.provenance.reserve(p + t);
+
+            for (int i = 0; i < p; ++i) {
+                s.draft_tokens.push_back(df_results[seq_id][i]);
+                s.provenance.push_back(0);
+            }
+            for (int i = 0; i < t; ++i) {
+                s.draft_tokens.push_back(mtp_results[seq_id][i]);
+                s.provenance.push_back(1);
+            }
+
+            *dp.result = s.draft_tokens;
+            dp.drafting = false;
+
+            s.n_gen_df_tokens += p;
+            s.n_gen_mtp_tokens += t;
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) states.size() || n_accepted == 0) {
+            return;
+        }
+
+        draft_hybrid_state & s = states[seq_id];
+
+        // Walk provenance to count accepted tokens per backend
+        int df_accepted = 0;
+        int mtp_accepted = 0;
+        for (int i = 0; i < (int) n_accepted && i < s.draft_tokens.size(); ++i) {
+            if (s.provenance[i] == 0) {
+                ++df_accepted;
+            } else if (s.provenance[i] == 1) {
+                ++mtp_accepted;
+            }
+        }
+
+        s.n_acc_df_tokens  += df_accepted;
+        s.n_acc_mtp_tokens += mtp_accepted;
+
+        // Propagate acceptance to sub-impls so their internal KV / stats
+        // stay consistent. is_other=false for the owning impl, true for
+        // the other; the generic loop already calls through for non-owners.
+        if (df_impl) {
+            df_impl->accept(seq_id, (uint16_t) df_accepted, false);
+        }
+        if (mtp_impl) {
+            mtp_impl->accept(seq_id, (uint16_t) mtp_accepted, true);
+        }
+
+        // Reset composed state for next step
+        s.draft_tokens.clear();
+        s.provenance.clear();
+        
+    }
+
+    bool need_embd() const override {
+        // DFlash needs target embeddings for its encoder.
+        return df_impl ? df_impl->need_embd() : false;
+    }
+
+    bool need_embd_nextn() const override {
+        // MTP needs pre-norm embeddings from the target.
+        return mtp_impl ? mtp_impl->need_embd_nextn() : false;
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        // Sub-impls are processed by the outer common_speculative_process() loop.
+        return true;
+    }
+
+    bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const override {
+        return false;
+    }
+
+    void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) override {}
 };
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
@@ -2682,6 +2892,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: return "draft-mtp-adaptive";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH: return "draft-hybrid-mtp-dflash";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -2737,6 +2948,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -2892,6 +3104,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_mtp_adaptive = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)) && params.draft.ctx_dft != nullptr;
         bool has_draft_dflash = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) && params.draft.ctx_dft != nullptr;
         bool has_draft_dspark = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) && params.draft.ctx_dft != nullptr;
+        bool has_hybrid       = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH));
 
         // If --dflash or --eagle3 flags are set, enable the corresponding type
         if (!has_draft_dflash && params.draft.dflash && params.draft.ctx_dft != nullptr) {
@@ -2901,7 +3114,6 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             has_draft_eagle3 = true;
         }
 
-
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
         bool has_ngram_map_k   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K));
@@ -2909,10 +3121,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        if (has_hybrid) {
+            // Hybrid needs both DFlash/DSpark and MTP backends present.
+            // Force them into the priority list before the hybrid composer.
+            if (!has_draft_dflash && !has_draft_dspark) {
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params));
+            }
+            if (!has_draft_mtp && !has_draft_mtp_adaptive) {
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
+            }
+        }
         if (has_ngram_simple) {
             // This implementation can guess a lot of tokens without any draft model.
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, params));
@@ -2942,11 +3164,23 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_draft_mtp_adaptive) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, params));
         }
-        if (has_draft_dflash) {
+        if (has_draft_dflash && !has_hybrid) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params));
         }
-        if (has_draft_dspark) {
+        if (has_draft_dspark && !has_hybrid) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params));
+        }
+        if (has_draft_mtp && !has_hybrid) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
+        }
+        if (has_draft_mtp_adaptive && !has_hybrid) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, params));
+        }
+        if (has_hybrid) {
+            // Hybrid must be last so it can compose after sub-impls draft.
+            // Sub-impls will draft but not claim dp.result; the hybrid
+            // impl composes the final sequence and sets drafting=false.
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH, params));
         }
     }
 
@@ -3027,6 +3261,35 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             default:
                 break;
         }
+    }
+
+    // Hybrid needs pointers to the DFlash and MTP impls that were just created.
+    // Resolve them by type and construct the composer impl afterwards.
+    common_speculative_impl * df_impl = nullptr;
+    common_speculative_impl * mtp_impl = nullptr;
+    for (const auto & u : impls) {
+        if (!df_impl && (u->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                         u->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+            df_impl = u.get();
+        }
+        if (!mtp_impl && (u->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                          u->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)) {
+            mtp_impl = u.get();
+        }
+    }
+
+    for (const common_speculative_config & config : configs) {
+        if (config.type != COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH) {
+            continue;
+        }
+        auto * h = new common_speculative_impl_hybrid_mtp_dflash(config.params, n_seq, df_impl, mtp_impl);
+        if (!h->init()) {
+            delete h;
+            fprintf(stderr, "spec %12.*s: failed to init hybrid MTP+DFlash; ensure --spec-type includes draft-dflash/dspark and draft-mtp\n", 12, __func__);
+            continue;
+        }
+        impls.push_back(std::unique_ptr<common_speculative_impl_hybrid_mtp_dflash>(h));
+        break;
     }
 
     if (impls.empty()) {

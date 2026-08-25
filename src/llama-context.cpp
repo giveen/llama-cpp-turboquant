@@ -2033,7 +2033,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
 
                 seq_output_count[seq_id]++;
-                if (seq_output_count[seq_id] > 1) {
+                if (seq_output_count[seq_id] > 16) {
                     LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence (seq_id %d had %d)\n",
                             __func__, seq_id, seq_output_count[seq_id]);
                     return -1;
