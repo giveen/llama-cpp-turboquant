@@ -4297,6 +4297,8 @@ private:
                 return;
             }
 
+            SLT_INF(slot, "about to sample/accept: n_draft=%zu\n", slot.spec_draft.size());
+
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 

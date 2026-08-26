@@ -1338,6 +1338,7 @@ struct common_speculative_impl_hybrid_mtp_dflash : public common_speculative_imp
     // Sub-impls owned elsewhere in spec->impls
     common_speculative_impl * df_impl;
     common_speculative_impl * mtp_impl;
+    std::vector<common_speculative_impl *> * impl_last = nullptr;
 
     // Per-sequence composed state
     std::vector<draft_hybrid_state> states;
@@ -1399,6 +1400,13 @@ struct common_speculative_impl_hybrid_mtp_dflash : public common_speculative_imp
         std::vector<llama_tokens *> orig_results;
         orig_results.reserve(dparams.size());
 
+        SPC_INF("hybrid draft enter: n_seqs=%zu, df=%s, mtp=%s\n",
+                dparams.size(),
+                df_impl ? common_speculative_type_to_str(df_impl->type).c_str() : "null",
+                mtp_impl ? common_speculative_type_to_str(mtp_impl->type).c_str() : "null");
+        SPC_INF("hybrid draft config: df_max_depth=%d, df_confidence=%.2f, mtp_extension=%d\n",
+                params.hybrid_df_max_depth, params.hybrid_df_confidence, params.hybrid_mtp_extension);
+
         // Save originals, then call DFlash first into scratch buffers.
         for (size_t i = 0; i < dparams.size(); ++i) {
             orig_results.push_back(dparams[i].result);
@@ -1452,11 +1460,20 @@ struct common_speculative_impl_hybrid_mtp_dflash : public common_speculative_imp
 
             s.n_gen_df_tokens += p;
             s.n_gen_mtp_tokens += t;
+
+            if (!s.draft_tokens.empty() && impl_last) {
+                (*impl_last)[seq_id] = this;
+            }
+
+            SPC_INF("hybrid draft seq=%d: composed %zu tokens, df=%d mtp=%d\n",
+                    (int) seq_id,
+                    s.draft_tokens.size(),
+                    p, t);
         }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) states.size() || n_accepted == 0) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) states.size()) {
             return;
         }
 
@@ -1465,20 +1482,25 @@ struct common_speculative_impl_hybrid_mtp_dflash : public common_speculative_imp
         // Walk provenance to count accepted tokens per backend
         int df_accepted = 0;
         int mtp_accepted = 0;
-        for (int i = 0; i < (int) n_accepted && i < s.draft_tokens.size(); ++i) {
-            if (s.provenance[i] == 0) {
-                ++df_accepted;
-            } else if (s.provenance[i] == 1) {
-                ++mtp_accepted;
+        if (n_accepted > 0) {
+            for (int i = 0; i < (int) n_accepted && i < (int) s.draft_tokens.size(); ++i) {
+                if (s.provenance[i] == 0) {
+                    ++df_accepted;
+                } else if (s.provenance[i] == 1) {
+                    ++mtp_accepted;
+                }
             }
         }
+
+        SPC_INF("hybrid accept seq=%d: n_accepted=%u, df_acc=%d, mtp_acc=%d, drafted=%zu\n",
+                (int) seq_id, n_accepted, df_accepted, mtp_accepted,
+                s.draft_tokens.size());
 
         s.n_acc_df_tokens  += df_accepted;
         s.n_acc_mtp_tokens += mtp_accepted;
 
-        // Propagate acceptance to sub-impls so their internal KV / stats
-        // stay consistent. is_other=false for the owning impl, true for
-        // the other; the generic loop already calls through for non-owners.
+        // Propagate acceptance/rejection to sub-impls so their internal KV /
+        // state stays consistent across iterations, even when n_accepted=0.
         if (df_impl) {
             df_impl->accept(seq_id, (uint16_t) df_accepted, false);
         }
@@ -3303,6 +3325,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
     };
 
+    for (auto & u : result->impls) {
+        if (auto * h = dynamic_cast<common_speculative_impl_hybrid_mtp_dflash *>(u.get())) {
+            h->impl_last = &result->impl_last;
+            break;
+        }
+    }
+
     return result;
 }
 
@@ -3324,6 +3353,8 @@ common_speculative_draft_params & common_speculative_get_draft_params(
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
+    SPC_INF("begin enter: seq_id=%d, prompt_size=%zu\n", (int) seq_id, prompt.size());
+
     if (spec == nullptr) {
         return;
     }
@@ -3382,6 +3413,8 @@ void common_speculative_draft(common_speculative * spec) {
         return;
     }
 
+    SPC_INF("draft enter: n_impls=%zu\n", spec->impls.size());
+
     auto & dparams = spec->dparams;
 
     {
@@ -3401,6 +3434,23 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // Skip standalone sub-impl drafts when hybrid is present. Hybrid owns
+        // both DFlash/DSpark and MTP internally and must be the only active
+        // drafting impl in this pass.
+        bool has_hybrid = false;
+        for (const auto & u : spec->impls) {
+            if (u.get()->type == COMMON_SPECULATIVE_TYPE_DRAFT_HYBRID_MTP_DFLASH) {
+                has_hybrid = true;
+                break;
+            }
+        }
+        if (has_hybrid && (impl.get()->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                           impl.get()->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                           impl.get()->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                           impl.get()->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)) {
+            continue;
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -3460,6 +3510,10 @@ void common_speculative_draft(common_speculative * spec) {
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
+
+    SPC_INF("accept enter: seq_id=%d, n_accepted=%u, impl=%s\n",
+            (int) seq_id, n_accepted,
+            impl ? common_speculative_type_to_str(impl->type).c_str() : "null");
 
     GGML_ASSERT(impl);
 

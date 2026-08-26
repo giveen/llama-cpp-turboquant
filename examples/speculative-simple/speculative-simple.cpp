@@ -75,6 +75,7 @@ int main(int argc, char ** argv) {
         }
 
         auto cparams = common_context_params_to_llama(params_dft);
+        cparams.ctx_other = ctx_tgt;
         ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
@@ -351,6 +352,16 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
     LOG_INF("target:\n\n");
     common_perf_print(ctx_tgt, smpl.get());
+
+    printf("BENCH mode=%s prompt_tokens=%d completion_tokens=%d prompt_ms=%.3f predicted_ms=%.3f prompt_per_token_ms=%.3f predicted_per_token_ms=%.3f prompt_per_second=%.3f predicted_per_second=%.3f\n",
+           params.speculative.types.empty() ? "none" : common_speculative_type_to_str(params.speculative.types[0]).c_str(),
+           n_input, n_predict,
+           (t_enc_end - t_enc_start) / 1e6f * 1000.0f,
+           (t_dec_end - t_dec_start) / 1e6f * 1000.0f,
+           (t_enc_end - t_enc_start) / 1e6f > 0 ? (n_input / ((t_enc_end - t_enc_start) / 1e6f)) : 0.0f,
+           (t_dec_end - t_dec_start) / 1e6f > 0 ? (n_predict / ((t_dec_end - t_dec_start) / 1e6f)) : 0.0f,
+           inp.size() / ((t_enc_end - t_enc_start) / 1e6f),
+           n_predict / ((t_dec_end - t_dec_start) / 1e6f));
 
     llama_batch_free(batch_tgt);
 
