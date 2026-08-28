@@ -46,7 +46,7 @@ Initial server smoke test failed with "block KV streaming is not supported for t
 - Falls back silently with `LLAMA_LOG_WARN` on any failure
 
 **Safety exclusions in the current code:**
-- Turbo K/V + ≥8 layers: deliberately excluded (mixed page sizes from `TURBO_LAYER_ADAPTIVE` would corrupt the uniform-page-size assumption in the streaming pool)
+- Turbo K/V + `TURBO_LAYER_ADAPTIVE` actually varying per-layer types: excluded (mixed page sizes would corrupt the uniform-page-size assumption in the streaming pool). See section 11 below - this used to blanket-exclude any turbo K/V with >= 8 layers; it's now precise about which mode/type combinations actually vary.
 - Multi-GPU: only layers on the first streaming-eligible device's backend are considered
 - Variable head dims (`is_n_embd_k_gqa_variable` / `is_n_embd_v_gqa_variable`): excluded for uniform-page-size reason
 - Non-unified KV cache (`kv_unified == false`): the streaming path requires `unified_kv_cache == true`
@@ -98,8 +98,8 @@ Server smoke test with `--kv-stream 2304` on Qwen3.8-27B at 65536 ctx, q8_0/q8_0
 
 **Streaming is now engaging on Qwen3.8-27B.** The server starts cleanly, serves coherent output, and the full breadcrumb trail from CLI flag to pool creation is present in the logs.
 
-### Step 6: Turbo fallback
-Turbo3 + ≥8 layers with `--kv-stream 2304` runs correctly. The safety exclusion at line 267 (`kv_stream_adaptive_possible`) skips streaming silently at the pre-scan level when turbo types are detected with ≥8 layers. The model falls back to ordinary VRAM KV cache without any error. Output is coherent.
+### Step 6: Turbo fallback (superseded by section 11 below)
+Turbo3 + ≥8 layers with `--kv-stream 2304` ran correctly but fell back to the ordinary VRAM KV cache without error: the old safety exclusion treated any turbo K/V type combined with ≥8 layers as unsafe, regardless of whether `TURBO_LAYER_ADAPTIVE` would actually vary anything for that type. Section 11 replaces this with a precise check - a plain turbo3 K/V config like this one (no `TURBO_LAYER_ADAPTIVE` override, V isn't turbo2 so the auto-enable never triggers) should now stream instead of falling back. **Needs re-verification on hardware** to confirm it now engages.
 
 ### 8. Measurement tests
 
@@ -173,9 +173,110 @@ All three tools now build and expose `--kv-stream N` on this sandbox's
 CPU-only build. GPU testing of the actual sweep/benchmark behavior (as
 opposed to CLI wiring) still needs real hardware.
 
+### 11. Precise turbo exclusion instead of blanket turbo K/V + >= 8 layers
+
+The old exclusion (section 6) rejected any turbo K/V type combined with
+>= 8 layers, on the theory that `TURBO_LAYER_ADAPTIVE` (the existing
+per-layer K/V type override, auto-enabled for turbo2-V models) *might* give
+layers different byte-per-token sizes, which the streaming pool's
+single-page-size assumption can't handle. In practice that override only
+changes anything for specific (mode, type) combinations:
+
+- Modes 1/2 (K+V boundary upgrade to q8_0) apply only when **K** is a turbo
+  type and `n_layer >= 8`.
+- Modes 5/6/7 (V-only boundary upgrade) apply only when **V** is a turbo
+  type and `n_layer >= 8`. Mode 7 is auto-enabled whenever V is turbo2 with
+  `n_layer >= 8` and no explicit `TURBO_LAYER_ADAPTIVE` override - this is
+  the one real-world case (turbo2-V) that was correctly excluded before.
+- A pure turbo3 or turbo4 K/V config never triggers any of these (mode
+  stays 0), so it was always safe to stream - the old check just couldn't
+  tell the difference and rejected it anyway.
+
+Changes in `src/llama-kv-cache.cpp`:
+
+- Hoisted the `TURBO_LAYER_ADAPTIVE` mode resolution (env var override, or
+  the turbo2-V auto-enable) out of the per-layer loop's
+  `static const int adaptive_mode = [&]() {...}();` into a plain local
+  variable computed once per constructor call, before the pre-scan. This
+  also fixes a latent correctness bug: a function-local `static` has
+  process lifetime, so the *first* `llama_kv_cache` ever constructed in a
+  process pinned the mode for every later construction regardless of its
+  own `type_v` - directly relevant now that `llama-bench` can sweep
+  `--cache-type-v` across many contexts in one process.
+- Replaced the pre-scan's blanket
+  `(k_is_turbo || v_is_turbo) && n_layer >= 8` check with
+  `kv_stream_layers_vary`, which mirrors the exact per-layer dispatch
+  conditions (mode 1/2 + K-is-turbo, or mode 5/6/7 + V-is-turbo) so only a
+  resolved mode that actually produces different types is excluded.
+
+Verified in this sandbox (no GPU, so the runtime-creation half of the path
+is still unverified here): `llama` rebuilds clean with zero new warnings,
+all four `test-kv-stream-*` tests pass, `test-llama-archs` passes across
+every registered architecture with no new failures.
+
+**Needs hardware verification**: does a pure turbo3/turbo4 K/V config
+(the common case, e.g. Qwen3.8-27B with `-ctk turbo3 -ctv turbo3`) now
+actually engage streaming end-to-end (pool created, VRAM reduced, correct
+output), and does turbo2-V with `n_layer >= 8` still correctly fall back
+(mode 7 auto-enables, so `kv_stream_layers_vary` should still be true there).
+
+### 12. `--kv-stream auto`: derive the stage pool from `-c`
+
+Requested so users don't have to hand-pick a MiB budget for every context
+size, e.g. `-c 262144 --kv-stream auto`. Asked the user which heuristic to
+use (AskUserQuestion) since the pool is deliberately meant to stay much
+smaller than the full context's KV cache - sizing it to the *full* context
+would defeat the point of streaming - so "derive from -c" needed a precise
+definition. Chosen: **a fixed percentage of the context stays resident per
+layer**, not the full context size.
+
+Formula (`src/llama-context.cpp`, resolved once inside `llama_context`'s
+constructor, right where `kv_stream_stage_bytes` was already being derived
+from the manual MiB value - same place model/hparams/`cparams.n_ctx` are
+all available together):
+
+- `resident_tokens = clamp(n_ctx * 10%, floor=2048 tokens, ceiling=n_ctx)`
+- rounded up to the nearest 256-token page
+- `stage_bytes = page_bytes(K+V, first eligible layer) * eligible_layer_count * (resident_pages + 4 scratch pages)`
+- `stage_mib = min(ceil(stage_bytes / 1 MiB), 8192 MiB)`
+
+Plumbing: new `bool kv_stream_auto` field threaded through the same path as
+`kv_stream_stage_mib` end to end - `include/llama.h`
+(`llama_context_params`), `src/llama-cparams.h`, `common/common.h`
+(`common_params`), `common/common.cpp`
+(`common_context_params_to_llama`), and `src/llama-context.cpp`'s default
+struct. `common/arg.cpp`'s `--kv-stream` handler switched from an int
+handler to a string handler so it accepts either a MiB number or the
+literal `auto`; the resolved MiB value is logged (`block KV streaming
+auto: n_ctx=... resident=... tokens/layer (10%) layers=... -> stage=... MiB`)
+before falling into the same validation/gating path a manual value uses.
+
+**Not done**: `llama-bench`'s `--kv-stream` sweep parameter still only
+accepts numeric MiB values - `auto` isn't wired into its `cmd_params`
+sweep system in this pass, since sweeping "auto" per-instance would need
+its own bool-sweep dimension. Numeric sweeps remain the way to do
+controlled A/B throughput comparisons there.
+
+Verified in this sandbox (built a tiny synthetic qwen3 model via
+`test-llama-archs -o <dir>` to exercise the real constructor path, no GPU
+available so only the CPU fallback end-state was reachable):
+- `-c 262144 --kv-stream auto` -> `resident=26368 tokens/layer (10%)
+  layers=2 -> stage=54 MiB`
+- `-c 4096 --kv-stream auto` -> hits the 2048-token floor -> `stage=6 MiB`
+- `-c 1000000000 --kv-stream auto` -> hits the 8192 MiB ceiling
+- manual `--kv-stream 128` and no-flag default both unaffected
+- all four `test-kv-stream-*` tests and `test-llama-archs` (111s) still pass
+
+**Needs hardware verification**: whether the default 10%/2048-floor/8192-MiB-ceiling
+heuristic actually gives good throughput/VRAM tradeoffs in practice, e.g. at
+`-c 262144` on Qwen3.8-27B - the constants were chosen for defensibility, not
+tuned against real measurements yet.
+
 ## Next concrete step
 
 1. Run a controlled PPL comparison with and without `--kv-stream 2304` on a fixed prompt set using `llama-perplexity`
 2. Use `llama-bench --kv-stream 0,2304` (and other stage sizes) to characterize throughput scaling across generation lengths and context sizes in one sweep
 3. Verify the non-SWA path with a non-SWA model
 4. General interactive testing via `llama-cli --kv-stream <n>`
+5. Verify turbo3/turbo4 K/V now streams (section 11) and turbo2-V still correctly falls back
+6. Try `-c 262144 --kv-stream auto` (and other context sizes) on real hardware and see whether the 10%/floor/ceiling defaults (section 12) need tuning
