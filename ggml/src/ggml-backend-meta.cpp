@@ -727,7 +727,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
+        // src[2] carries row indices, not data; its split layout need not match src[0].
+        // Only enforce equality when both sources carry real split state, i.e. neither is NONE.
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_NONE &&
+            src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_NONE &&
+            !split_states_equal(src_ss[0], src_ss[2])) {
+            GGML_ABORT("split_states_equal(src_ss[0], src_ss[2]) failed in handle_set_rows");
+        }
         return src_ss[0];
     };
 
