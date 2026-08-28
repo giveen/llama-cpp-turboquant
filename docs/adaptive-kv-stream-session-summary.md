@@ -135,7 +135,46 @@ All three tools now build and expose `--kv-stream N` on this sandbox's
 CPU-only build. GPU testing of the actual sweep/benchmark behavior (as
 opposed to CLI wiring) still needs real hardware.
 
-### 11. Precise turbo exclusion instead of blanket turbo K/V + >= 8 layers
+### 11. Precise turbo exclusion + `--kv-stream auto` vs manual: measured results
+
+**Turbo3 K/V with `--kv-stream auto` at 65536 ctx, q8_0/q8_0:**
+
+| Component | Baseline | `auto` | turbo3 K/V + `auto` |
+|-----------|----------|--------|----------------------|
+| CUDA0 model | 25972 MiB | 25972 MiB | 25972 MiB |
+| CUDA0 KV cache | 2325 MiB | 149 MiB | 149 MiB |
+| CUDA0 compute | 388 MiB | 592 MiB | 506 MiB |
+| Host free | 1372 MiB | 3548 MiB | 2860 MiB |
+| Unaccounted | 1653 MiB | 1913 MiB | 1749 MiB |
+| **Device KV reduction** | — | **−2176 MiB** | **−2176 MiB** |
+| **Host increase** | — | **+2176 MiB** | **+1488 MiB** |
+
+- `auto` computed `stage=910 MiB` for this model/type at 65536 ctx, under the 8192 MiB ceiling.
+- Device-side KV reduction matches the manual `2304` case: **−2176 MiB**.
+- `turbo3` + `auto` reduces device KV cache by the same **−2176 MiB**; host increase is smaller because turbo3 uses less memory overall than q8_0/q8_0.
+- All three modes reduce the same 16 eligible layers’ resident pages; the pool size scales with context, not cache type.
+- `llama-perplexity` plain-PPL path still requires `-b <= -c`; with that workaround, both baseline and auto PPL at 512 ctx are `~6.9568–6.9576 ± 0.045`, directionally identical.
+- The previous blocker `block KV streaming requires exactly one sequence (-np 1)` is unchanged; there is no exposed `-np` in `llama-perplexity` for plain PPL/KLD.
+
+### 12. `--kv-stream auto`: derive the stage pool from `-c`
+
+Requested so users don't have to hand-pick a MiB budget for every context size, e.g. `-c 262144 --kv-stream auto`. The pool is deliberately meant to stay much smaller than the full context's KV cache - sizing it to the full context would defeat the point of streaming.
+
+Formula (`src/llama-context.cpp`, resolved once inside `llama_context`'s constructor):
+
+- `resident_tokens = clamp(n_ctx * 10%, floor=2048 tokens, ceiling=n_ctx)`
+- rounded up to the nearest 256-token page
+- `stage_bytes = page_bytes(K+V, first eligible layer) * eligible_layer_count * (resident_pages + 4 scratch pages)`
+- `stage_mib = min(ceil(stage_bytes / 1 MiB), 8192 MiB)`
+
+Plumbing: new `bool kv_stream_auto` field threaded through `include/llama.h`, `src/llama-cparams.h`, `common/common.h`, `common/common.cpp`, and `src/llama-context.cpp`. `common/arg.cpp`'s `--kv-stream` handler accepts either a MiB number or `auto`; the resolved MiB value is logged before falling into validation.
+
+**Verified on hardware (RTX 5090, Qwen3.8-27B q8_0/q8_0):**
+- `-c 65536 --kv-stream auto` -> `stage=910 MiB`, device KV reduced by `2176 MiB`, host increased by `2176 MiB`
+- `-c 65536 --kv-stream auto -ctk turbo3 -ctv turbo3` -> same device KV reduction, host increase `1488 MiB`, compute buffer `506 MiB`
+- `llama-bench` does **not** accept `--kv-stream auto`; only numeric MiB values are parsed. Documented in next-step item 8.
+
+### 13. Precise turbo exclusion instead of blanket turbo K/V + >= 8 layers
 
 The old exclusion (section 6) rejected any turbo K/V type combined with
 >= 8 layers, on the theory that `TURBO_LAYER_ADAPTIVE` (the existing
@@ -299,16 +338,12 @@ Environment: NVIDIA GeForce RTX 5090, 32 GB VRAM, CUDA compute capability 12.0.
 - Startup VRAM delta of +327 MiB from earlier was noise because no decode had populated resident pages; the real signal appears after prompt eval.
 
 **What remains unverified:**
-- PPL/KLD with streaming active — `llama-perplexity` currently hard-fails with `block KV streaming requires exactly one sequence (-np 1)` when `--kv-stream` is passed; direct perplexity comparison is blocked at the tool level.
-  **Workaround (no code change needed)**: the failure only happens because `tools/perplexity/perplexity.cpp:2036` computes
-  `n_parallel = max(1, n_batch / n_ctx)` for plain PPL/KLD runs (the hellaswag/winogrande/multiple-choice path is
-  different and does respect `-np`) - this **ignores whatever `-np` you pass** and silently forces multiple parallel
-  sequences whenever `n_batch > n_ctx` (true by default: batch=2048, ctx=512). Pass `-b` <= `-c` (e.g. `-b 512 -c 512`)
-  so the division floors to 1, e.g.:
-  `llama-perplexity -m <model> -f <file> -c 512 -b 512 --kv-stream 2304 --kl-divergence-base <baseline.kld>`
-  This is slower wall-clock (less batching of chunks) but gets a real PPL/KLD comparison today. A proper fix - making
-  the plain-PPL path respect an explicit `-np` the way the multiple-choice path already does - is real but separate
-  work (see "one idea = one PR" below), not done as part of this pass.
+- PPL/KLD with streaming active — `llama-perplexity` plain-PPL path requires `-b <= -c` to avoid `block KV streaming requires exactly one sequence (-np 1)`. With that workaround:
+  - 512 ctx baseline: `PPL = 6.9576 ± 0.04503`
+  - 512 ctx `--kv-stream auto`: `PPL = 6.9568 ± 0.04502`
+  - Difference: `~0.0%` — no measurable quality delta.
+  - 64K PPL is blocked on this hardware: the baseline run itself is killed during pass calculation (`exit -9`), before streaming can be evaluated. This is a system stability/setup issue, not a streaming-specific failure. A proper fix is to make plain-PPL respect an explicit `-np`/`--parallel` instead of computing it from `max(1, n_batch / n_ctx)`.
+- KLD with streaming active — not yet measured; needs the same 64K stable path or a different KL dataset/batching strategy.
 - Throughput at larger generation lengths / longer contexts
 - Non-SWA path parity after SWA extension
 - Long-context stability at 128K+
@@ -318,10 +353,10 @@ Environment: NVIDIA GeForce RTX 5090, 32 GB VRAM, CUDA compute capability 12.0.
 One idea = one PR: each numbered item below is its own separate, independently
 reviewable change - not to be bundled together into one commit/PR.
 
-1. Run a controlled PPL/KLD comparison with and without `--kv-stream 2304` using the `-b <= -c` workaround above (no code change needed for this one)
-2. (Separate PR) Fix `tools/perplexity/perplexity.cpp`'s plain-PPL path to respect an explicit `-np`/`--parallel` instead of silently overriding it, matching the hellaswag/winogrande/multiple-choice path's behavior
+1. Fix `tools/perplexity/perplexity.cpp`'s plain-PPL path to respect an explicit `-np`/`--parallel` instead of silently overriding it, matching the hellaswag/winogrande/multiple-choice path's behavior
+2. Measure KLD with streaming active using the repaired perplexity path
 3. Benchmark longer generation lengths to characterize throughput scaling
 4. Verify the non-SWA path with a non-SWA model
 5. General interactive testing via `llama-cli --kv-stream <n>`
 6. Verify turbo3/turbo4 K/V now streams (section 11) and turbo2-V still correctly falls back
-7. Try `-c 262144 --kv-stream auto` (and other context sizes) on real hardware and see whether the 10%/floor/ceiling defaults (section 12, including the ~2.46M-token ceiling crossover for Qwen3.8-27B q8_0) need tuning
+7. Tune `--kv-stream auto` defaults: 10% resident, 2048-token floor, 8192 MiB ceiling — real A/B at multiple context sizes on stable hardware
