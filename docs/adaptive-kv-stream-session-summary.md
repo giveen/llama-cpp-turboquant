@@ -64,4 +64,28 @@ The `TURBO_AUTO_ASYMMETRIC=1` path upgraded K from turbo3 to q8_0 for this model
 - No streaming runtime benchmark with `--kv-stream`
 
 ## Next concrete step
-Run `llama-bench` and a simple completion through the streaming server to verify decode throughput with `--kv-stream 2304 -ctk q8_0 -ctv turbo3`, then measure ppl and KLD at 64K context with and without streaming to establish the baseline comparison.
+
+IMPORTANT correction: a throughput or ppl/KLD comparison "with and without
+streaming" will not show anything meaningful yet, and should not be run as
+the next step. `--kv-stream` now validates and the server starts (commit
+`d83bc4f47`), but `llama-kv-cache.cpp` still does not request the pinned
+streaming buffer type for K/V tensors - the cache is still ordinary VRAM
+storage regardless of the flag. The flag currently only changes one log
+line at context construction; the decode path is byte-for-byte identical
+with or without it. A perf/quality comparison run now would just be
+comparing the same code path against itself.
+
+What *is* worth checking now: confirm `nvidia-smi`/VRAM usage at a given
+`-c` is identical with and without `--kv-stream` (it should be - this is a
+real regression check, since the flag should not change memory behavior
+yet).
+
+The remaining work before a throughput/quality comparison is meaningful:
+wire `llama-kv-cache.cpp` to request `ggml_backend_cuda_kv_stream_buffer_type(...)`
+for a layer's K/V tensors when streaming validates. This needs a
+`llama_kv_cache` constructor signature change threaded through its several
+call sites in `llama-model.cpp`'s per-architecture switch - left as
+follow-up specifically because it has a much larger blast radius than
+everything landed so far (all of which was either purely additive or a
+narrow, behavior-preserving refactor of isolated code), and is best done
+now that real compiler/GPU feedback is available on this branch.
