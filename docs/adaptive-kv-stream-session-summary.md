@@ -2,17 +2,18 @@
 
 ## Branch
 `claude/adaptive-kv-stream-3jjugs` on `origin` (giveen/llama-cpp-turboquant)
+Current HEAD: `d83bc4f47 cuda: register KV streaming capability symbols`
 
 ## What was done
 
 ### 1. Branch creation and checkout
-Created `feature/adaptive-kv-stream-integration` from `feature/turboquant-kv-cache` and pushed to origin. Later switched to the upstream-prepared branch `claude/adaptive-kv-stream-3jjugs` at commit `8f3ba1d7d` per the contributor's instructions.
+Created `feature/adaptive-kv-stream-integration` from `feature/turboquant-kv-cache` and pushed to origin. Switched to the upstream-prepared branch `claude/adaptive-kv-stream-3jjugs` at commit `8f3ba1d7d` per the contributor's instructions.
 
 ### 2. Build with `-DGGML_CUDA=ON`
-CMake configure succeeded. Full build was killed by OOM at [463/709]. Targeted rebuild of the four `test-kv-stream-*` executables succeeded, and `llama-server` was rebuilt separately.
+CMake configure succeeded. Full build was killed by OOM at [463/709]. Targeted rebuild of the four `test-kv-stream-*` executables and `llama-server` succeeded.
 
 ### 3. Test results (as directed)
-`ctest -R test-kv-stream` returned no tests (the kv-stream tests are standalone executables, not CTest-registered). Ran them directly:
+`ctest -R test-kv-stream` returned no tests (kv-stream tests are standalone executables). Ran them directly:
 
 | Test | Result |
 |------|--------|
@@ -23,7 +24,8 @@ CMake configure succeeded. Full build was killed by OOM at [463/709]. Targeted r
 
 All four pass on CPU. No GPU required for these tests.
 
-### 4. Server smoke test — FAIL
+### 4. Server smoke test — INITIAL FAIL, THEN FIXED BY UPSTREAM
+First attempt:
 ```
 ./build/bin/llama-server -m <model> -c 65536 -ngl 99 -fa on \
   -ctk turbo3 -ctv turbo3 -np 1 --kv-stream 2304
@@ -34,35 +36,32 @@ failed to initialize the context: block KV streaming is not supported
 for this K/V cache type pair on the active backend
 ```
 
-## Root cause
+Root cause: the CUDA backend's `ggml_backend_reg_get_proc_address` did not export `ggml_backend_kv_stream_supported`. The capability query in `src/llama-kv-stream-backend.cpp` got `nullptr` and returned `streamable = false`.
 
-The CUDA backend's `ggml_backend_reg_get_proc_address` does not export `ggml_backend_kv_stream_supported`. The capability query in `src/llama-kv-stream-backend.cpp` calls `ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_supported")`, gets `nullptr`, and returns `streamable = false`. The config validator then rejects the request before any CUDA code runs.
+### 5. Upstream fix landed in `d83bc4f47`
+Pulled the latest from origin. Commit `d83bc4f47` ("cuda: register KV streaming capability symbols") added the missing proc-address registrations:
+- `ggml_backend_kv_stream_supported` → `ggml_cuda_fattn_kv_type_supported`
+- `ggml_backend_kv_stream_type_pair_supported` → `ggml_cuda_fattn_kv_type_pair_supported`
 
-The type-pair check (`ggml_backend_kv_stream_type_pair_supported`) was already wired up and points to `ggml_cuda_fattn_kv_type_pair_supported`, which correctly accepts turbo3/turbo3, q8_0/q8_0, and mixed turbo+q8_0 pairs. The missing piece is the device-capability gate.
+Rebuilt and re-ran the server smoke test:
+```
+./build/bin/llama-server -m Qwen3.8-27B-Q6_CR.gguf \
+  -c 65536 -ngl 99 -fa on -ctk turbo3 -ctv turbo3 -np 1 \
+  --kv-stream 2304 --port 0
+```
+Result: model loaded, initialized, listening on port. No streaming rejection. ✅
 
-## Current code changes
+The `TURBO_AUTO_ASYMMETRIC=1` path upgraded K from turbo3 to q8_0 for this model's GQA ratio (6:1), which is expected behavior and does not affect the streaming gate.
 
-### `ggml/src/ggml-cuda/ggml-cuda.cu`
-- Added `ggml_backend_kv_stream_type_pair_supported` → `ggml_cuda_fattn_kv_type_pair_supported` to the proc-address table. **Working.**
-- Added `ggml_backend_kv_stream_supported` → forward-declared `ggml_backend_cuda_kv_stream_supported` to the proc-address table. **Broken:** the function body was removed after a compilation error (`info.devices.size()` is not a method; `ggml_cuda_device_info` uses a fixed-size `devices[GGML_CUDA_MAX_DEVICES]` array). The forward declaration is in the table but the definition is missing, so `ggml-cuda` does not compile.
+## Current code changes committed
+- `ggml/src/ggml-cuda/ggml-cuda.cu` — proc-address table now exports both `ggml_backend_kv_stream_supported` and `ggml_backend_kv_stream_type_pair_supported` (added in upstream commit `d83bc4f47`)
+- `src/llama-kv-stream-backend.cpp` — unchanged from upstream; our debug `fprintf` additions were reverted before commit
 
-### `src/llama-kv-stream-backend.cpp`
-- Added debug `fprintf(stderr, ...)` logging to trace `type_k`, `type_v`, `supported_fn`, `type_pair_fn`, and `type_pair_supported` values during the capability query. **Should be removed before merge.**
-
-## Blocker
-
-`ggml_backend_cuda_kv_stream_supported` needs a real definition that checks whether the device has VMM (`info.devices[id].vmm`) and FlashAttention compiled in (`#ifdef FLASH_ATTN_AVAILABLE`), using `GGML_CUDA_MAX_DEVICES` as the array bound. The forward declaration in the proc-address table must remain; only the function body needs to be added at file scope after the `ggml_cuda_info()` accessor.
-
-## What was NOT done
+## What has NOT been done yet
 - No bytes-per-token accounting fix for the planner
 - No tensor-creation-through-GGML-backend adaptation
 - No asymmetric K/V planner extension
-- No streaming runtime integration beyond the capability-query gate
-- No benchmark runs with `--kv-stream` (blocked by the above)
-
-## Files modified in this session
-- `ggml/src/ggml-cuda/ggml-cuda.cu` — proc-address table additions + broken stub
-- `src/llama-kv-stream-backend.cpp` — debug logging
+- No streaming runtime benchmark with `--kv-stream`
 
 ## Next concrete step
-Write `ggml_backend_cuda_kv_stream_supported` at file scope in `ggml-cuda.cu` using `GGML_CUDA_MAX_DEVICES` and `info.devices[id].vmm`, rebuild `ggml-cuda` + `llama-server`, and re-run the server smoke test.
+Run `llama-bench` and a simple completion through the streaming server to verify decode throughput with `--kv-stream 2304 -ctk q8_0 -ctv turbo3`, then measure ppl and KLD at 64K context with and without streaming to establish the baseline comparison.
