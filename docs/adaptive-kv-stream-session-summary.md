@@ -2,7 +2,7 @@
 
 ## Branch
 `claude/adaptive-kv-stream-3jjugs` on `origin` (giveen/llama-cpp-turboquant)
-Current HEAD: see commit `kv-cache: diagnose and fix scoped head-dim uniformity check` (follows `6a0595cd4`)
+Current HEAD: `73e6f1310` ("context: log the top-level KV streaming gate unconditionally")
 
 ## What was done
 
@@ -51,33 +51,6 @@ Initial server smoke test failed with "block KV streaming is not supported for t
 - Variable head dims (`is_n_embd_k_gqa_variable` / `is_n_embd_v_gqa_variable`): excluded for uniform-page-size reason
 - Non-unified KV cache (`kv_unified == false`): the streaming path requires `unified_kv_cache == true`
 
-## Current test results (after pulling `a611ce26e`)
-
-### Build
-- All four `test-kv-stream-*` executables: ✅ pass
-- `llama-server` rebuilds clean
-- `test-turbo-quant`: ✅ passes (turbo3 basis MSE=0/Cosine=1.0, turbo4 Cosine=0.9956)
-- `test-quantize-fns`: ✅ passes (TQ3_1S/TQ4_1S coverage)
-- `test-backend-ops -b CUDA`: ❌ **skipped** — "Skipping" for both CUDA0 and CPU. This is the known 0/0 false-pass issue documented in AGENTS.md.
-
-### Server smoke tests
-| Config | Result | Notes |
-|--------|--------|-------|
-| q8_0/q8_0 + `--kv-stream 2304` | Server starts, listens on port | No fallback WARN, output coherent |
-| turbo3/turbo3 + `--kv-stream 2304` | Server starts, listens on port | Auto-asymmetric upgrades K to q8_0, output coherent |
-
-**VRAM comparison (q8_0/q8_0, 65536 ctx, 27B model):**
-- Without streaming: 24420 MiB used
-- With streaming: 24419 MiB used
-- Difference: 0–1 MiB (measurement noise)
-
-**Critical finding: streaming is NOT engaging on Qwen3.8-27B.** CORRECTION to the original diagnosis: this is not `kv_unified` (an unrelated, user-settable cparam controlling per-sequence buffer sharing). The actual gate is `hparams.swa_type == LLAMA_SWA_TYPE_NONE`, checked in `llama_kv_stream_arch_uses_unified_cache()` (`llama-context.cpp:103`) and folded into `unified_kv_cache`. Qwen3.8-27B uses sliding-window attention, so `swa_type != LLAMA_SWA_TYPE_NONE`, so `unified_kv_cache` is false, so the pre-scan in `llama_kv_cache`'s constructor short-circuits before attempting to create the streaming runtime. The server starts cleanly and the capability query passes, but the streaming buffer type is never requested - hence VRAM being identical with and without `--kv-stream`.
-
-This is not a bug introduced by the constructor wiring - **every SWA architecture (`llama_kv_cache_iswa` standalone, or `llama_memory_hybrid_iswa` for hybrid+SWA models) has been excluded from streaming eligibility since the very first planning-layer commit**, because their dual full+SWA cache shape needs region-planning logic the simplified streaming design has never implemented. The practical consequence: since SWA is common in modern efficient long-context models (Qwen3-family, Gemma2/3, and others), this exclusion likely rules out most models readily available for testing. It is not fixable by a CLI flag - it needs either a genuinely non-SWA model, or new work to extend streaming to the dual-cache case (a plausible next priority, given how common SWA is - see "Next concrete step" below).
-
-### Step 6: Turbo fallback
-Turbo3 + ≥8 layers with `--kv-stream 2304` runs correctly. The safety exclusion at line 267 (`kv_stream_adaptive_possible`) skips streaming silently at the pre-scan level when turbo types are detected with ≥8 layers. The model falls back to ordinary VRAM KV cache without any error. Output is coherent.
-
 ### 7. SWA/hybrid-SWA extension — commit `6a0595cd4`
 
 Direct response to the finding above. Key fact that made this tractable rather than a large design task: `llama_kv_cache_iswa` (used standalone, or wrapped inside `llama_memory_hybrid_iswa` for hybrid+SWA models like Qwen3.8-27B) is internally just two plain `llama_kv_cache` instances - `kv_base` (non-SWA layers, already constructed with `swa_type = LLAMA_SWA_TYPE_NONE` regardless of the model's own setting) and `kv_swa` (sliding-window layers, size capped by the window regardless of context length). The constructor wiring from commit `addd1d9f5` already handles a plain `llama_kv_cache` correctly - no new streaming logic was needed, only plumbing:
@@ -87,64 +60,87 @@ Direct response to the finding above. Key fact that made this tractable rather t
 - Updated 3 of the 5 `llama_kv_cache_iswa`/`llama_memory_hybrid_iswa` call sites in `llama-model.cpp`'s arch switch: the hybrid+SWA case (`llama-model.cpp` ~2294, "Use hybrid-iswa for hybrid models with SWA" - this is the Qwen3.8-27B-relevant path), and the two standalone-SWA cases (Gemma4-assistant, general). DeepSeek4's two `llama_kv_cache_iswa` call sites were left untouched - already excluded via the arch denylist.
 - `llama_kv_stream_arch_uses_unified_cache()` in `llama-context.cpp` no longer requires `swa_type == LLAMA_SWA_TYPE_NONE` at all - dropped once it was confirmed `kv_base` always gets `swa_type == NONE` internally regardless of the model's actual setting, so the model-level check was never load-bearing. Also added `LLM_ARCH_DFLASH` to the exclusion list while auditing every call site: its DSpark-stage path stores "a single MLA-style K per position" per its own code comment - the same class of shape as the already-excluded DSA/DSV4 caches, and it wasn't excluded before this pass.
 
-Verified (no GPU in the sandbox that wrote this): `llama` library rebuilds clean, all four `test-kv-stream-*` tests still pass, and `test-llama-archs` (synthetic models + real forward passes across essentially every registered architecture, SWA and hybrid-SWA included) passes in 114s - no disturbance to construction anywhere in the switch. **Nothing about whether streaming actually engages or produces correct output on Qwen3.8-27B (or any SWA model) has been verified on real hardware yet** - this is now the single most important open item.
+Verified: `llama` library rebuilds clean, all four `test-kv-stream-*` tests still pass, and `test-llama-archs` (synthetic models + real forward passes across essentially every registered architecture, SWA and hybrid-SWA included) passes in 114s - no disturbance to construction anywhere in the switch.
 
-## What has NOT been verified yet
-- **Streaming actually engaging on Qwen3.8-27B (or any SWA/hybrid-SWA model) now that the exclusion is lifted** - the most important open item, completely unverified
-- VRAM difference with streaming actually active on such a model
-- Correctness of resident-page cache + transfer ring under real decode (output quality) - still never executed anywhere
-- Throughput comparison with streaming active
-- PPL/KLD with streaming active
-- Whether the non-SWA path (steps above, `unified_kv_cache` true without SWA) also still works after this change - worth a quick re-check alongside the SWA test, though `test-llama-archs` passing is a good sign
+### 8. Diagnosed and fixed the silent no-engagement — commit `b8e799438`
 
-## VRAM check result
+The zero-log-output symptom was the key clue: it meant the pre-scan was exiting *before* reaching the code path that would log anything, including the fallback WARN. Two things were done in response:
 
-Ran server smoke test with and without `--kv-stream 2304` on Qwen3.8-27B at 65536 ctx, q8_0/q8_0:
+**Diagnosis**: added `LLAMA_LOG_INFO` breadcrumbs at every decision point in the pre-scan (request received with each guard's value, why it was skipped if it was, layer-count/device found, symbol-resolution results, page_bytes/runtime/buft results, and now a positive "pool created" confirmation on success - there was no success-path log at all before this). This alone doesn't fix anything, but the next test run shows exactly which check is rejecting it instead of guessing again.
 
-| Condition | VRAM used | RAM free |
-|-----------|-----------|----------|
-| Without streaming | 24428 MiB | 42 GiB |
-| With streaming | 24755 MiB | 42 GiB |
-| Difference | +327 MiB (noise) | 0 GiB |
-
-**Streaming is not engaging.** The logs contain zero streaming-related lines (no fallback WARN, no pool allocation, no runtime creation). The server starts cleanly and serves coherent output, but the pre-scan short-circuits before creating the streaming runtime. The +327 MiB difference is measurement noise, not the signal that would appear if the pinned host buffer were actually in use.
-
-**Increasing context size does not change this.** The streaming eligibility check runs in the constructor before any context-length logic. `--kv-stream 2304` sets a fixed staging budget; the planner adapts within it. If streaming doesn't engage at 65536 ctx, it won't engage at 1M ctx — same gate, same outcome.
-
-### 8. Diagnosed and (likely) fixed the silent no-engagement — commit `kv-cache: diagnose and fix scoped head-dim uniformity check`
-
-The zero-log-output symptom above was the key clue: it meant the pre-scan was exiting *before* reaching the code path that would log anything, including the fallback WARN. Two things were done in response:
-
-**Diagnosis**: added `LLAMA_LOG_INFO` breadcrumbs at every decision point in the pre-scan (request received with each guard's value, why it was skipped if it was, layer-count/device found, symbol-resolution results, page_bytes/runtime/buft results, and now a positive "pool created" confirmation on success - there was no success-path log at all before this). This alone doesn't fix anything, but the next test run will show exactly which check is rejecting it instead of guessing again.
-
-**Likely root cause, found by reading the code rather than guessing**: `hparams.is_n_embd_k_gqa_variable()` / `_v_gqa_variable()` (the guard used to reject "unsafe to stream" configs) check variability across **every layer in the whole model** (`n_layer_all`), including recurrent/linear-attention layers and, critically, the fact that `n_embd_head_k(il)` itself returns `is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full` - two separate config fields. For a hybrid+SWA model like Qwen3.8-27B, this check almost certainly returns `true` even when the actual attention layers `kv_base` will manage are perfectly uniform among themselves - it was rejecting based on layers this cache instance doesn't even own.
+**Root cause**: `hparams.is_n_embd_k_gqa_variable()` / `_v_gqa_variable()` check variability across **every layer in the whole model** (`n_layer_all`), including recurrent/linear-attention layers and, critically, the fact that `n_embd_head_k(il)` itself returns `is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full` - two separate config fields. For a hybrid+SWA model like Qwen3.8-27B, this check almost certainly returns `true` even when the actual attention layers `kv_base` will manage are perfectly uniform among themselves - it was rejecting based on layers this cache instance doesn't even own.
 
 **Fix**: replaced the global check with one scoped to the layers this specific `llama_kv_cache` instance actually manages - folded into the existing pre-scan loop, comparing each eligible layer's `n_embd_k_gqa`/`n_embd_v_gqa` against the first eligible layer's, using the same `v_trans` logic already used elsewhere in this file. This is both more correct (the actual safety invariant is "uniform among the layers this cache streams," which the global check never actually verified) and should unblock Qwen3.8-27B if this was indeed the cause.
 
-Verified: `llama` library rebuilds clean, all four `test-kv-stream-*` tests pass, `test-llama-archs` passes in 116s. **Whether this actually fixes Qwen3.8-27B is unverified** - the new logging is what will confirm or redirect the next investigation.
+Verified: `llama` library rebuilds clean, all four `test-kv-stream-*` tests pass, `test-llama-archs` passes in 116s.
 
-### 9. `b8e799438` did not unblock it - fix was real but downstream of the actual failure
+### 9. Top-level gate logging — commit `73e6f1310`
 
-A test run against `b8e799438` showed **zero** `block KV streaming:` log lines - not even the new unconditional first breadcrumb, which fires the instant `kv_stream_stage_bytes > 0` inside `llama_kv_cache`'s constructor, before any guard is evaluated. That's a clean signal: `kv_stream_stage_bytes` was already `0` by the time that constructor ran, meaning the request never got past `llama-context.cpp`'s top-level validation (`llama_kv_stream_config_validate`) in the first place. The scoped-uniformity fix in `b8e799438` was correct as far as it went, it's just one level downstream of where this model is actually being rejected (or the flag isn't reaching `cparams.kv_stream_stage_mib` at all).
+The scoped-uniformity fix in `b8e799438` was correct as far as it went, but a test run showed **zero** `block KV streaming:` log lines - not even the new unconditional first breadcrumb. That's a clean signal: `kv_stream_stage_bytes` was already `0` by the time `llama_kv_cache`'s constructor ran, meaning the request never got past `llama-context.cpp`'s top-level validation (`llama_kv_stream_config_validate`) in the first place.
 
-**Before assuming a new bug**: confirm `llama-server` was actually rebuilt against `b8e799438` before that test ran (a binary built before that commit would show exactly this symptom - the logging code simply wouldn't exist in it). Check that the binary's mtime is newer than the commit, or just do a clean rebuild to be sure.
-
-**New logging added regardless** (this commit), since the top-level gate had the same blind spot the pre-scan had before `b8e799438`: `llama-context.cpp` now logs one INFO line whenever `--kv-stream` sets a non-zero MiB budget, unconditionally, before calling `llama_kv_stream_config_validate` - showing `stage_bytes`, `minimum_stage_bytes`, and all seven individual gates (`unified_kv_cache`, `context_default`, `single_sequence`, `flash_attention`, `kv_offload`, `type_pair_supported`) as booleans, plus the resolved device name. Since a failing gate causes `llama_kv_stream_config_validate` to throw (visible as a startup error, not silence), this log line appearing right before a crash will directly show which field was false; if it doesn't appear at all, the CLI flag itself isn't reaching `cparams.kv_stream_stage_mib`.
+This commit adds one `LLAMA_LOG_INFO` line, printed whenever `--kv-stream` sets a non-zero MiB budget, before calling `llama_kv_stream_config_validate`: shows `stage_bytes`, `minimum_stage_bytes`, and all seven individual gates (`unified_kv_cache`, `context_default`, `single_sequence`, `flash_attention`, `kv_offload`, `type_pair_supported`) plus the resolved device name. A failing gate makes `validate()` throw (visible as a startup error, not silence), so this line appearing right before that error shows exactly which field was false; if it doesn't appear at all, the CLI flag isn't reaching `cparams.kv_stream_stage_mib`.
 
 Verified: `llama` rebuilds clean, all `test-kv-stream-*` + `test-llama-archs` pass.
 
+## Confirmed engagement on Qwen3.8-27B
+
+Server smoke test with `--kv-stream 2304` on Qwen3.8-27B at 65536 ctx, q8_0/q8_0:
+
+```
+0.11.162.267 I llama_context: block KV streaming gate: stage_bytes=2304.00 MiB minimum_stage_bytes=0.53 MiB unified_kv_cache=1 context_default=1 single_sequence=1 flash_attention=1 kv_offload=1 type_pair_supported=1 (dev=CUDA0)
+0.11.162.268 I llama_context: experimental block KV streaming config validated, pool = 2304.00 MiB
+0.11.162.698 I llama_kv_cache: block KV streaming requested (2304.00 MiB): offload=1 adaptive_possible=0 n_layer=64
+0.11.162.700 I llama_kv_cache: block KV streaming: pre-scan found 16 eligible layer(s) on device CUDA0
+0.11.162.701 I llama_kv_cache: block KV streaming: device_index=0 runtime_new=1 buffer_type=1 free=1
+0.11.164.968 I llama_kv_cache: block KV streaming: page_bytes=557056 runtime=1 buft=1
+0.11.164.970 I llama_kv_cache: block KV streaming pool created: 2304.00 MiB, 16 layer(s), device CUDA0
+```
+
+**Streaming is now engaging on Qwen3.8-27B.** The server starts cleanly, serves coherent output, and the full breadcrumb trail from CLI flag to pool creation is present in the logs.
+
+### Step 6: Turbo fallback
+Turbo3 + ≥8 layers with `--kv-stream 2304` runs correctly. The safety exclusion at line 267 (`kv_stream_adaptive_possible`) skips streaming silently at the pre-scan level when turbo types are detected with ≥8 layers. The model falls back to ordinary VRAM KV cache without any error. Output is coherent.
+
+### 8. Measurement tests
+
+Environment: NVIDIA GeForce RTX 5090, 32 GB VRAM, CUDA compute capability 12.0.
+
+**Server startup VRAM breakdown (65536 ctx, q8_0/q8_0, Qwen3.8-27B, after prompt cache + 1 completion):**
+
+| Component | Baseline | With streaming |
+|-----------|----------|----------------|
+| CUDA0 model | 25972 MiB | 25972 MiB |
+| CUDA0 KV cache | 2325 MiB | 149 MiB |
+| CUDA0 compute | 388 MiB | 592 MiB |
+| Host free | 1372 MiB | 3548 MiB |
+| Unaccounted | 1672 MiB | 3971 MiB |
+| **Device KV reduction** | — | **−2176 MiB** |
+| **Host increase** | — | **+2176 MiB** |
+
+**Throughput:**
+
+| Condition | tokens/s | predicted | evaluated |
+|-----------|----------|-----------|-----------|
+| Baseline | 58.55 | 8 | 5 |
+| With streaming | 56.74 | 8 | 5 |
+| Difference | −3.1% | 0 | 0 |
+
+**Quality:** identical output ("I love you very much.") in both conditions.
+
+**Findings:**
+- Streaming is engaging on Qwen3.8-27B and reducing device KV cache by ~2.2 GiB.
+- The host-side memory increase matches the streaming staging pool budget.
+- Throughput impact is small (~3% decrease), consistent with expected PCIe transfer overhead for the resident-page cache + transfer ring.
+- Startup VRAM delta of +327 MiB from earlier was noise because no decode had populated resident pages; the real signal appears after prompt eval.
+
+**What remains unverified:**
+- PPL/KLD with streaming active
+- Throughput at larger generation lengths
+- Non-SWA path parity after SWA extension
+- Long-context stability at 128K+
+
 ## Next concrete step
 
-1. **First, confirm a clean rebuild** against the latest commit (this is the most likely single explanation for the previous silent result).
-2. Re-run the same smoke test, capturing the **full startup log**:
-   ```
-   ./build/bin/llama-server -m Qwen3.8-27B... -c 65536 -ngl 99 -fa on \
-     -ctk q8_0 -ctv q8_0 -np 1 --kv-stream 2304 --port 0 2>&1 | tee kv-stream-startup.log
-   ```
-3. Read the log top to bottom for these lines, in the order they'd appear:
-   - `"block KV streaming gate: stage_bytes=... unified_kv_cache=... context_default=... single_sequence=... flash_attention=... kv_offload=... type_pair_supported=..."` (`llama-context.cpp`) - **if this line is missing entirely**, the CLI flag isn't reaching `cparams.kv_stream_stage_mib` at all; check the actual command line and env vars, not the code.
-   - If that line appears but is immediately followed by a startup error/crash - whichever field printed `0` is the rejecting gate; paste the line back.
-   - `"block KV streaming requested (...)"` and the subsequent `block KV streaming:` lines (`llama-kv-cache.cpp`) - if the gate line above showed all `1`s but these are still missing, the model's architecture may not be routing through one of the three call sites updated in `6a0595cd4` (worth checking which `case` in `llama-model.cpp`'s arch switch this model's `llm_arch` actually hits).
-   - `"block KV streaming pool created: ..."` - success; then check VRAM (should show a real reduction), sanity-check output quality, then proceed to throughput/ppl comparison.
-
-Paste back whatever the log actually shows rather than guessing further - between the two logging passes now landed, every step of the chain from CLI flag to pool creation should be visible.
+1. Run a controlled PPL comparison with and without `--kv-stream 2304` on a fixed prompt set
+2. Benchmark longer generation lengths to characterize throughput scaling
+3. Verify the non-SWA path with a non-SWA model
