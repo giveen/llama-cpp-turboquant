@@ -2,7 +2,7 @@
 
 ## Branch
 `claude/adaptive-kv-stream-3jjugs` on `origin` (giveen/llama-cpp-turboquant)
-Current HEAD: `a611ce26e docs: update adaptive-kv-stream summary for the constructor wiring`
+Current HEAD: `6a0595cd4 kv-cache: extend streaming to kv_base of SWA/hybrid-SWA caches`
 
 ## What was done
 
@@ -78,14 +78,33 @@ This is not a bug introduced by the constructor wiring - **every SWA architectur
 ### Step 6: Turbo fallback
 Turbo3 + ≥8 layers with `--kv-stream 2304` runs correctly. The safety exclusion at line 267 (`kv_stream_adaptive_possible`) skips streaming silently at the pre-scan level when turbo types are detected with ≥8 layers. The model falls back to ordinary VRAM KV cache without any error. Output is coherent.
 
+### 7. SWA/hybrid-SWA extension — commit `6a0595cd4`
+
+Direct response to the finding above. Key fact that made this tractable rather than a large design task: `llama_kv_cache_iswa` (used standalone, or wrapped inside `llama_memory_hybrid_iswa` for hybrid+SWA models like Qwen3.8-27B) is internally just two plain `llama_kv_cache` instances - `kv_base` (non-SWA layers, already constructed with `swa_type = LLAMA_SWA_TYPE_NONE` regardless of the model's own setting) and `kv_swa` (sliding-window layers, size capped by the window regardless of context length). The constructor wiring from commit `addd1d9f5` already handles a plain `llama_kv_cache` correctly - no new streaming logic was needed, only plumbing:
+
+- `kv_stream_stage_bytes` threaded through `llama_kv_cache_iswa`'s two constructors into `kv_base`'s construction only - `kv_swa` deliberately stays non-streaming (it doesn't grow with context length, doesn't need it).
+- Threaded one level further through `llama_memory_hybrid_iswa` into its `mem_attn`.
+- Updated 3 of the 5 `llama_kv_cache_iswa`/`llama_memory_hybrid_iswa` call sites in `llama-model.cpp`'s arch switch: the hybrid+SWA case (`llama-model.cpp` ~2294, "Use hybrid-iswa for hybrid models with SWA" - this is the Qwen3.8-27B-relevant path), and the two standalone-SWA cases (Gemma4-assistant, general). DeepSeek4's two `llama_kv_cache_iswa` call sites were left untouched - already excluded via the arch denylist.
+- `llama_kv_stream_arch_uses_unified_cache()` in `llama-context.cpp` no longer requires `swa_type == LLAMA_SWA_TYPE_NONE` at all - dropped once it was confirmed `kv_base` always gets `swa_type == NONE` internally regardless of the model's actual setting, so the model-level check was never load-bearing. Also added `LLM_ARCH_DFLASH` to the exclusion list while auditing every call site: its DSpark-stage path stores "a single MLA-style K per position" per its own code comment - the same class of shape as the already-excluded DSA/DSV4 caches, and it wasn't excluded before this pass.
+
+Verified (no GPU in the sandbox that wrote this): `llama` library rebuilds clean, all four `test-kv-stream-*` tests still pass, and `test-llama-archs` (synthetic models + real forward passes across essentially every registered architecture, SWA and hybrid-SWA included) passes in 114s - no disturbance to construction anywhere in the switch. **Nothing about whether streaming actually engages or produces correct output on Qwen3.8-27B (or any SWA model) has been verified on real hardware yet** - this is now the single most important open item.
+
 ## What has NOT been verified yet
-- Streaming actually engaging on a model with `unified_kv_cache == true` (requires a non-SWA, non-MLA, non-DSA model)
-- VRAM difference with streaming actually active
-- Correctness of resident-page cache + transfer ring under real decode (output quality)
+- **Streaming actually engaging on Qwen3.8-27B (or any SWA/hybrid-SWA model) now that the exclusion is lifted** - the most important open item, completely unverified
+- VRAM difference with streaming actually active on such a model
+- Correctness of resident-page cache + transfer ring under real decode (output quality) - still never executed anywhere
 - Throughput comparison with streaming active
 - PPL/KLD with streaming active
+- Whether the non-SWA path (steps above, `unified_kv_cache` true without SWA) also still works after this change - worth a quick re-check alongside the SWA test, though `test-llama-archs` passing is a good sign
 
 ## Next concrete step
-Obtain or identify a model in the local cache that uses a unified KV cache - specifically `hparams.swa_type == LLAMA_SWA_TYPE_NONE` (no sliding-window attention at all, not fixable via a CLI flag), plus no MLA/DSA/DSV4 - and has < 8 layers or uses non-turbo cache types. Test `--kv-stream` on that model and verify the streaming runtime is actually created (look for pool allocation log lines, VRAM difference, and correct output). Without such a model, steps 2-5 cannot be meaningfully completed.
 
-If no such model is available locally, the higher-leverage next step may instead be extending streaming eligibility to SWA architectures (`llama_kv_cache_iswa` / `llama_memory_hybrid_iswa`), since that's what most realistically-available long-context models actually use. That needs new region-planning logic for the dual full+SWA cache shape - a real design task, not a quick unblock.
+Re-run the exact same server smoke test that showed 0-1 MiB VRAM difference before:
+```
+./build/bin/llama-server -m Qwen3.8-27B... -c 65536 -ngl 99 -fa on \
+  -ctk q8_0 -ctv q8_0 -np 1 --kv-stream 2304 --port 0
+```
+This should now be a genuinely different test than last time - `unified_kv_cache` no longer excludes this model, so the pre-scan should reach the runtime-creation step. Watch for:
+1. The `LLAMA_LOG_WARN` fallback message ("block KV streaming requested but not available on this backend/device") - if it still appears, something else in the pre-scan/symbol-resolution chain needs a real log/backtrace to diagnose (this would be new information, not the previously-diagnosed SWA exclusion).
+2. If it does *not* appear: check VRAM usage again - a real reduction this time is the expected signal that `kv_base`'s pinned buffer is actually in use.
+3. Run a short completion and sanity-check output quality before trusting any perf number - the resident-page cache and transfer ring have never executed against real data.
