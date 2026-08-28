@@ -84,7 +84,7 @@ Verified in the sandbox that produced this commit (no GPU there): the `llama` li
 
 ## What needs to be tested next
 
-1. **Build with `-DGGML_CUDA=ON` and confirm it still compiles.** This is the first time the constructor-wiring commit (`addd1d9f5`) has touched a real CUDA compiler - the CUDA-side additions (`runtime_new_for_device` wrapper, proc-address registrations) are new since the last verified build.
+1. **Build with `-DGGML_CUDA=ON` and confirm it still compiles.** ✅ Done — the constructor-wiring commit (`addd1d9f5`) builds clean, and all four `test-kv-stream-*` executables plus `llama-server` rebuild successfully.
 
 2. **Server smoke test, same as before**, but now watch for whether streaming actually *engages* rather than just validates:
    ```
