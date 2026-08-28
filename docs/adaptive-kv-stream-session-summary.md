@@ -97,14 +97,26 @@ Verified (no GPU in the sandbox that wrote this): `llama` library rebuilds clean
 - PPL/KLD with streaming active
 - Whether the non-SWA path (steps above, `unified_kv_cache` true without SWA) also still works after this change - worth a quick re-check alongside the SWA test, though `test-llama-archs` passing is a good sign
 
+## VRAM check result
+
+Ran server smoke test with and without `--kv-stream 2304` on Qwen3.8-27B at 65536 ctx, q8_0/q8_0:
+
+| Condition | VRAM used | RAM free |
+|-----------|-----------|----------|
+| Without streaming | 24428 MiB | 42 GiB |
+| With streaming | 24755 MiB | 42 GiB |
+| Difference | +327 MiB (noise) | 0 GiB |
+
+**Streaming is not engaging.** The logs contain zero streaming-related lines (no fallback WARN, no pool allocation, no runtime creation). The server starts cleanly and serves coherent output, but the pre-scan short-circuits before creating the streaming runtime. The +327 MiB difference is measurement noise, not the signal that would appear if the pinned host buffer were actually in use.
+
+**Increasing context size does not change this.** The streaming eligibility check runs in the constructor before any context-length logic. `--kv-stream 2304` sets a fixed staging budget; the planner adapts within it. If streaming doesn't engage at 65536 ctx, it won't engage at 1M ctx — same gate, same outcome.
+
 ## Next concrete step
 
-Re-run the exact same server smoke test that showed 0-1 MiB VRAM difference before:
-```
-./build/bin/llama-server -m Qwen3.8-27B... -c 65536 -ngl 99 -fa on \
-  -ctk q8_0 -ctv q8_0 -np 1 --kv-stream 2304 --port 0
-```
-This should now be a genuinely different test than last time - `unified_kv_cache` no longer excludes this model, so the pre-scan should reach the runtime-creation step. Watch for:
-1. The `LLAMA_LOG_WARN` fallback message ("block KV streaming requested but not available on this backend/device") - if it still appears, something else in the pre-scan/symbol-resolution chain needs a real log/backtrace to diagnose (this would be new information, not the previously-diagnosed SWA exclusion).
-2. If it does *not* appear: check VRAM usage again - a real reduction this time is the expected signal that `kv_base`'s pinned buffer is actually in use.
-3. Run a short completion and sanity-check output quality before trusting any perf number - the resident-page cache and transfer ring have never executed against real data.
+Identify or obtain a model that:
+1. Uses a non-SWA architecture (not Qwen3-family, not Gemma2/3)
+2. Has uniform head dims across layers
+3. Has ≥8 layers but uses non-turbo cache types (to avoid the turbo+≥8-layer safety exclusion)
+4. Fits in VRAM on this hardware
+
+Then re-run the server smoke test with `--kv-stream` and verify streaming actually engages (look for pool allocation log lines, real VRAM reduction, and correct output). Without such a model, steps 2–5 cannot produce meaningful numbers.
