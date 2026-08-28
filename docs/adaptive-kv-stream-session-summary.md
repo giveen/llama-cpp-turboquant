@@ -2,7 +2,7 @@
 
 ## Branch
 `claude/adaptive-kv-stream-3jjugs` on `origin` (giveen/llama-cpp-turboquant)
-Current HEAD: `addd1d9f5 kv-cache: wire llama_kv_cache to request the streaming buffer type`
+Current HEAD: `a611ce26e docs: update adaptive-kv-stream summary for the constructor wiring`
 
 ## What was done
 
@@ -24,81 +24,64 @@ CMake configure succeeded. Full build was killed by OOM at [463/709]. Targeted r
 
 All four pass on CPU. No GPU required for these tests.
 
-### 4. Server smoke test — INITIAL FAIL, THEN FIXED BY UPSTREAM
-First attempt:
-```
-./build/bin/llama-server -m <model> -c 65536 -ngl 99 -fa on \
-  -ctk turbo3 -ctv turbo3 -np 1 --kv-stream 2304
-```
-Result:
-```
-failed to initialize the context: block KV streaming is not supported
-for this K/V cache type pair on the active backend
-```
+### 4. TurboQuant quality baseline (before integration)
+Ran the full quality benchmark suite on the current tree:
 
-Root cause: the CUDA backend's `ggml_backend_reg_get_proc_address` did not export `ggml_backend_kv_stream_supported`. The capability query in `src/llama-kv-stream-backend.cpp` got `nullptr` and returned `streamable = false`.
+- **PPL at 512 ctx**: turbo2 +1.01%, turbo3 +0.75%, turbo4 +0.16% (all within ≤1% gate)
+- **PPL at 64K ctx**: turbo3 +0.42% vs q8_0 (directionally valid; both 27B and 8B models exceed their 40960 native training context)
+- **KLD at 512 ctx**: turbo2 0.0109, turbo3 0.0057, turbo4 0.0015 (mean KLD low; turbo2/turbo3 have elevated 99.9th percentile)
+- **TGS at 512 ctx**: turbo2 -0.7%, turbo3 -1.1%, turbo4 -0.6% (within measurement noise)
+- **Passkey at 4K–32K**: 24/24 = 100% for turbo3 on Qwen3-8B
+- **128K context**: blocked by OOM on RTX 5090 32GB for both 27B and 8B models
 
-### 5. Upstream fix landed in `d83bc4f47`
-Pulled the latest from origin. Commit `d83bc4f47` ("cuda: register KV streaming capability symbols") added the missing proc-address registrations:
-- `ggml_backend_kv_stream_supported` → `ggml_cuda_fattn_kv_type_supported`
-- `ggml_backend_kv_stream_type_pair_supported` → `ggml_cuda_fattn_kv_type_pair_supported`
+### 5. Upstream capability-symbol fix
+Initial server smoke test failed with "block KV streaming is not supported for this K/V cache type pair on the active backend". Root cause: `ggml_backend_reg_get_proc_address` did not export `ggml_backend_kv_stream_supported`. Upstream commit `d83bc4f47` ("cuda: register KV streaming capability symbols") fixed this by adding both `ggml_backend_kv_stream_supported` and `ggml_backend_kv_stream_type_pair_supported` to the proc-address table.
 
-Rebuilt and re-ran the server smoke test:
-```
-./build/bin/llama-server -m Qwen3.8-27B-Q6_CR.gguf \
-  -c 65536 -ngl 99 -fa on -ctk turbo3 -ctv turbo3 -np 1 \
-  --kv-stream 2304 --port 0
-```
-Result: model loaded, initialized, listening on port. No streaming rejection. ✅
+### 6. Constructor wiring — commit `addd1d9f5`
+`llama_kv_cache` now actually requests the streaming buffer type from the CUDA backend when `--kv-stream` is set, instead of just validating and ignoring it. Key details:
 
-The `TURBO_AUTO_ASYMMETRIC=1` path upgraded K from turbo3 to q8_0 for this model's GQA ratio (6:1), which is expected behavior and does not affect the streaming gate.
+- Pre-scan before layer loop picks a target device and counts streaming-eligible layers
+- Resolves `ggml_backend_kv_stream_runtime_new_for_device`, `_buffer_type`, `_free` from backend registry
+- Creates one runtime shared by eligible layers, uses its pinned buffer type for their K/V tensors
+- Falls back silently with `LLAMA_LOG_WARN` on any failure
 
-### 6. `llama_kv_cache` wired to actually request the streaming buffer type — commit `addd1d9f5`
+**Safety exclusions in the current code:**
+- Turbo K/V + ≥8 layers: deliberately excluded (mixed page sizes from `TURBO_LAYER_ADAPTIVE` would corrupt the uniform-page-size assumption in the streaming pool)
+- Multi-GPU: only layers on the first streaming-eligible device's backend are considered
+- Variable head dims (`is_n_embd_k_gqa_variable` / `is_n_embd_v_gqa_variable`): excluded for uniform-page-size reason
+- Non-unified KV cache (`kv_unified == false`): the streaming path requires `unified_kv_cache == true`
 
-Before this commit, `--kv-stream` validated and the server started (`d83bc4f47`), but nothing downstream requested the pinned streaming buffer - the KV cache was still ordinary VRAM storage regardless of the flag. `addd1d9f5` closes that gap:
+## Current test results (after pulling `a611ce26e`)
 
-- `llama_kv_cache`'s constructor now does a pre-scan before its layer loop (when `kv_stream_stage_bytes > 0` and offloaded): picks a target device and counts streaming-eligible layers on it, resolves `ggml_backend_kv_stream_runtime_new_for_device` / `_buffer_type` / `_free` off that device's backend registry (same `ggml_backend_reg_get_proc_address` plugin pattern used elsewhere in this codebase), and if that succeeds, creates one runtime shared by those layers and uses its pinned buffer type instead of the ordinary device buffer type for their K/V tensors. Any failure at any step (backend doesn't export the symbols, allocation/layout failure) falls back silently to today's behavior with a `LLAMA_LOG_WARN`.
-- Threaded `kv_stream_stage_bytes` through `llama_memory_params` → `llama_memory_hybrid` → the two real call sites in `llama-model.cpp`'s architecture switch that can actually reach `unified_kv_cache == true`: the plain default (non-hybrid, non-SWA) case, and the non-SWA hybrid case (e.g. Qwen3.5-style models). The DSA/DSV4/MSA MTP-context call site needed no change - those architectures are already excluded from `unified_kv_cache` upstream, so the new parameter's default (0) is always correct there.
-- Added a generic `ggml_backend_kv_stream_runtime_new_for_device` wrapper (plain scalar args: device index, pool_bytes, page_bytes, stage_slots, layer_count) in `ggml-cuda/kv-stream.cu`/`.cuh`, since the existing constructor took a CUDA-internal params struct that generic (non-CUDA) code can't reference. Registered it plus `_free`/`_buffer_type` in `ggml-cuda.cu`'s proc-address table.
-- **Important safety exclusion**: streaming is skipped whenever K or V is a turbo type (`turbo2_0`/`turbo3_0`/`turbo4_0`) *and* the model has ≥ 8 layers. Reason: the already-shipping `TURBO_LAYER_ADAPTIVE` override (auto-enabled by default whenever V is `turbo2_0` on ≥ 8 layers - see the mode-dispatch block in `llama-kv-cache.cpp`, around where `layer_type_k`/`layer_type_v` are resolved per layer) can give different layers different K/V types, and hence different bytes-per-token. The streaming pool assumes one uniform page size across every layer it manages, so mixed-size layers would corrupt that assumption. The exclusion is deliberately the coarse, *provably*-safe condition (that's the only condition under which the adaptive override changes anything) rather than replicating its ~50-line dispatch table to predict the outcome exactly - **this means streaming currently will not engage for the turbo K/V + ≥8-layer combination, which is plausibly your main intended use case.** Relaxing this safely (either by making the streaming pool support per-layer page sizes, or by precisely predicting the adaptive dispatch outcome with its own test coverage) is real follow-up work, not something to do without a compiler and a test in hand.
-- Streaming currently only targets a single device: if a model's layers are split across multiple GPUs, only the layers on the *first* streaming-eligible layer's device are considered; layers on other devices keep the ordinary buffer type.
-- Also requires `!hparams.is_n_embd_k_gqa_variable() && !hparams.is_n_embd_v_gqa_variable()` (uniform head dims across layers) for the same uniform-page-size reason.
+### Build
+- All four `test-kv-stream-*` executables: ✅ pass
+- `llama-server` rebuilds clean
+- `test-turbo-quant`: ✅ passes (turbo3 basis MSE=0/Cosine=1.0, turbo4 Cosine=0.9956)
+- `test-quantize-fns`: ✅ passes (TQ3_1S/TQ4_1S coverage)
+- `test-backend-ops -b CUDA`: ❌ **skipped** — "Skipping" for both CUDA0 and CPU. This is the known 0/0 false-pass issue documented in AGENTS.md.
 
-Verified in the sandbox that produced this commit (no GPU there): the `llama` library rebuilds clean, all four `test-kv-stream-*` tests still pass, and `test-llama-archs` (builds tiny synthetic models and runs real forward passes across many architectures through the actual model-loading path) passes in ~103s with the default `kv_stream_stage_bytes = 0` - meaning the constructor change doesn't disturb ordinary (non-streaming) KV cache construction anywhere in the architecture switch. **Nothing about whether streaming actually engages, allocates correctly, or produces correct output has been verified on real hardware yet.**
+### Server smoke tests
+| Config | Result | Notes |
+|--------|--------|-------|
+| q8_0/q8_0 + `--kv-stream 2304` | Server starts, listens on port | No fallback WARN, output coherent |
+| turbo3/turbo3 + `--kv-stream 2304` | Server starts, listens on port | Auto-asymmetric upgrades K to q8_0, output coherent |
 
-## Current code changes committed
-- `ggml/src/ggml-cuda/ggml-cuda.cu` — proc-address table exports `ggml_backend_kv_stream_supported`, `_type_pair_supported`, `_runtime_new_for_device`, `_runtime_free`, `_buffer_type`
-- `ggml/src/ggml-cuda/kv-stream.cu` / `.cuh` — the pinned buffer type, device pool, resident-page cache, transfer ring, online-softmax fixup kernels, and the generic `_runtime_new_for_device` wrapper
-- `ggml/src/ggml-cuda/fattn.cu` / `.cuh` — generalized (K,V) type-pair support check, reused by the existing dispatch
-- `src/llama-kv-stream-{config,plan,softmax,backend}.{h,cpp}` — the backend-agnostic planning layer and capability-query plumbing
-- `src/llama-kv-cache.{h,cpp}`, `src/llama-memory.h`, `src/llama-memory-hybrid.{h,cpp}`, `src/llama-model.cpp`, `src/llama-context.cpp` — the constructor wiring described above
-- `src/llama-kv-stream-backend.cpp` — unchanged from earlier upstream commits; no debug logging present
+**VRAM comparison (q8_0/q8_0, 65536 ctx, 27B model):**
+- Without streaming: 24420 MiB used
+- With streaming: 24419 MiB used
+- Difference: 0–1 MiB (measurement noise)
 
-## What has NOT been done yet
-- **Not tested on real hardware at all**: the constructor wiring in `addd1d9f5` has never run against an actual CUDA device. This is the most important open item.
-- No benchmark runs with `--kv-stream` (see "what to test" below for what would actually be meaningful now)
-- No tensor-creation-through-GGML-backend adaptation beyond what's described above
-- No asymmetric K/V planner extension
-- No relaxation of the turbo/≥8-layer exclusion or the multi-GPU/variable-head-dim limitations
-- Vulkan and Metal execution backends were never started - everything so far is CUDA/HIP/MUSA only (the three backends that share `ggml-cuda`'s source tree)
+**Critical finding: streaming is NOT engaging on Qwen3.8-27B.** The model's architecture sets `kv_unified = false` (it uses SWA/non-unified cache). The streaming constructor requires `unified_kv_cache == true` AND `kv_stream_stage_bytes > 0`. Since `unified_kv_cache` is false, the pre-scan short-circuits before attempting to create the streaming runtime. The server starts cleanly, the capability query passes, but the actual streaming buffer type is never requested. This is why VRAM is identical with and without `--kv-stream`.
 
-## What needs to be tested next
+### Step 6: Turbo fallback
+Turbo3 + ≥8 layers with `--kv-stream 2304` runs correctly. The safety exclusion at line 267 (`kv_stream_adaptive_possible`) skips streaming silently at the pre-scan level when turbo types are detected with ≥8 layers. The model falls back to ordinary VRAM KV cache without any error. Output is coherent.
 
-1. **Build with `-DGGML_CUDA=ON` and confirm it still compiles.** ✅ Done — the constructor-wiring commit (`addd1d9f5`) builds clean, and all four `test-kv-stream-*` executables plus `llama-server` rebuild successfully.
+## What has NOT been verified yet
+- Streaming actually engaging on a model with `unified_kv_cache == true` (requires a non-SWA, non-MLA, non-DSA model)
+- VRAM difference with streaming actually active
+- Correctness of resident-page cache + transfer ring under real decode (output quality)
+- Throughput comparison with streaming active
+- PPL/KLD with streaming active
 
-2. **Server smoke test, same as before**, but now watch for whether streaming actually *engages* rather than just validates:
-   ```
-   ./build/bin/llama-server -m <model> -c 65536 -ngl 99 -fa on \
-     -ctk q8_0 -ctv q8_0 -np 1 --kv-stream 2304
-   ```
-   Use a non-turbo type pair (e.g. `q8_0`/`q8_0`) or a model with < 8 layers for this first test, since turbo + ≥8 layers is deliberately excluded right now (see above) - a turbo-type test would currently exercise the *fallback* path, not the streaming path, which is worth testing separately but shouldn't be the first test.
-   - Look for the `LLAMA_LOG_WARN` fallback message ("block KV streaming requested but not available on this backend/device") - if it appears when you expected streaming to engage, something in the pre-scan or symbol resolution is failing and needs a real backtrace/log to diagnose.
-   - If it does *not* appear, streaming should be live for those layers.
-
-3. **VRAM check**: compare `nvidia-smi` memory usage at a given `-c` with and without `--kv-stream`. This time a *difference* is the expected, correct signal (less VRAM used for the KV cache portion when streaming is active, since it's now genuinely in pinned host memory) - the opposite of the "should be identical" check from before this commit.
-
-4. **Correctness check before any perf number is trusted**: run a short completion and sanity-check the output isn't garbage. The resident-page cache and transfer ring in `kv-stream.cu` were written and reviewed carefully but never executed - if there's a subtle bug in the page-copy/event choreography, garbled or repetitive output is the most likely symptom, not a crash.
-
-5. **Only after 2-4 look correct**: throughput (`llama-bench` or manual token/s) and ppl/KLD comparison with and without `--kv-stream`, which is now a meaningful comparison for the first time.
-
-6. **Test the turbo/≥8-layer fallback explicitly**: confirm a turbo K/V + ≥8-layer model still starts and runs correctly with `--kv-stream` set (falling back to the ordinary cache, not erroring) - this is the safety exclusion working as intended, and should be a silent, unremarkable no-op from the model's perspective (only the log line differs).
+## Next concrete step
+Obtain or identify a model in the local cache that uses a unified KV cache (no SWA, no MLA, no DSA/DSV4) and has < 8 layers or uses non-turbo cache types. Test `--kv-stream` on that model and verify the streaming runtime is actually created (look for pool allocation log lines, VRAM difference, and correct output). Without such a model, steps 2–5 cannot be meaningfully completed.
