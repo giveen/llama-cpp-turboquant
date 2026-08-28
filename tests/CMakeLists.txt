@@ -303,6 +303,12 @@ target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src
 llama_build_and_test(test-kv-stream-softmax.cpp  ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-softmax.cpp)
 target_include_directories(test-kv-stream-softmax PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# per-backend capability query: links the real llama/ggml libraries (unlike
+# the pure-math tests above) since it resolves symbols off the live backend
+# registry.
+llama_build_and_test(test-kv-stream-backend.cpp)
+target_include_directories(test-kv-stream-backend PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
