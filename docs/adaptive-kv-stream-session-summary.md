@@ -2,7 +2,7 @@
 
 ## Branch
 `claude/adaptive-kv-stream-3jjugs` on `origin` (giveen/llama-cpp-turboquant)
-Current HEAD: `6a0595cd4 kv-cache: extend streaming to kv_base of SWA/hybrid-SWA caches`
+Current HEAD: see commit `kv-cache: diagnose and fix scoped head-dim uniformity check` (follows `6a0595cd4`)
 
 ## What was done
 
@@ -111,12 +111,29 @@ Ran server smoke test with and without `--kv-stream 2304` on Qwen3.8-27B at 6553
 
 **Increasing context size does not change this.** The streaming eligibility check runs in the constructor before any context-length logic. `--kv-stream 2304` sets a fixed staging budget; the planner adapts within it. If streaming doesn't engage at 65536 ctx, it won't engage at 1M ctx — same gate, same outcome.
 
+### 8. Diagnosed and (likely) fixed the silent no-engagement — commit `kv-cache: diagnose and fix scoped head-dim uniformity check`
+
+The zero-log-output symptom above was the key clue: it meant the pre-scan was exiting *before* reaching the code path that would log anything, including the fallback WARN. Two things were done in response:
+
+**Diagnosis**: added `LLAMA_LOG_INFO` breadcrumbs at every decision point in the pre-scan (request received with each guard's value, why it was skipped if it was, layer-count/device found, symbol-resolution results, page_bytes/runtime/buft results, and now a positive "pool created" confirmation on success - there was no success-path log at all before this). This alone doesn't fix anything, but the next test run will show exactly which check is rejecting it instead of guessing again.
+
+**Likely root cause, found by reading the code rather than guessing**: `hparams.is_n_embd_k_gqa_variable()` / `_v_gqa_variable()` (the guard used to reject "unsafe to stream" configs) check variability across **every layer in the whole model** (`n_layer_all`), including recurrent/linear-attention layers and, critically, the fact that `n_embd_head_k(il)` itself returns `is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full` - two separate config fields. For a hybrid+SWA model like Qwen3.8-27B, this check almost certainly returns `true` even when the actual attention layers `kv_base` will manage are perfectly uniform among themselves - it was rejecting based on layers this cache instance doesn't even own.
+
+**Fix**: replaced the global check with one scoped to the layers this specific `llama_kv_cache` instance actually manages - folded into the existing pre-scan loop, comparing each eligible layer's `n_embd_k_gqa`/`n_embd_v_gqa` against the first eligible layer's, using the same `v_trans` logic already used elsewhere in this file. This is both more correct (the actual safety invariant is "uniform among the layers this cache streams," which the global check never actually verified) and should unblock Qwen3.8-27B if this was indeed the cause.
+
+Verified: `llama` library rebuilds clean, all four `test-kv-stream-*` tests pass, `test-llama-archs` passes in 116s. **Whether this actually fixes Qwen3.8-27B is unverified** - the new logging is what will confirm or redirect the next investigation.
+
 ## Next concrete step
 
-Identify or obtain a model that:
-1. Uses a non-SWA architecture (not Qwen3-family, not Gemma2/3)
-2. Has uniform head dims across layers
-3. Has ≥8 layers but uses non-turbo cache types (to avoid the turbo+≥8-layer safety exclusion)
-4. Fits in VRAM on this hardware
+Re-run the exact same smoke test as the VRAM check above, and this time **capture the full server startup log**, not just the VRAM numbers:
+```
+./build/bin/llama-server -m Qwen3.8-27B... -c 65536 -ngl 99 -fa on \
+  -ctk q8_0 -ctv q8_0 -np 1 --kv-stream 2304 --port 0 2>&1 | tee kv-stream-startup.log
+```
+Look for the new `block KV streaming:` log lines (all at INFO level, so they should show by default):
+1. If you see `"skipped, K or V byte-per-token size varies across this cache's N eligible layer(s)"` - the fix didn't fully solve it; the actual per-layer values logged there are the next thing to inspect (paste them back for further diagnosis).
+2. If you see `"pre-scan found 0 eligible layer(s)"` - a different, not-yet-diagnosed issue in the counting loop itself (e.g. `hparams.has_kv(il)` or the `filter_base` callback rejecting more than expected) - also worth pasting back.
+3. If you see `"device_index=... runtime_new=0 ..."` (any of the four booleans false) - the proc-address symbols aren't resolving; check the CUDA backend registered them correctly.
+4. If you see `"block KV streaming pool created: ..."` - it worked. Then check VRAM (should show a real reduction this time), run a short completion and sanity-check output quality before trusting any perf number, then proceed to throughput/ppl comparison.
 
-Then re-run the server smoke test with `--kv-stream` and verify streaming actually engages (look for pool allocation log lines, real VRAM reduction, and correct output). Without such a model, steps 2–5 cannot produce meaningful numbers.
+If the log shows something not covered above, paste it back rather than guessing further - this is exactly what the logging was added for.
