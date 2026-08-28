@@ -291,6 +291,18 @@ endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
 
+# backend-agnostic KV streaming planning layer: pure C++, no ggml/llama
+# dependency, so the implementation files are compiled straight into each
+# test binary instead of linking the full llama library.
+llama_build_and_test(test-kv-stream-config.cpp  ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp)
+target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-kv-stream-plan.cpp     ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-plan.cpp)
+target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-kv-stream-softmax.cpp  ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-softmax.cpp)
+target_include_directories(test-kv-stream-softmax PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
