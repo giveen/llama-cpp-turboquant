@@ -123,17 +123,28 @@ The zero-log-output symptom above was the key clue: it meant the pre-scan was ex
 
 Verified: `llama` library rebuilds clean, all four `test-kv-stream-*` tests pass, `test-llama-archs` passes in 116s. **Whether this actually fixes Qwen3.8-27B is unverified** - the new logging is what will confirm or redirect the next investigation.
 
+### 9. `b8e799438` did not unblock it - fix was real but downstream of the actual failure
+
+A test run against `b8e799438` showed **zero** `block KV streaming:` log lines - not even the new unconditional first breadcrumb, which fires the instant `kv_stream_stage_bytes > 0` inside `llama_kv_cache`'s constructor, before any guard is evaluated. That's a clean signal: `kv_stream_stage_bytes` was already `0` by the time that constructor ran, meaning the request never got past `llama-context.cpp`'s top-level validation (`llama_kv_stream_config_validate`) in the first place. The scoped-uniformity fix in `b8e799438` was correct as far as it went, it's just one level downstream of where this model is actually being rejected (or the flag isn't reaching `cparams.kv_stream_stage_mib` at all).
+
+**Before assuming a new bug**: confirm `llama-server` was actually rebuilt against `b8e799438` before that test ran (a binary built before that commit would show exactly this symptom - the logging code simply wouldn't exist in it). Check that the binary's mtime is newer than the commit, or just do a clean rebuild to be sure.
+
+**New logging added regardless** (this commit), since the top-level gate had the same blind spot the pre-scan had before `b8e799438`: `llama-context.cpp` now logs one INFO line whenever `--kv-stream` sets a non-zero MiB budget, unconditionally, before calling `llama_kv_stream_config_validate` - showing `stage_bytes`, `minimum_stage_bytes`, and all seven individual gates (`unified_kv_cache`, `context_default`, `single_sequence`, `flash_attention`, `kv_offload`, `type_pair_supported`) as booleans, plus the resolved device name. Since a failing gate causes `llama_kv_stream_config_validate` to throw (visible as a startup error, not silence), this log line appearing right before a crash will directly show which field was false; if it doesn't appear at all, the CLI flag itself isn't reaching `cparams.kv_stream_stage_mib`.
+
+Verified: `llama` rebuilds clean, all `test-kv-stream-*` + `test-llama-archs` pass.
+
 ## Next concrete step
 
-Re-run the exact same smoke test as the VRAM check above, and this time **capture the full server startup log**, not just the VRAM numbers:
-```
-./build/bin/llama-server -m Qwen3.8-27B... -c 65536 -ngl 99 -fa on \
-  -ctk q8_0 -ctv q8_0 -np 1 --kv-stream 2304 --port 0 2>&1 | tee kv-stream-startup.log
-```
-Look for the new `block KV streaming:` log lines (all at INFO level, so they should show by default):
-1. If you see `"skipped, K or V byte-per-token size varies across this cache's N eligible layer(s)"` - the fix didn't fully solve it; the actual per-layer values logged there are the next thing to inspect (paste them back for further diagnosis).
-2. If you see `"pre-scan found 0 eligible layer(s)"` - a different, not-yet-diagnosed issue in the counting loop itself (e.g. `hparams.has_kv(il)` or the `filter_base` callback rejecting more than expected) - also worth pasting back.
-3. If you see `"device_index=... runtime_new=0 ..."` (any of the four booleans false) - the proc-address symbols aren't resolving; check the CUDA backend registered them correctly.
-4. If you see `"block KV streaming pool created: ..."` - it worked. Then check VRAM (should show a real reduction this time), run a short completion and sanity-check output quality before trusting any perf number, then proceed to throughput/ppl comparison.
+1. **First, confirm a clean rebuild** against the latest commit (this is the most likely single explanation for the previous silent result).
+2. Re-run the same smoke test, capturing the **full startup log**:
+   ```
+   ./build/bin/llama-server -m Qwen3.8-27B... -c 65536 -ngl 99 -fa on \
+     -ctk q8_0 -ctv q8_0 -np 1 --kv-stream 2304 --port 0 2>&1 | tee kv-stream-startup.log
+   ```
+3. Read the log top to bottom for these lines, in the order they'd appear:
+   - `"block KV streaming gate: stage_bytes=... unified_kv_cache=... context_default=... single_sequence=... flash_attention=... kv_offload=... type_pair_supported=..."` (`llama-context.cpp`) - **if this line is missing entirely**, the CLI flag isn't reaching `cparams.kv_stream_stage_mib` at all; check the actual command line and env vars, not the code.
+   - If that line appears but is immediately followed by a startup error/crash - whichever field printed `0` is the rejecting gate; paste the line back.
+   - `"block KV streaming requested (...)"` and the subsequent `block KV streaming:` lines (`llama-kv-cache.cpp`) - if the gate line above showed all `1`s but these are still missing, the model's architecture may not be routing through one of the three call sites updated in `6a0595cd4` (worth checking which `case` in `llama-model.cpp`'s arch switch this model's `llm_arch` actually hits).
+   - `"block KV streaming pool created: ..."` - success; then check VRAM (should show a real reduction), sanity-check output quality, then proceed to throughput/ppl comparison.
 
-If the log shows something not covered above, paste it back rather than guessing further - this is exactly what the logging was added for.
+Paste back whatever the log actually shows rather than guessing further - between the two logging passes now landed, every step of the chain from CLI flag to pool creation should be visible.
