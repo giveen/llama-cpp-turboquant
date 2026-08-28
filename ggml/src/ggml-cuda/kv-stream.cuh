@@ -52,6 +52,14 @@ struct ggml_backend_cuda_kv_stream_params {
 ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         const ggml_backend_cuda_kv_stream_params & params);
 
+// Same as above, but takes plain scalar arguments instead of the CUDA-specific
+// params struct, and returns/takes an opaque void* handle - this is the shape
+// resolved by llama-kv-cache.cpp through ggml_backend_reg_get_proc_address
+// (registered under "ggml_backend_kv_stream_runtime_new_for_device" in
+// ggml-cuda.cu), so that generic code never needs to include this header.
+void * ggml_backend_cuda_kv_stream_runtime_new_for_device(
+        int device, size_t pool_bytes, size_t page_bytes, uint32_t stage_slots, uint32_t layer_count);
+
 void ggml_backend_cuda_kv_stream_runtime_free(ggml_backend_cuda_kv_stream_runtime_t runtime);
 
 // The pinned host buffer type backing the authoritative KV cache tensors.
