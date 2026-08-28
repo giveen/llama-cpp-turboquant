@@ -101,44 +101,6 @@ Server smoke test with `--kv-stream 2304` on Qwen3.8-27B at 65536 ctx, q8_0/q8_0
 ### Step 6: Turbo fallback (superseded by section 11 below)
 Turbo3 + ≥8 layers with `--kv-stream 2304` ran correctly but fell back to the ordinary VRAM KV cache without error: the old safety exclusion treated any turbo K/V type combined with ≥8 layers as unsafe, regardless of whether `TURBO_LAYER_ADAPTIVE` would actually vary anything for that type. Section 11 replaces this with a precise check - a plain turbo3 K/V config like this one (no `TURBO_LAYER_ADAPTIVE` override, V isn't turbo2 so the auto-enable never triggers) should now stream instead of falling back. **Needs re-verification on hardware** to confirm it now engages.
 
-### 8. Measurement tests
-
-Environment: NVIDIA GeForce RTX 5090, 32 GB VRAM, CUDA compute capability 12.0.
-
-**Server startup VRAM breakdown (65536 ctx, q8_0/q8_0, Qwen3.8-27B, after prompt cache + 1 completion):**
-
-| Component | Baseline | With streaming |
-|-----------|----------|----------------|
-| CUDA0 model | 25972 MiB | 25972 MiB |
-| CUDA0 KV cache | 2325 MiB | 149 MiB |
-| CUDA0 compute | 388 MiB | 592 MiB |
-| Host free | 1372 MiB | 3548 MiB |
-| Unaccounted | 1672 MiB | 3971 MiB |
-| **Device KV reduction** | — | **−2176 MiB** |
-| **Host increase** | — | **+2176 MiB** |
-
-**Throughput:**
-
-| Condition | tokens/s | predicted | evaluated |
-|-----------|----------|-----------|-----------|
-| Baseline | 58.55 | 8 | 5 |
-| With streaming | 56.74 | 8 | 5 |
-| Difference | −3.1% | 0 | 0 |
-
-**Quality:** identical output ("I love you very much.") in both conditions.
-
-**Findings:**
-- Streaming is engaging on Qwen3.8-27B and reducing device KV cache by ~2.2 GiB.
-- The host-side memory increase matches the streaming staging pool budget.
-- Throughput impact is small (~3% decrease), consistent with expected PCIe transfer overhead for the resident-page cache + transfer ring.
-- Startup VRAM delta of +327 MiB from earlier was noise because no decode had populated resident pages; the real signal appears after prompt eval.
-
-**What remains unverified:**
-- PPL/KLD with streaming active
-- Throughput at larger generation lengths
-- Non-SWA path parity after SWA extension
-- Long-context stability at 128K+
-
 ### 10. Wired `--kv-stream` into llama-bench, llama-perplexity, llama-cli — commit `bf9971c38`
 
 To unblock PPL/KLD comparison, throughput benchmarking, and general interactive
@@ -276,6 +238,58 @@ tuned against real measurements yet.
 
 1. Run a controlled PPL comparison with and without `--kv-stream 2304` on a fixed prompt set using `llama-perplexity`
 2. Use `llama-bench --kv-stream 0,2304` (and other stage sizes) to characterize throughput scaling across generation lengths and context sizes in one sweep
+3. Verify the non-SWA path with a non-SWA model
+4. General interactive testing via `llama-cli --kv-stream <n>`
+### 8. Measurement tests
+
+Environment: NVIDIA GeForce RTX 5090, 32 GB VRAM, CUDA compute capability 12.0.
+
+**Server startup VRAM breakdown (65536 ctx, q8_0/q8_0, Qwen3.8-27B, after prompt cache + 1 completion):**
+
+| Component | Baseline | With streaming |
+|-----------|----------|----------------|
+| CUDA0 model | 25972 MiB | 25972 MiB |
+| CUDA0 KV cache | 2325 MiB | 149 MiB |
+| CUDA0 compute | 388 MiB | 592 MiB |
+| Host free | 1372 MiB | 3548 MiB |
+| Unaccounted | 1672 MiB | 3971 MiB |
+| **Device KV reduction** | — | **−2176 MiB** |
+| **Host increase** | — | **+2176 MiB** |
+
+**Throughput (`llama-bench`, 512 ctx, 128 gen, 3 reps):**
+
+| Condition | pp512 t/s | tg128 t/s |
+|-----------|-----------|-----------|
+| Baseline | 3640.26 ± 192.63 | 53.75 ± 0.26 |
+| With streaming | 3514.62 ± 176.04 | 52.53 ± 0.11 |
+| Difference | −3.5% | −2.3% |
+
+**Server inference (`llama-server`, 512 ctx, 1 completion):**
+
+| Condition | tokens/s | predicted | evaluated |
+|-----------|----------|-----------|-----------|
+| Baseline | 58.55 | 8 | 5 |
+| With streaming | 56.74 | 8 | 5 |
+| Difference | −3.1% | 0 | 0 |
+
+**Quality:** identical output ("I love you very much.") in both server conditions.
+
+**Findings:**
+- Streaming is engaging on Qwen3.8-27B and reducing device KV cache by ~2.2 GiB.
+- The host-side memory increase matches the streaming staging pool budget.
+- Throughput impact is small (~2–3% decrease), consistent with expected PCIe transfer overhead for the resident-page cache + transfer ring.
+- Startup VRAM delta of +327 MiB from earlier was noise because no decode had populated resident pages; the real signal appears after prompt eval.
+
+**What remains unverified:**
+- PPL/KLD with streaming active — `llama-perplexity` currently hard-fails with `block KV streaming requires exactly one sequence (-np 1)` when `--kv-stream` is passed; direct perplexity comparison is blocked at the tool level
+- Throughput at larger generation lengths / longer contexts
+- Non-SWA path parity after SWA extension
+- Long-context stability at 128K+
+
+## Next concrete step
+
+1. Resolve the `llama-perplexity` single-sequence blocker, or add a direct server-side PPL endpoint, then run a controlled PPL comparison with and without `--kv-stream 2304`
+2. Benchmark longer generation lengths to characterize throughput scaling
 3. Verify the non-SWA path with a non-SWA model
 4. General interactive testing via `llama-cli --kv-stream <n>`
 5. Verify turbo3/turbo4 K/V now streams (section 11) and turbo2-V still correctly falls back
