@@ -2,7 +2,7 @@
 
 ## Branch
 `claude/adaptive-kv-stream-3jjugs` on `origin` (giveen/llama-cpp-turboquant)
-Current HEAD: `73e6f1310` ("context: log the top-level KV streaming gate unconditionally")
+Current HEAD: `bf9971c38` ("llama-bench: wire up --kv-stream sweep parameter")
 
 ## What was done
 
@@ -139,8 +139,43 @@ Environment: NVIDIA GeForce RTX 5090, 32 GB VRAM, CUDA compute capability 12.0.
 - Non-SWA path parity after SWA extension
 - Long-context stability at 128K+
 
+### 10. Wired `--kv-stream` into llama-bench, llama-perplexity, llama-cli — commit `bf9971c38`
+
+To unblock PPL/KLD comparison, throughput benchmarking, and general interactive
+testing with streaming active, checked whether the three remaining CLI tools
+expose `--kv-stream`:
+
+- **llama-bench**: has its own `cmd_params` sweep system (separate from
+  `common_params`, built for combinatorial parameter sweeps), so this
+  genuinely needed new code. Added `--kv-stream <n>` as a full sweep
+  parameter mirroring the existing `n_batch`/`fit_min_ctx` pattern: CLI
+  parsing (comma-range values via `parse_int_range`), `cmd_params` /
+  `cmd_params_instance` / `test` struct fields, cartesian-product
+  combination (new `for` loop + all three instance-literal sites), and a
+  `kvs` results-table column that only appears when the value is actually
+  swept away from the default (0). Built cleanly under this sandbox's
+  CPU-only (`GGML_CUDA=OFF`) configuration; smoke-tested `--help` output,
+  single-value and multi-value (`256,512,1024`) sweeps, and confirmed the
+  `kvs` column only renders when non-default.
+- **llama-perplexity** and **llama-cli**: needed **no code changes**.
+  `--kv-stream` is registered in `common/arg.cpp` under
+  `LLAMA_EXAMPLE_COMMON` with no `.set_examples()` restriction, and every
+  example inherits `LLAMA_EXAMPLE_COMMON` options (`arg.cpp:1389-1396`).
+  Both tools parse via `common_params_parse` -> `common_init_from_params`
+  -> `common_context_params_to_llama`, which already threads
+  `params.kv_stream_stage_mib` into `cparams.kv_stream_stage_mib`
+  (`common/common.cpp:1727`). `llama-cli`'s embedded server
+  (`cli-context.cpp:123`) passes the same unmodified `common_params`
+  through to `server->start(params)`. Confirmed by building both targets
+  and checking `--kv-stream N` appears in their `--help` output.
+
+All three tools now build and expose `--kv-stream N` on this sandbox's
+CPU-only build. GPU testing of the actual sweep/benchmark behavior (as
+opposed to CLI wiring) still needs real hardware.
+
 ## Next concrete step
 
-1. Run a controlled PPL comparison with and without `--kv-stream 2304` on a fixed prompt set
-2. Benchmark longer generation lengths to characterize throughput scaling
+1. Run a controlled PPL comparison with and without `--kv-stream 2304` on a fixed prompt set using `llama-perplexity`
+2. Use `llama-bench --kv-stream 0,2304` (and other stage sizes) to characterize throughput scaling across generation lengths and context sizes in one sweep
 3. Verify the non-SWA path with a non-SWA model
+4. General interactive testing via `llama-cli --kv-stream <n>`
