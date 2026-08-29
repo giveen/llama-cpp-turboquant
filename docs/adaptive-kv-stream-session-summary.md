@@ -317,9 +317,22 @@ Verified in this sandbox with a synthetic qwen3-dense model (`test-llama-archs -
 
 With this fix, the real `-b <= -c` workaround documented above is no longer necessary -
 `-np 1 --kv-stream <n>` (or `--kv-stream auto`) should work directly on its own batch/ctx
-settings. **Needs hardware verification**: a real PPL/KLD run with `-np 1 --kv-stream ...`
-and no `-b`/`-c` workaround, to confirm parity with the workaround's already-measured
-`~0.0%` PPL delta.
+settings.
+
+**Confirmed on hardware** (RTX 5090, fresh build at `2bb5ba583`, `-np 1` directly, no
+`-b`/`-c` workaround): 512 ctx baseline `PPL = 6.9576 ± 0.04503` vs `--kv-stream auto`
+`PPL = 6.9568 ± 0.04502` - `~0.0%` difference, exact parity with the earlier
+workaround-based measurement. The fix works as intended on real hardware.
+
+`llama-bench --kv-stream 2304` at 512 ctx / 128 gen / 3 reps also re-confirmed: baseline
+pp512 `3649.95-3655.61 ± ~138`, tg128 `53.91-53.93 ± ~0.25`; with streaming pp512
+`3522.98-3532.44 ± ~165-192`, tg128 `52.50-52.57 ± ~0.10-0.18` - consistently
+**~-3.5% pp, ~-2.5% tg** across repeated runs, matching section 11's earlier numbers.
+
+**Still blocked**: 64K PPL still gets killed mid-run (`exit -9`) on this hardware even
+after the `-np` fix - confirms this is a system stability/resource issue unrelated to
+the perplexity `-np` bug or to streaming itself. Server memory breakdown for this round
+did not complete before the test script was terminated - still pending.
 
 ### Status of the remaining next-step items (as of this pass)
 
@@ -398,15 +411,64 @@ Environment: NVIDIA GeForce RTX 5090, 32 GB VRAM, CUDA compute capability 12.0.
 - Non-SWA path parity after SWA extension
 - Long-context stability at 128K+
 
+### 16. `llama-bench --kv-stream auto` fixed, and the real root cause of the 64K PPL `exit -9`
+
+Went back through the two remaining "stated issues" from the latest hardware round.
+
+**`llama-bench` rejecting `--kv-stream auto`**: this was simply never wired up (documented
+as "Not done" in section 14) - `cmd_params::kv_stream_stage_mib` was a plain
+`std::vector<uint32_t>` with no way to represent "auto". Fixed by introducing a small
+`kv_stream_spec { uint32_t mib; bool auto_size; }` value type used everywhere that field
+appears (`cmd_params`, `cmd_params_instance`, `test`), with `operator<<`/`operator==` so it
+drops into the existing `join()`/comparison machinery unchanged. `--kv-stream` now parses
+comma-separated tokens where each one is either a MiB number or the literal `auto`; the
+results-table column reclassifies from `INT` to `STRING` (prints "auto" or the number) since
+a column can now hold either. Verified in this sandbox: `--kv-stream auto`,
+`--kv-stream 0,2304,auto` (mixed sweep), and the default (column hidden) all work; `-np`
+independent `test-kv-stream-*` suite still passes.
+
+**64K PPL `exit -9`**: traced this to an actual root cause rather than leaving it as
+"system instability." `tools/perplexity/perplexity.cpp:512-515`:
+```cpp
+std::vector<float> logits;
+if (num_batches > 1) {
+    logits.reserve(size_t(n_ctx) * n_vocab);
+}
+```
+`num_batches = (n_ctx + n_batch - 1) / n_batch`, so with the default `-b 2048` and
+`-c 65536`, `num_batches = 32 > 1`, and this buffer reserves `65536 * n_vocab` floats on
+the **host**. For a ~152K-token vocab (Qwen3-class), that's `65536 * 151936 * 4 bytes ~=
+39.8 GiB` of host RAM for one intermediate buffer - independent of `--kv-stream` entirely,
+and independent of GPU VRAM. This matches the observation that the *baseline* run (no
+streaming at all) is what gets killed. The comment directly above it (`// TODO: this could
+be made smaller; it's currently the worst-case size`) is pre-existing upstream code, not
+something introduced by this branch or by streaming.
+
+**Testable workaround (no code change)**: pass `-b` >= `-c` for the 64K run (e.g.
+`-b 65536 -c 65536`), which makes `num_batches == 1` and skips this allocation entirely.
+Trade-off: a single 65536-token batch is a much larger one-shot GPU compute step, which
+could hit a different (VRAM-side) limit instead - untested on this hardware.
+
+**Not fixed in this pass**: actually shrinking this buffer so large-context PPL works
+with `num_batches > 1` too would mean restructuring the perplexity computation to process
+and discard logits incrementally per sub-batch instead of buffering a whole chunk at once -
+a real, riskier change to core PPL/KLD numerics, unrelated to the KV-streaming feature
+itself and pre-existing in upstream llama.cpp. Flagging rather than attempting blind,
+per "one idea = one PR" and pausing on invasive changes - happy to take this on as its own
+follow-up if wanted, once the `-b >= -c` workaround has been tried.
+
 ## Next concrete step
 
 One idea = one PR: each numbered item below is its own separate, independently
 reviewable change - not to be bundled together into one commit/PR.
 
-1. Re-run PPL/KLD with `-np 1 --kv-stream ...` directly (no `-b <= -c` workaround needed) now that section 15's fix is in, and confirm it matches the workaround's already-measured `~0.0%` PPL delta
-2. Measure KLD with streaming active using the repaired perplexity path
-3. Benchmark longer generation lengths to characterize throughput scaling
-4. Verify the non-SWA path with a non-SWA model on real inference output (sandbox-level gate/pre-scan parity already confirmed, section 15)
-5. General interactive testing via `llama-cli --kv-stream <n>`
-6. Verify turbo2-V with `n_layer >= 8` still correctly falls back on real hardware (turbo3 already confirmed engaging, section 11; code path for turbo2-V is unchanged and could not be exercised end-to-end in the sandbox, section 15)
-7. Tune `--kv-stream auto` defaults: 10% resident, 2048-token floor, 8192 MiB ceiling — real A/B at multiple context sizes on stable hardware
+1. ~~Re-run PPL/KLD with `-np 1 --kv-stream ...` directly~~ - **done, confirmed (section 15)**: `~0.0%` PPL delta at 512 ctx, exact parity with the earlier `-b <= -c` workaround measurement
+2. ~~`llama-bench` rejecting `--kv-stream auto`~~ - **done (section 16)**: fixed and tested in sandbox
+3. Try the `-b >= -c` workaround for 64K PPL (section 16's root-cause diagnosis) on real hardware, e.g. `-b 65536 -c 65536`; if it avoids the `exit -9` but hits a GPU-side limit instead, report back before attempting the deeper fix (restructuring the PPL logits buffer to not need the full `n_ctx * n_vocab` allocation)
+4. Measure KLD with streaming active once a stable 64K (or smaller stand-in) path exists
+5. Benchmark longer generation lengths to characterize throughput scaling
+6. Verify the non-SWA path with a non-SWA model on real inference output (sandbox-level gate/pre-scan parity already confirmed, section 15)
+7. General interactive testing via `llama-cli --kv-stream <n>`
+8. Verify turbo2-V with `n_layer >= 8` still correctly falls back on real hardware (turbo3 already confirmed engaging, section 11; code path for turbo2-V is unchanged and could not be exercised end-to-end in the sandbox, section 15)
+9. Tune `--kv-stream auto` defaults: 10% resident, 2048-token floor, 8192 MiB ceiling — real A/B at multiple context sizes on stable hardware
+10. Server memory breakdown for the latest round - script was terminated before this landed, needs a re-run
