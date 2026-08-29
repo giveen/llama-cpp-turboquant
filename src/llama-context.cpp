@@ -455,7 +455,7 @@ llama_context::llama_context(
     // Note: this only validates the feature gate for now - no backend yet
     // implements the streaming pool/transfer-ring execution path, so the
     // feature stays inert (logged, not enabled) even when the config is
-    // otherwise valid. See llama-kv-stream-config.h / llama-kv-stream-plan.h.
+    // otherwise valid. See llama-kv-stream-config.h.
     uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
     bool kv_stream_enabled = false;
 

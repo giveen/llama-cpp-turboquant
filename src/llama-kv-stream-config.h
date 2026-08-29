@@ -4,10 +4,10 @@
 #include <string>
 
 // Feature gate for experimental block-granular KV cache streaming: the
-// authoritative KV cache lives in a pinned host staging area while a bounded
-// device pool holds a runtime-adjusted split of resident pages plus a small
-// async transfer ring. Streaming is opt-in (stage_bytes == 0 disables it) and
-// only valid on cache shapes the region/plan math below actually supports.
+// authoritative KV cache lives in a pinned host buffer instead of the
+// ordinary device buffer for streaming-eligible layers. Streaming is opt-in
+// (stage_bytes == 0 disables it) and only valid on cache shapes this gate
+// actually supports.
 struct llama_kv_stream_config {
     uint64_t stage_bytes         = 0;
     uint64_t minimum_stage_bytes = 0;
@@ -15,7 +15,7 @@ struct llama_kv_stream_config {
     // True when the active memory is a plain unified llama_kv_cache (or the
     // attention component of a hybrid recurrent+attention cache) rather than
     // a specialized attention cache (DSA/DSV4 MLA-style, MSA indexer, SWA
-    // dual-cache) whose region layout this planner does not yet model.
+    // dual-cache) this gate does not support.
     bool unified_kv_cache = false;
     bool context_default  = false;
     bool single_sequence  = false;
@@ -35,24 +35,3 @@ struct llama_kv_stream_config_result {
 };
 
 llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_stream_config & config);
-
-struct llama_kv_stream_pool_layout_params {
-    uint64_t pool_bytes = 0;
-    uint64_t page_bytes = 0;
-    uint32_t layer_count = 0;
-    uint32_t scratch_pages = 0;
-};
-
-struct llama_kv_stream_pool_layout {
-    bool valid = false;
-    std::string error;
-
-    uint32_t resident_pages_per_layer  = 0;
-    uint32_t resident_tokens_per_layer = 0;
-    uint64_t scratch_bytes  = 0;
-    uint64_t resident_bytes = 0;
-    uint64_t unused_bytes   = 0;
-};
-
-llama_kv_stream_pool_layout llama_kv_stream_pool_layout_make(
-    const llama_kv_stream_pool_layout_params & params);

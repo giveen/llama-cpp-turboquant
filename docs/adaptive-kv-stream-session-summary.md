@@ -574,6 +574,48 @@ already suspected (2304 MiB oversized relative to the ~910 MiB `auto` sweet spot
 at 65K ctx for this model) rather than a code bug - needs the actual error message from
 that run to confirm, since it wasn't captured in the report.
 
+### 19. Removed ~2,250 lines of dead code, and a real wasted-VRAM bug found along the way
+
+Prompted by "is there room to reduce LOC" after discussing the CUDA resident-cache/ring's
+inert status (section 18's TODO). Audited every kv-stream module for production call
+sites (not just its own test) and found three entirely unused pieces:
+
+- `llama-kv-stream-plan.{h,cpp}` (714 lines) + its test (854 lines) - zero call sites
+  outside its own test; the mention in `llama-context.cpp` was prose in a comment, not
+  an `#include`.
+- `llama-kv-stream-softmax.{h,cpp}` (103 lines) + its test (110 lines) - same story, and
+  structurally can likely never be called from its intended use even if the ring gets
+  finished, since the real merge has to happen in a `__global__` device kernel (which the
+  CUDA fixup kernels already do directly, duplicating this host-side math rather than
+  calling it).
+- `llama-kv-stream-pool_layout_make` (in `llama-kv-stream-config.{h,cpp}`) - also unused;
+  `llama-kv-cache.cpp`'s actual page_bytes computation is inline, not through this.
+- The CUDA resident-cache/transfer-ring/fixup-kernels in `kv-stream.cu` (section 18).
+
+**Bonus finding while removing the CUDA piece**: `ggml_backend_cuda_kv_stream_runtime_new`
+was unconditionally doing `cudaMalloc(&runtime->pool_data, params.pool_bytes)` - a real,
+full-size **device** allocation purely to back the unused resident cache/ring, on top of
+the separate `cudaHostAlloc` that actually backs the streamed K/V tensors. Every
+`--kv-stream N` request was reserving an extra N MiB of real GPU VRAM for a pool nothing
+ever read or wrote. Removing it should make measured VRAM usage *lower* than what's
+already been reported, not just remove dead code - needs a hardware re-run to confirm by
+how much.
+
+Kept the public plugin surface (`ggml_backend_kv_stream_runtime_new_for_device_t` and its
+CUDA implementation's scalar params) unchanged for forward compatibility with the chunked-
+streaming design in section 18's TODO - `page_bytes`/`stage_slots`/`layer_count` are still
+accepted, just unused by the current (simplified) CUDA implementation.
+
+Net: 14 files changed, 69 insertions(+), 2318 deletions(-) - about 2,250 fewer lines.
+Verified in this sandbox: `llama` rebuilds clean, `llama-bench`/`llama-perplexity`/
+`llama-cli`/`llama-server` all still link, `test-kv-stream-config` and
+`test-kv-stream-backend` (the two remaining kv-stream unit tests) pass, `test-llama-archs`
+still passes with no new failures.
+
+**Needs hardware verification**: confirm `--kv-stream` still engages identically (pool
+created, VRAM reduced, correct output) after this cleanup, and measure whether the removed
+wasted device allocation actually lowers VRAM usage further than what's already measured.
+
 ## Next concrete step
 
 One idea = one PR: each numbered item below is its own separate, independently
@@ -594,3 +636,4 @@ reviewable change - not to be bundled together into one commit/PR.
 13. Try `--kv-stream` on a non-sm_120 GPU if/when available - the code has no SM-specific gating (section 17), but this has only ever run on an RTX 5090 so far
 14. Re-run `llama-perplexity --kv-stream auto` (default `-fit on`, no workaround) on real hardware to confirm section 18's fix resolves the hard error there too, not just in this sandbox's CPU repro
 15. Capture the actual error message from `llama-bench --kv-stream 2304` failing to create context on Qwen3.8-27B (section 18) - needed to confirm it's the suspected VRAM/pool-size constraint and not a separate bug
+16. Re-run the VRAM measurement after the section 19 cleanup - confirm `--kv-stream N` still engages identically and check whether removing the wasted device-pool allocation lowers measured VRAM usage further

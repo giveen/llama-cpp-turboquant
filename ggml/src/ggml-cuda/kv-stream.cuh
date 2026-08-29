@@ -11,44 +11,32 @@
 // ggml-cuda).
 //
 // The authoritative KV cache lives in the pinned host buffer type exposed
-// here. A fixed-size device pool backs a uniform-per-layer resident-page
-// cache plus a small async transfer ring (see llama_kv_stream_pool_layout_make
-// in src/llama-kv-stream-config.h for the same pool-layout math, computed
-// host-side before this runtime is created).
-//
-// Note on scope: this is a simplified design relative to the CUDA reference
-// this was adapted from, which lets individual model layers give up resident
-// pages (in round-robin fashion) so decode can keep its full active-page
-// count even when an even per-layer split would fall short, plus precise
-// per-row dirty tracking. Here every layer always gets the same
-// resident_pages_per_layer, and a page is invalidated (not precisely
-// tracked) whenever its host tensor is written. Simpler and easier to
-// verify without a CUDA toolchain at hand; the tradeoff is streaming
-// somewhat more eagerly under a tight pool instead of borrowing pages from
-// other layers.
-//
-// The FlashAttention dispatch that actually reads/writes resident pages and
-// drives the transfer ring is a later stage - this file is self-contained
-// and unreferenced by the rest of the codebase until then. See
-// src/llama-kv-stream-{config,plan,softmax}.h for the backend-agnostic
-// planning layer this is the first execution backend for.
+// here (cudaHostAllocMapped): FlashAttention dereferences it directly via
+// CUDA's unified virtual addressing, so no explicit device-side cache or
+// copy is needed for correctness - just the buffer-type swap. See the TODO
+// at the top of kv-stream.cu for the follow-up (chunked host->device
+// streaming with an explicit prefetch ring) that would reduce the current
+// per-decode-step PCIe cost this simple approach pays, and why it isn't
+// built yet.
 
 struct ggml_backend_cuda_kv_stream_runtime;
 typedef ggml_backend_cuda_kv_stream_runtime * ggml_backend_cuda_kv_stream_runtime_t;
 
 struct ggml_backend_cuda_kv_stream_params {
     int      device      = 0;
-    size_t   pool_bytes  = 0; // total fixed-size device pool (resident pages + transfer ring)
-    size_t   page_bytes  = 0; // bytes per resident page / transfer ring slot
-    uint32_t stage_slots = 0; // transfer ring capacity, in pages
-    uint32_t layer_count = 0; // logical KV layers sharing the resident cache
+    // page_bytes/stage_slots/layer_count mirror the generic
+    // ggml_backend_kv_stream_runtime_new_for_device_t plugin signature for
+    // forward compatibility with the chunked-streaming design (see
+    // kv-stream.cu) - the current CUDA implementation doesn't use them.
+    size_t   pool_bytes  = 0;
+    size_t   page_bytes  = 0;
+    uint32_t stage_slots = 0;
+    uint32_t layer_count = 0;
 };
 
-// Allocates the pinned host buffer type and the fixed-size device pool for
-// `params.device`, carved into a uniform-per-layer resident-page cache and a
-// `params.stage_slots`-deep transfer ring. Returns nullptr on any allocation
-// or layout failure - the caller should fall back to the ordinary
-// non-streaming KV cache path.
+// Allocates the pinned host buffer type for `params.device`. Returns
+// nullptr on any allocation failure - the caller should fall back to the
+// ordinary non-streaming KV cache path.
 ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
         const ggml_backend_cuda_kv_stream_params & params);
 
@@ -67,13 +55,3 @@ void ggml_backend_cuda_kv_stream_runtime_free(ggml_backend_cuda_kv_stream_runtim
 // type for a layer when streaming is enabled.
 ggml_backend_buffer_type_t ggml_backend_cuda_kv_stream_buffer_type(
         ggml_backend_cuda_kv_stream_runtime_t runtime);
-
-size_t   ggml_backend_cuda_kv_stream_pool_bytes(ggml_backend_cuda_kv_stream_runtime_t runtime);
-uint32_t ggml_backend_cuda_kv_stream_resident_pages_per_layer(ggml_backend_cuda_kv_stream_runtime_t runtime);
-
-// Adjusts the resident/ring split by changing the ring to `stage_slots`
-// pages, following llama_kv_stream_partition_adapt's decision (see
-// src/llama-kv-stream-plan.h). Invalidates all resident pages - callers must
-// expect a reload burst right after a successful repartition.
-bool ggml_backend_cuda_kv_stream_repartition(
-        ggml_backend_cuda_kv_stream_runtime_t runtime, uint32_t stage_slots);
