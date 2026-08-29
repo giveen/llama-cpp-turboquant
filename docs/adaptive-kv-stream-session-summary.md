@@ -457,6 +457,123 @@ itself and pre-existing in upstream llama.cpp. Flagging rather than attempting b
 per "one idea = one PR" and pausing on invasive changes - happy to take this on as its own
 follow-up if wanted, once the `-b >= -c` workaround has been tried.
 
+### 17. Multi-GPU (tensor-split) streaming, DFLASH architecture extension, and SM/compute-capability audit
+
+Per the request to extend to other architectures, other SM/compute capabilities, and
+tensor-split multi-GPU setups while hardware testing continues:
+
+**Multi-GPU tensor-split streaming** (`src/llama-kv-cache.{h,cpp}`) - the previous
+implementation only ever built *one* runtime, on whichever device happened to host the
+first eligible layer; every other device's layers silently never streamed at all, which
+made the feature effectively single-GPU-only. Reworked the pre-scan to group eligible
+layers by device (`std::map<ggml_backend_dev_t, uint32_t>`) instead of tracking a single
+device, and to create an **independent runtime per device** that has any eligible layers -
+each sized with the caller's `--kv-stream` MiB value as a **per-device** budget (a 4-GPU
+tensor split with `--kv-stream 2304` reserves 2304 MiB on *each* GPU with eligible layers,
+not 2304 MiB split four ways - simpler to reason about, and VRAM is inherently a per-device
+resource). The uniform-byte-per-token safety check now applies across *all* eligible layers
+regardless of device (previously it only checked layers on the first device, since other
+devices' layers were skipped anyway). A device whose runtime creation fails just falls back
+to the ordinary buffer type for its own layers - it doesn't block streaming on the other
+devices. `llama_kv_cache::kv_stream_runtime`/`kv_stream_runtime_free_fn` (single handles)
+became `kv_stream_entries` (`std::vector<{dev, buft, runtime, free_fn}>`); the destructor
+frees all of them; the per-layer buffer-type lookup is now a linear scan over that small
+vector (construction-time only, negligible cost).
+
+**DFLASH architecture extension** (`src/llama-context.cpp`) - `LLM_ARCH_DFLASH` was
+blanket-excluded via the same architecture denylist as the genuinely special MLA/indexer
+caches (MinMax M3, GLM DSA, DeepSeek32/4). But DFLASH only uses a non-standard cache
+(`llama_kv_cache_iswa` with a custom MLA-style filter) when `hparams.dsv4_hc_mult > 0`
+(the DSV4 DSpark-stage case) - per `llama-model.cpp`'s own construction switch, with
+`dsv4_hc_mult == 0` it falls through to the exact same standard
+`llama_kv_cache`/hybrid/recurrent construction as any other architecture. Same class of
+over-conservative fix as section 13's turbo exclusion: `llama_kv_stream_arch_uses_unified_cache`
+now takes `hparams` and returns `hparams.dsv4_hc_mult == 0` for DFLASH instead of a blanket
+`false`, so non-DSpark DFLASH configs are streamable like any other architecture.
+**Could not be exercised end-to-end in this sandbox**: `test-llama-archs` unconditionally
+skips `LLM_ARCH_DFLASH` (and `EAGLE3`) itself - "needs more fixture params", same category
+as its existing Gemma4 FIXME - so this fix is verified by code review against the actual
+construction switch, not by a synthetic-model run. Audited every other `create_memory`
+switch case (MSA, DSA, DSV4, EAGLE3, and the standalone/hybrid/recurrent default path) for
+a similar mismatch between the denylist and the actual branch taken - didn't find another one.
+
+**SM / compute-capability audit** - no code change needed, but the concern didn't check
+out as a real gap: `ggml_backend_cuda_kv_stream_supported()`'s own comment already states
+the design intent ("true for any valid CUDA/HIP/MUSA device... no device feature beyond
+what every supported GPU already has"), and `ggml/src/ggml-cuda/kv-stream.cu`'s kernels
+use no compute-capability-conditional code, warp-size-dependent intrinsics, or tensor-core
+instructions of any kind - confirmed by grepping for `__shfl`/`warpSize`/`__CUDA_ARCH__`/
+`wmma` and finding nothing. `CMakeLists.txt` compiles `kv-stream.cu` for every
+`CMAKE_CUDA_ARCHITECTURES` target the same as every other `.cu` file, no special-casing.
+So SM/compute-capability breadth was already unconditional from the original port - what's
+actually missing is *hardware testing* on something other than the RTX 5090 (sm_120) used
+so far, not a code fix.
+
+Verified in this sandbox: `llama` rebuilds clean (touched `llama-kv-cache.h/.cpp` and
+`llama-context.cpp`), all four `test-kv-stream-*` tests pass, `test-llama-archs` passes
+across every architecture it covers with no new failures.
+
+**Needs hardware verification**: multi-GPU tensor-split streaming has never been exercised
+on real multi-GPU hardware - the single-GPU RTX 5090 testing so far can't exercise the new
+per-device grouping/multiple-runtime-creation path at all. DFLASH (any config) and other
+compute capabilities (anything other than sm_120) are likewise unverified beyond code
+review, for lack of that hardware in this session.
+
+### 18. Root-caused and fixed the `common_fit_params` hard error with `--kv-stream`
+
+Real hardware run reported: `llama-perplexity --kv-stream auto` aborts in
+`common_init_from_params` with `"failed to fit parameters to device memory (hard error);
+retry with -fit off"` at both 512 and 2048 ctx on Qwen3-8B, while the baseline (no
+`--kv-stream`) runs normally - and asked, reasonably, why this would even touch device
+memory at all when KV streaming's whole point is keeping the cache off-device.
+
+**Root cause, traced end to end**: `-fit` is on by default (`common/common.h`:
+`fit_params = true`), and `common_init_from_params()` calls `common_fit_params()`
+(`common/fit.cpp`) *before* the real context is built, to measure memory usage for
+candidate configurations. Its measurement helper
+(`common_get_device_memory_data_impl`) loads the model and builds a **trial** context
+with `mparams.no_alloc = true` - a dry run that measures tensor sizes without doing
+real allocation work (the existing K/V tensor buffers and the turbo rotation matrices
+already respect this flag the same way). But `llama-context.cpp`'s streaming
+validation gate (`llama_kv_stream_config_validate`) **throws a hard `std::runtime_error`
+on any failing gate**, by design, for a real, explicit `--kv-stream` request that can't
+be satisfied - and it ran unconditionally, `no_alloc` or not. During a probe, the
+CPU-backend `type_pair_supported=0` gate (or any other gate, depending on what
+candidate configuration the fit search happens to be trying) fails exactly the way it
+normally would on an unsupported backend, throws, and `common_get_device_memory_data_impl`
+treats *any* failure to construct the initial trial as fatal (`common_fit_params:
+encountered an error while trying to fit params ...` -> `COMMON_PARAMS_FIT_STATUS_ERROR`
+-> the hard-error message the user saw). Reproduced this exact failure in this sandbox
+(no GPU needed - the mechanism doesn't depend on CUDA, `no_alloc=true` triggers on any
+backend) with a synthetic model: `llama-perplexity ... --kv-stream auto` (default `-fit`
+on) hit the identical hard-error message, `-fit off` did not.
+
+**Fix** (`src/llama-context.cpp`): skip the entire streaming validation/gate block
+during a `no_alloc` probe instead of running it and throwing - equivalent to leaving
+`kv_stream_enabled = false`, exactly like the real construction's own graceful
+fallback for configurations the feature doesn't apply to. Also added the same guard to
+`src/llama-kv-cache.cpp`'s per-device runtime-creation loop (belt and suspenders: even
+if streaming were somehow still requested during a probe, it must never perform a real
+backend allocation like `cudaMalloc` there either - every candidate configuration
+fit-params tries would otherwise leak a real device allocation it never frees between
+trials). This does **not** change behavior for a real (non-probe) `--kv-stream` request,
+which still throws exactly as before when explicitly requested and genuinely
+unsatisfiable - only the fit-params dry run is affected.
+
+Verified in this sandbox: reproduced the original crash, confirmed the fix resolves it
+(`common_fit_params: successfully fit params to free device memory` instead of the hard
+error), confirmed `-fit off` and the no-`--kv-stream` baseline are both unaffected
+(byte-identical behavior to before), all four `test-kv-stream-*` tests and
+`test-llama-archs` still pass.
+
+**Separately**: the `llama-bench --kv-stream 2304` context-creation failure reported in
+the same round is **not** this bug - `llama-bench` only invokes `common_fit_params` when
+`-fitt`/`--fit-target` is explicitly passed (`do_fit` is false by default), which wasn't
+the case here. That failure is most likely the genuine VRAM/pool-size constraint the user
+already suspected (2304 MiB oversized relative to the ~910 MiB `auto` sweet spot measured
+at 65K ctx for this model) rather than a code bug - needs the actual error message from
+that run to confirm, since it wasn't captured in the report.
+
 ## Next concrete step
 
 One idea = one PR: each numbered item below is its own separate, independently
@@ -472,3 +589,8 @@ reviewable change - not to be bundled together into one commit/PR.
 8. Verify turbo2-V with `n_layer >= 8` still correctly falls back on real hardware (turbo3 already confirmed engaging, section 11; code path for turbo2-V is unchanged and could not be exercised end-to-end in the sandbox, section 15)
 9. Tune `--kv-stream auto` defaults: 10% resident, 2048-token floor, 8192 MiB ceiling — real A/B at multiple context sizes on stable hardware
 10. Server memory breakdown for the latest round - script was terminated before this landed, needs a re-run
+11. Verify multi-GPU tensor-split streaming (section 17) on real multi-GPU hardware - confirm each device with eligible layers gets its own pool, VRAM reduction is per-device, and a device where the runtime fails to create still falls back correctly without breaking the others
+12. Verify the DFLASH `dsv4_hc_mult == 0` fix (section 17) with a real DFLASH model - could not be exercised in the sandbox since `test-llama-archs` skips this architecture entirely
+13. Try `--kv-stream` on a non-sm_120 GPU if/when available - the code has no SM-specific gating (section 17), but this has only ever run on an RTX 5090 so far
+14. Re-run `llama-perplexity --kv-stream auto` (default `-fit on`, no workaround) on real hardware to confirm section 18's fix resolves the hard error there too, not just in this sandbox's CPU repro
+15. Capture the actual error message from `llama-bench --kv-stream 2304` failing to create context on Qwen3.8-27B (section 18) - needed to confirm it's the suspected VRAM/pool-size constraint and not a separate bug
