@@ -223,7 +223,7 @@ static void anchor_set_tensors(ggml_backend_t backend, const anchor_tensors & t,
     ggml_backend_tensor_set(t.v_scales,     p.v_scales.data(),  0, p.v_scales.size() * sizeof(float));
 }
 
-static int test_shared_scratch_order() {
+static int test_shared_scratch_on(ggml_backend_t backend, const char * name) {
     const int S = 33;
     const int D = 128;
     const int n_heads = 4;
@@ -259,13 +259,7 @@ static int test_shared_scratch_order() {
     ggml_tensor * readA   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, S);
     ggml_tensor * readB   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, S);
 
-    ggml_backend_ptr backend;
-    backend.ptr = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!backend.get()) {
-        fprintf(stderr, "FAIL: shared-scratch CPU backend init failed\n");
-        return 1;
-    }
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend.get());
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
 
     ggml_backend_buffer_ptr buf;
     buf.ptr = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -274,8 +268,8 @@ static int test_shared_scratch_order() {
         return 1;
     }
 
-    anchor_set_tensors(backend.get(), tA, A.packed);
-    anchor_set_tensors(backend.get(), tB, B.packed);
+    anchor_set_tensors(backend, tA, A.packed);
+    anchor_set_tensors(backend, tB, B.packed);
     std::vector<uint8_t> zeros((size_t) n_embd * S * 2, 0);
     ggml_backend_tensor_set(scratch, zeros.data(), 0, zeros.size());
     ggml_backend_tensor_set(readA,   zeros.data(), 0, zeros.size());
@@ -304,8 +298,8 @@ static int test_shared_scratch_order() {
     ggml_tensor * cpyB = ggml_cpy(ctx, opB, readB);
     ggml_build_forward_expand(gf, cpyB);
 
-    if (ggml_backend_graph_compute(backend.get(), gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "FAIL: shared-scratch graph compute failed\n");
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "FAIL: %s shared-scratch graph compute failed\n", name);
         return 1;
     }
 
@@ -327,26 +321,26 @@ static int test_shared_scratch_order() {
     float max_A = max_abs(fA.data(), A.ref_v_cm.data(), total);
     float max_B = max_abs(fB.data(), B.ref_v_cm.data(), total);
 
-    printf("shared-scratch: readA vs A mse=%.3e max=%.3e | readA vs B mse=%.3e (overwrite check)\n",
-           mse_A, max_A, mse_A_vs_B);
-    printf("shared-scratch: readB vs B mse=%.3e max=%.3e\n", mse_B, max_B);
+    printf("[%s] shared-scratch: readA vs A mse=%.3e max=%.3e | readA vs B mse=%.3e (overwrite check)\n",
+           name, mse_A, max_A, mse_A_vs_B);
+    printf("[%s] shared-scratch: readB vs B mse=%.3e max=%.3e\n", name, mse_B, max_B);
 
     int fail = 0;
     if (mse_A > 1e-2f || max_A > 1e-1f) {
-        fprintf(stderr, "FAIL: shared-scratch readA does not match layer A (mse=%.3e, max=%.3e)\n", mse_A, max_A);
+        fprintf(stderr, "[%s] FAIL: shared-scratch readA does not match layer A (mse=%.3e, max=%.3e)\n", name, mse_A, max_A);
         if (mse_A_vs_B < mse_A) {
-            fprintf(stderr, "  readA looks like layer B's data -- the chain ordering let layer B overwrite layer A before its read.\n");
+            fprintf(stderr, "[%s]   readA looks like layer B's data -- the chain ordering let layer B overwrite layer A before its read.\n", name);
         }
         print_first_divergence(fA.data(), A.ref_v_cm.data(), total, "scA", n_embd, D);
         fail = 1;
     }
     if (mse_B > 1e-2f || max_B > 1e-1f) {
-        fprintf(stderr, "FAIL: shared-scratch readB does not match layer B (mse=%.3e, max=%.3e)\n", mse_B, max_B);
+        fprintf(stderr, "[%s] FAIL: shared-scratch readB does not match layer B (mse=%.3e, max=%.3e)\n", name, mse_B, max_B);
         print_first_divergence(fB.data(), B.ref_v_cm.data(), total, "scB", n_embd, D);
         fail = 1;
     }
     if (!fail) {
-        printf("PASS: shared-scratch chain ordering correct (A read before B overwrite)\n");
+        printf("[%s] PASS: shared-scratch chain ordering correct (A read before B overwrite)\n", name);
     }
 
     ggml_free(ctx);
@@ -604,8 +598,26 @@ int main() {
 
     ggml_free(ctx);
 
-    // shared-scratch multi-layer ordering check
-    const int shared_fail = test_shared_scratch_order();
+    // ---- shared-scratch multi-layer ordering check, CPU then CUDA ----
+    int fail = pass ? 0 : 1;
 
-    return (pass ? 0 : 1) | shared_fail;
+    ggml_backend_ptr backend_cpu;
+    backend_cpu.ptr = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!backend_cpu.ptr) {
+        fprintf(stderr, "FAIL: CPU backend init failed\n");
+        return 1;
+    }
+    fail |= test_shared_scratch_on(backend_cpu.ptr, "CPU");
+
+#if defined(GGML_USE_CUDA) || defined(GGML_CUDA)
+    ggml_backend_ptr backend_gpu;
+    backend_gpu.ptr = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (backend_gpu.ptr) {
+        fail |= test_shared_scratch_on(backend_gpu.ptr, "CUDA");
+    } else {
+        fprintf(stderr, "SKIP: no GPU backend available, skipping CUDA shared-scratch check\n");
+    }
+#endif
+
+    return fail;
 }
