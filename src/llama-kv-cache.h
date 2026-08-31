@@ -396,9 +396,6 @@ private:
     mutable ggml_tensor * anchor_chain_k = nullptr;
     mutable ggml_tensor * anchor_chain_v = nullptr;
 
-    // AnchorKV: upload compressed data to GPU for fused kernel
-    void anchor_kv_upload_compressed(int32_t il);
-
     // AnchorKV: build the per-layer GPU tensors for the in-graph decompress op
     void anchor_kv_upload_layer(int32_t ikv);
 

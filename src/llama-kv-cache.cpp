@@ -1767,14 +1767,19 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
     const int n_K_eff = akv_params.compress_k ? n_K_max : 1;
     const int n_V_eff = akv_params.compress_v ? n_V_max : 1;
 
-    g.anchors      = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, n_heads, 2, k, D);
-    g.anchor_of    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_heads, S);
-    g.gamma        = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, n_heads, S);
-    g.slot_of      = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_heads, S);
-    g.k_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_K_eff, cpr);
-    g.k_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_K_eff);
-    g.v_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  n_heads, n_V_eff, cpr);
-    g.v_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_V_eff);
+    // Tensor dims must match the data packing in the loops below:
+    // data is packed C-order [n_heads, 2, k, D] with D contiguous,
+    // so ne[0]=D (contiguous), ne[1]=k, ne[2]=2, ne[3]=n_heads.
+    g.anchors      = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, D, k, 2, n_heads);
+    // anchor_of/gamma/slot_of packed as [2, n_heads, S] with S contiguous
+    g.anchor_of    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, S, n_heads, 2);
+    g.gamma        = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, S, n_heads, 2);
+    g.slot_of      = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, S, n_heads, 2);
+    // k/v res codes packed as [n_heads, n_K_eff, cpr] with cpr contiguous
+    g.k_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  cpr, n_K_eff, n_heads);
+    g.k_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_K_eff, n_heads);
+    g.v_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  cpr, n_V_eff, n_heads);
+    g.v_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_V_eff, n_heads);
 
     std::vector<ggml_bf16_t> anchors(n_heads * 2 * k * D, ggml_fp32_to_bf16(0.0f));
     std::vector<int32_t> anchor_of(2 * n_heads * S, 0);
@@ -1818,14 +1823,12 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
         }
     }
 
-    if (hparams.no_alloc) {
-        g.buf = ggml_backend_buffer_ptr(ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0)); // dummy buffer
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            t->buffer = g.buf.get();
-        }
-    } else {
-        g.buf = ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft));
-    }
+    // Always allocate the compressed data buffer eagerly. Unlike model
+    // tensors, these are small and their sizes are known at compression time.
+    // Using no_alloc + zero-size buffer (the old path) makes the
+    // ggml_backend_tensor_set calls below silently fail, so the GPU kernels
+    // read uninitialized memory.
+    g.buf = ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft));
     if (!g.buf) {
         throw std::runtime_error("failed to allocate buffer for AnchorKV compressed data");
     }
@@ -2043,13 +2046,12 @@ void llama_kv_cache::anchor_kv_compress_all() {
         if (anchor_scratch_k) anchor_scratch_k->buffer = anchor_buf.get();
         if (anchor_scratch_v) anchor_scratch_v->buffer = anchor_buf.get();
 
-        if (hparams.no_alloc) {
-            anchor_buf = ggml_backend_buffer_ptr(ggml_backend_buft_alloc_buffer(buft_first, /*size =*/ 0));
-            if (anchor_scratch_k) anchor_scratch_k->buffer = anchor_buf.get();
-            if (anchor_scratch_v) anchor_scratch_v->buffer = anchor_buf.get();
-        } else {
-            anchor_buf = ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft_first));
-        }
+        // Always allocate the scratch buffer eagerly. The scratch is the dst
+        // of the ANCHOR_DECOMPRESS op - it needs real backing memory for the
+        // kernel to write into. Using no_alloc + zero-size buffer means the
+        // graph scheduler must reallocate it during reserve, but the scratch
+        // tensors live in a separate context that may not be tracked.
+        anchor_buf = ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft_first));
         if (!anchor_buf) {
             throw std::runtime_error("failed to allocate AnchorKV scratch buffer");
         }
@@ -2081,44 +2083,6 @@ const anchor_kv_layer * llama_kv_cache::get_anchor_kv_layer(int32_t il) const {
         return nullptr;
     }
     return &anchor_kv_data[il];
-}
-
-// External declarations for AnchorKV CUDA functions
-extern "C" {
-    // Upload compressed KV data to GPU and set FA dispatch state
-    void anchor_kv_upload_compressed(
-        const float * anchor_keys, const float * anchor_values,
-        const int   * k_anchor_of, const int   * v_anchor_of,
-        const float * k_gamma,     const float * v_gamma,
-        const int   * k_slot_of,   const int   * v_slot_of,
-        const uint8_t * k_res_codes, const float * k_res_scales,
-        const uint8_t * v_res_codes, const float * v_res_scales,
-        int S, int D, int k, int n_K, int n_V
-    );
-}
-
-void llama_kv_cache::anchor_kv_upload_compressed(int32_t il) {
-    if (!anchor_kv_enabled || il < 0 || (size_t) il >= anchor_kv_data.size()) return;
-
-    const anchor_kv_layer & layer = anchor_kv_data[il];
-    if (layer.heads.empty()) return;
-
-    const anchor_kv_head & head = layer.heads[0];
-    int S = head.S;
-    int D = head.D;
-    int k = head.k;
-
-    /* Delegate to the CUDA upload function (anchor-kv-decompress.cu),
-     * which has CUDA API access and sets the shared FA state. */
-    ::anchor_kv_upload_compressed(
-        head.anchor_keys.data(), head.anchor_values.data(),
-        head.k_anchor_of.data(), head.v_anchor_of.data(),
-        head.k_gamma.data(),     head.v_gamma.data(),
-        head.k_slot_of.data(),   head.v_slot_of.data(),
-        head.k_res_codes.data(), head.k_res_scales.data(),
-        head.v_res_codes.data(), head.v_res_scales.data(),
-        S, D, k, head.n_K, head.n_V
-    );
 }
 
 ggml_tensor * llama_kv_cache::anchor_kv_build_decompress(ggml_context * ctx, int32_t il, bool is_k) const {
@@ -3686,9 +3650,9 @@ bool llama_kv_cache_context::apply() {
         // for "this is a real one-new-token decode step" in the single-stream
         // case this feature is scoped to.
         if (ub.n_tokens == 1) {
-            LLAMA_LOG_INFO("%s: compressing KV cache after prefill...\n", __func__);
+            fprintf(stderr, "[ANCHOR-KV] compressing KV cache after prefill...\n");
             kv->anchor_kv_compress_all();
-            LLAMA_LOG_INFO("%s: compression complete\n", __func__);
+            fprintf(stderr, "[ANCHOR-KV] compression complete (compressed=%d)\n", kv->get_anchor_kv_compressed() ? 1 : 0);
         }
     }
 

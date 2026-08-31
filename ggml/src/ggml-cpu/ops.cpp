@@ -11444,10 +11444,10 @@ static void ggml_compute_forward_anchor_decompress_f16(
     const float freq_base  = ggml_get_op_params_f32(dst, 2);
     const float freq_scale = ggml_get_op_params_f32(dst, 3);
 
-    const int n_heads = (int) anchors->ne[0];
-    const int k       = (int) anchors->ne[2];
-    const int D       = (int) anchors->ne[3];
-    const int S       = (int) anchor_of->ne[2];
+    const int D       = (int) anchors->ne[0];
+    const int k       = (int) anchors->ne[1];
+    const int n_heads = (int) anchors->ne[3];
+    const int S       = (int) anchor_of->ne[0];
     const int n_K     = (int) k_res_codes->ne[1];
     const int n_V     = (int) v_res_codes->ne[1];
     const int cpr     = D / 4;
@@ -11455,7 +11455,7 @@ static void ggml_compute_forward_anchor_decompress_f16(
     const int64_t kv_size = dst->ne[1];
 
     GGML_ASSERT(n_embd == (int64_t) n_heads * D);
-    GGML_ASSERT((int) anchors->ne[1] == 2);
+    GGML_ASSERT((int) anchors->ne[2] == 2);
 
     const ggml_bf16_t * anchors_data = (const ggml_bf16_t *) anchors->data;
     const int32_t * anchor_of_data  = (const int32_t *) anchor_of->data;

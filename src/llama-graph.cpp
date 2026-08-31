@@ -2847,10 +2847,18 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // AnchorKV: with the fused FA kernel, K/V are reconstructed on-the-fly
-    // inside the FA kernel, so we don't need decompress nodes in the graph.
-    // The fused FA kernel reads compressed data directly.
-    // No decompress nodes needed - skip the old decompress path.
+    // AnchorKV: decompress the compressed KV representation into the shared
+    // scratch buffer before cpy_k/cpy_v append the new token and before get_k/
+    // get_v read. The decompress op fills positions [0, S) of the scratch;
+    // cpy_k/cpy_v then write the new token at position S.
+    if (mctx_cur->get_anchor_active()) {
+        if (mctx_cur->get_anchor_active_k()) {
+            ggml_build_forward_expand(gf, mctx_cur->build_anchor_k(ctx0, il));
+        }
+        if (mctx_cur->get_anchor_active_v()) {
+            ggml_build_forward_expand(gf, mctx_cur->build_anchor_v(ctx0, il));
+        }
+    }
 
     // store to KV cache
     {
@@ -2988,6 +2996,11 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    // AnchorKV: decompress before cpy_k/get_k (MLA: V is a view of K)
+    if (mctx_cur->get_anchor_active_k()) {
+        ggml_build_forward_expand(gf, mctx_cur->build_anchor_k(ctx0, il));
+    }
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
@@ -3085,6 +3098,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx->get_mla();
+
+    // AnchorKV: decompress before cpy_k/get_k (DSA MLA: V is a view of K)
+    if (mctx_cur->get_anchor_active_k()) {
+        ggml_build_forward_expand(gf, mctx_cur->build_anchor_k(ctx0, il));
+    }
 
     // store to KV cache
     {
@@ -3184,6 +3202,16 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_iswa = inp->mctx;
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    // AnchorKV: decompress before cpy_k/cpy_v/get_k/get_v
+    if (mctx_cur->get_anchor_active()) {
+        if (mctx_cur->get_anchor_active_k()) {
+            ggml_build_forward_expand(gf, mctx_cur->build_anchor_k(ctx0, il));
+        }
+        if (mctx_cur->get_anchor_active_v()) {
+            ggml_build_forward_expand(gf, mctx_cur->build_anchor_v(ctx0, il));
+        }
+    }
 
     // optionally store to KV cache
     if (k_cur) {
@@ -3298,6 +3326,11 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    // AnchorKV: decompress before cpy_k/get_k (ISWA MLA: V is a view of K)
+    if (mctx_cur->get_anchor_active_k()) {
+        ggml_build_forward_expand(gf, mctx_cur->build_anchor_k(ctx0, il));
+    }
 
     // optionally store to KV cache
     if (k_cur) {

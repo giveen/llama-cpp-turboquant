@@ -6402,19 +6402,19 @@ struct ggml_tensor * ggml_anchor_decompress(
         float                 freq_scale) {
     GGML_ASSERT(dst->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(anchors->type == GGML_TYPE_BF16 && anchors->ne[1] == 2);
-    GGML_ASSERT(anchor_of->type == GGML_TYPE_I32 && anchor_of->ne[0] == 2);
-    GGML_ASSERT(gamma->type     == GGML_TYPE_F16 && gamma->ne[0] == 2);
-    GGML_ASSERT(slot_of->type   == GGML_TYPE_I32 && slot_of->ne[0] == 2);
+    GGML_ASSERT(anchors->type == GGML_TYPE_BF16 && anchors->ne[2] == 2);
+    GGML_ASSERT(anchor_of->type == GGML_TYPE_I32 && anchor_of->ne[2] == 2);
+    GGML_ASSERT(gamma->type     == GGML_TYPE_F16 && gamma->ne[2] == 2);
+    GGML_ASSERT(slot_of->type   == GGML_TYPE_I32 && slot_of->ne[2] == 2);
     GGML_ASSERT(k_res_codes->type  == GGML_TYPE_I8);
     GGML_ASSERT(k_res_scales->type == GGML_TYPE_F32);
     GGML_ASSERT(v_res_codes->type  == GGML_TYPE_I8);
     GGML_ASSERT(v_res_scales->type == GGML_TYPE_F32);
 
-    const int n_heads = (int) anchors->ne[0];
-    const int k       = (int) anchors->ne[2];
-    const int D       = (int) anchors->ne[3];
-    const int S       = (int) anchor_of->ne[2];
+    const int D       = (int) anchors->ne[0];
+    const int k       = (int) anchors->ne[1];
+    const int n_heads = (int) anchors->ne[3];
+    const int S       = (int) anchor_of->ne[0];
 
     GGML_ASSERT(k > 0);
     GGML_ASSERT(S > 0);
@@ -6423,13 +6423,13 @@ struct ggml_tensor * ggml_anchor_decompress(
     GGML_ASSERT(anchor_of->ne[1] == n_heads);
     GGML_ASSERT(gamma->ne[1]     == n_heads);
     GGML_ASSERT(slot_of->ne[1]   == n_heads);
-    GGML_ASSERT(anchor_of->ne[2] == gamma->ne[2] && gamma->ne[2] == slot_of->ne[2]);
-    GGML_ASSERT(k_res_codes->ne[0] == n_heads && k_res_scales->ne[0] == n_heads);
-    GGML_ASSERT(v_res_codes->ne[0] == n_heads && v_res_scales->ne[0] == n_heads);
+    GGML_ASSERT(anchor_of->ne[0] == gamma->ne[0] && gamma->ne[0] == slot_of->ne[0]);
+    GGML_ASSERT(k_res_codes->ne[2] == n_heads && k_res_scales->ne[1] == n_heads);
+    GGML_ASSERT(v_res_codes->ne[2] == n_heads && v_res_scales->ne[1] == n_heads);
     GGML_ASSERT(D % 4 == 0);
-    GGML_ASSERT(k_res_codes->ne[2] == D / 4 && v_res_codes->ne[2] == D / 4);
-    GGML_ASSERT(k_res_scales->ne[1] == k_res_codes->ne[1]);
-    GGML_ASSERT(v_res_scales->ne[1] == v_res_codes->ne[1]);
+    GGML_ASSERT(k_res_codes->ne[0] == D / 4 && v_res_codes->ne[0] == D / 4);
+    GGML_ASSERT(k_res_scales->ne[0] == k_res_codes->ne[1]);
+    GGML_ASSERT(v_res_scales->ne[0] == v_res_codes->ne[1]);
     GGML_ASSERT(dst->ne[0] == n_heads * D);
 
     // note: the result is a view of dst so the op writes in-place into the

@@ -5,7 +5,6 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
-#include "anchor-kv-fa.h"
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -787,21 +786,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-
-    // AnchorKV: if compressed data is set, use the fused kernel for decode
-    // This reads compressed KV directly, never materializing dense KV in VRAM.
-    if (anchor_kv_fa_enabled()) {
-        const ggml_tensor * Q = dst->src[0];
-        if (Q->ne[1] <= 4) {  // decode mode (single/multiple query)
-            cudaStream_t stream = ctx.stream();
-            const float * d_Q = (const float *)Q->data;
-            float * d_out = (float *)dst->data;
-            int D = Q->ne[0];
-            const anchor_kv_data_t & state = anchor_kv_fa_get_state();
-            anchor_kv_fa_decode_launch(stream, d_Q, &state, d_out, D);
-            return;
-        }
-    }
 
     // Fused turbo MMA decode gate (DEFAULT ON — see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
     // Routes turbo4-K==turbo4-V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed

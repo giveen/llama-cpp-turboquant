@@ -179,10 +179,10 @@ void ggml_cuda_anchor_decompress(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const float freq_base  = ggml_get_op_params_f32(dst, 2);
     const float freq_scale = ggml_get_op_params_f32(dst, 3);
 
-    const int n_heads = (int) anchors->ne[0];
-    const int k       = (int) anchors->ne[2];
-    const int D       = (int) anchors->ne[3];
-    const int S       = (int) anchor_of->ne[2];
+    const int D       = (int) anchors->ne[0];
+    const int k       = (int) anchors->ne[1];
+    const int n_heads = (int) anchors->ne[3];
+    const int S       = (int) anchor_of->ne[0];
     const int n_K     = (int) k_res_codes->ne[1];
     const int n_V     = (int) v_res_codes->ne[1];
     const int64_t n_embd   = dst->ne[0];
