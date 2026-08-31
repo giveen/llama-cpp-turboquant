@@ -352,6 +352,10 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 # TurboQuant WHT round-trip test (links ggml turbo codec symbols via llama)
 llama_build_and_test(test-turbo-quant.c LABEL "turbo")
 
+# AnchorKV: real GGML_OP_ANCHOR_DECOMPRESS graph vs CPU reference
+llama_build_and_test(test-anchor-op-graph.cpp LABEL "turbo")
+target_include_directories(test-anchor-op-graph PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
     llama_build_and_test(test-gguf.cpp)
