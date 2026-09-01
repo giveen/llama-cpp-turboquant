@@ -704,6 +704,26 @@ void llama_kv_cache::anchor_kv_parse_env() {
             LLAMA_LOG_WARN("%s: AnchorKV ENABLED, theta=%.3f (%.1fx compression) K=%d V=%d\n",
                            __func__, akv_params.theta, 1.0f / akv_params.theta,
                            akv_params.compress_k ? 1 : 0, akv_params.compress_v ? 1 : 0);
+
+            // Diagnostic: ANCHOR_KV_DENSE_TEST=1 bypasses the shared-scratch
+            // buffer and the GGML_OP_ANCHOR_DECOMPRESS graph op entirely.
+            // Compression still runs and produces the same anchor_kv_data,
+            // but the lossy reconstruction is written back into the plain
+            // dense per-layer K/V tensors ONCE (see the writeback loop in
+            // anchor_kv_compress_all), and decode proceeds through the
+            // ordinary dense-cache get_k/get_v/cpy_k/cpy_v path with no
+            // custom op involved at all - the same style TheTom's
+            // TurboAnchorKV harness uses. This isolates whether a bug lives
+            // in the compression/reconstruction math itself (still broken
+            // here => bug is upstream of both runtime paths) or in the
+            // shared-scratch/graph-integration layer (coherent here but not
+            // in the normal graph-op path => bug is in that layer).
+            const char * dense_test_env = getenv("ANCHOR_KV_DENSE_TEST");
+            anchor_kv_dense_test = dense_test_env && atoi(dense_test_env) != 0;
+            if (anchor_kv_dense_test) {
+                LLAMA_LOG_WARN("%s: ANCHOR_KV_DENSE_TEST=1 - bypassing shared scratch/graph op, "
+                        "writing decompressed reconstruction directly into the dense cache\n", __func__);
+            }
         }
     }
 }
@@ -1648,6 +1668,11 @@ static void anchor_kv_relayout(
 // rotation applied at position +t - this also means YaRN (if active) is
 // handled correctly for free, since YaRN's ramp/attn-factor depend on
 // frequency index, not the sign of the position.
+//
+// forward=true runs the same op with POSITIVE positions instead - i.e. the
+// plain forward rotation, used by the ANCHOR_KV_DENSE_TEST diagnostic path to
+// re-rotate a decompressed (pre-RoPE) reconstruction back to real cache-key
+// space without duplicating this math a second time.
 static void anchor_kv_invert_rope_k(
         std::vector<float> & keys,
         uint32_t S_used,
@@ -1664,7 +1689,8 @@ static void anchor_kv_invert_rope_k(
         float    attn_factor,
         float    beta_fast,
         float    beta_slow,
-        ggml_tensor * rope_factors) {
+        ggml_tensor * rope_factors,
+        bool     forward = false) {
     if (n_rot == 0) {
         return;
     }
@@ -1700,7 +1726,7 @@ static void anchor_kv_invert_rope_k(
             float * dst = k_rot_data + ((size_t) t * n_head_kv_k + h) * n_rot;
             memcpy(dst, src, n_rot * sizeof(float));
         }
-        pos_data[t] = -(int32_t) t;
+        pos_data[t] = forward ? (int32_t) t : -(int32_t) t;
     }
 
     ggml_tensor * k_inv = ggml_rope_ext(rctx, k_rot, pos, rope_factors,
@@ -1845,6 +1871,52 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
     anchor_kv_gpu_data[ikv] = std::move(g);
 }
 
+void llama_kv_cache::anchor_kv_apply_rope_to_dense_k(
+        std::vector<float> & keys, uint32_t S_used, int n_embd_k_gqa,
+        uint32_t head_k, int n_head_kv_k, uint32_t layer_il, bool forward) {
+    if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE) {
+        return;
+    }
+
+    const uint32_t n_rot_layer = hparams.n_rot(layer_il);
+    const uint32_t n_embd_nope = hparams.n_lora_kv > 0 ? head_k - n_rot_layer : 0;
+
+    // MROPE/IMROPE workaround: same as build_rope_shift (see comment there) -
+    // a normal NEOX rotation is correct here too, we just need the ordering.
+    const int rope_type_eff =
+        (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE)
+            ? LLAMA_ROPE_TYPE_NEOX
+            : hparams.rope_type;
+
+    if (!anchor_cparams) {
+        LLAMA_LOG_WARN("%s: layer %u: AnchorKV cparams not set (anchor_kv_set_cparams was "
+                "never called) - cannot %s RoPE; reconstruction will be incoherent\n",
+                __func__, layer_il, forward ? "re-apply" : "invert");
+        return;
+    }
+
+    const llama_cparams & cp = *anchor_cparams;
+
+    const float freq_base_l  = model.get_rope_freq_base (cp, layer_il);
+    const float freq_scale_l = model.get_rope_freq_scale(cp, layer_il);
+    ggml_tensor * rope_factors = model.get_rope_factors(cp, layer_il);
+
+    if (cp.yarn_ext_factor != 0.0f) {
+        LLAMA_LOG_WARN("%s: layer %u: YaRN is active (ext_factor=%.3f) - this reuses the real "
+                "ggml_rope_ext op so YaRN is handled correctly here, but the in-graph "
+                "reconstruction kernel (GGML_OP_ANCHOR_DECOMPRESS) only implements the plain "
+                "linear-scale rotation, so it will not match under YaRN-extended contexts "
+                "(out of scope for this fix)\n",
+                __func__, layer_il, cp.yarn_ext_factor);
+    }
+
+    anchor_kv_invert_rope_k(keys, S_used, n_embd_k_gqa, head_k, n_head_kv_k,
+            n_rot_layer, n_embd_nope, rope_type_eff, (int) cp.n_ctx_orig_yarn,
+            freq_base_l, freq_scale_l,
+            cp.yarn_ext_factor, cp.yarn_attn_factor, cp.yarn_beta_fast, cp.yarn_beta_slow,
+            rope_factors, forward);
+}
+
 void llama_kv_cache::anchor_kv_compress_all() {
     if (!anchor_kv_enabled) return;
 
@@ -1954,46 +2026,10 @@ void llama_kv_cache::anchor_kv_compress_all() {
 
         // AnchorKV: undo RoPE on K before compression - see anchor_kv_invert_rope_k
         // doc above for why. V is never rotated, so `values` is untouched.
-        if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
-            const uint32_t n_rot_layer = hparams.n_rot(layer.il);
-            const uint32_t n_embd_nope = hparams.n_lora_kv > 0 ? head_k - n_rot_layer : 0;
-
-            // MROPE/IMROPE workaround: same as build_rope_shift (see comment there) -
-            // a normal NEOX rotation is correct here too, we just need the ordering.
-            const int rope_type_eff =
-                (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE)
-                    ? LLAMA_ROPE_TYPE_NEOX
-                    : hparams.rope_type;
-
-            if (!anchor_cparams) {
-                LLAMA_LOG_WARN("%s: layer %d: AnchorKV cparams not set (anchor_kv_set_cparams was "
-                        "never called) - cannot invert RoPE before compression; compressing "
-                        "POST-RoPE keys, which is known to produce incoherent reconstructions\n",
-                        __func__, il);
-            } else {
-                const llama_cparams & cp = *anchor_cparams;
-
-                const float freq_base_l  = model.get_rope_freq_base (cp, layer.il);
-                const float freq_scale_l = model.get_rope_freq_scale(cp, layer.il);
-                ggml_tensor * rope_factors = model.get_rope_factors(cp, layer.il);
-
-                if (cp.yarn_ext_factor != 0.0f) {
-                    LLAMA_LOG_WARN("%s: layer %d: YaRN is active (ext_factor=%.3f) - the RoPE "
-                            "inversion below reuses the real ggml_rope_ext op so YaRN is handled "
-                            "correctly here, but the in-graph reconstruction kernel "
-                            "(GGML_OP_ANCHOR_DECOMPRESS) only implements the plain linear-scale "
-                            "rotation, so reconstructed keys will not exactly match under "
-                            "YaRN-extended contexts (out of scope for this fix)\n",
-                            __func__, il, cp.yarn_ext_factor);
-                }
-
-                anchor_kv_invert_rope_k(keys, S_used, n_embd_k_gqa, head_k, n_head_kv_k,
-                        n_rot_layer, n_embd_nope, rope_type_eff, (int) cp.n_ctx_orig_yarn,
-                        freq_base_l, freq_scale_l,
-                        cp.yarn_ext_factor, cp.yarn_attn_factor, cp.yarn_beta_fast, cp.yarn_beta_slow,
-                        rope_factors);
-            }
-        }
+        // (shared with the ANCHOR_KV_DENSE_TEST forward re-rotation below, see
+        // anchor_kv_apply_rope_to_dense_k)
+        anchor_kv_apply_rope_to_dense_k(keys, S_used, n_embd_k_gqa, head_k, n_head_kv_k,
+                layer.il, /* forward = */ false);
 
         // re-layout cache columns -> compressor head-major order
         std::vector<float> keys_hl((size_t) n_head_kv_k * S_used * head_k);
@@ -2019,6 +2055,82 @@ void llama_kv_cache::anchor_kv_compress_all() {
                 __func__, il, n_head_kv_k,
                 anchor_kv_data[il].heads[0].k,
                 total_K_res, total_V_res);
+    }
+
+    if (anchor_kv_dense_test) {
+        // ANCHOR_KV_DENSE_TEST: skip the shared scratch + graph op entirely -
+        // decompress once now and write the lossy reconstruction directly into
+        // the existing dense per-layer K/V tensors. Decode then proceeds through
+        // the completely ordinary dense-cache get_k/get_v/cpy_k/cpy_v path (see
+        // get_anchor_kv_compressed_k/v), with no custom op involved at all. This
+        // isolates compression/reconstruction math bugs from graph-integration
+        // bugs - see the comment where anchor_kv_dense_test is set.
+        for (int32_t il = 0; il < n_layer; il++) {
+            const kv_layer & layer = layers[il];
+
+            const uint32_t head_k = hparams.n_embd_head_k(layer.il);
+            const uint32_t head_v = hparams.n_embd_head_v(layer.il);
+            const int32_t n_head_kv_k = n_embd_k_gqa / (int32_t) head_k;
+
+            const anchor_kv_layer & clayer = anchor_kv_data[il];
+
+            std::vector<float> dense_k, dense_v;
+            if (akv_params.compress_k) dense_k.assign((size_t) S_used * n_embd_k_gqa, 0.0f);
+            if (akv_params.compress_v) dense_v.assign((size_t) S_used * n_embd_v_gqa, 0.0f);
+
+            std::vector<float> recon_k((size_t) S_used * head_k);
+            std::vector<float> recon_v((size_t) S_used * head_v);
+            for (int h = 0; h < n_head_kv_k; h++) {
+                const anchor_kv_head & head = clayer.heads[h];
+                anchor_kv_decompress_head(head,
+                        akv_params.compress_k ? recon_k.data() : nullptr,
+                        akv_params.compress_v ? recon_v.data() : nullptr);
+
+                if (akv_params.compress_k) {
+                    for (uint32_t t = 0; t < S_used; t++) {
+                        memcpy(&dense_k[(size_t) t * n_embd_k_gqa + (size_t) h * head_k],
+                               &recon_k[(size_t) t * head_k], head_k * sizeof(float));
+                    }
+                }
+                if (akv_params.compress_v) {
+                    for (uint32_t t = 0; t < S_used; t++) {
+                        memcpy(&dense_v[(size_t) t * n_embd_v_gqa + (size_t) h * head_v],
+                               &recon_v[(size_t) t * head_v], head_v * sizeof(float));
+                    }
+                }
+            }
+
+            // reconstruction above is in pre-RoPE space (matches how compression
+            // read it) - rotate K back into real post-RoPE cache-key space before
+            // writing it back. V is never rotated.
+            if (akv_params.compress_k) {
+                anchor_kv_apply_rope_to_dense_k(dense_k, S_used, n_embd_k_gqa, head_k,
+                        n_head_kv_k, layer.il, /* forward = */ true);
+            }
+
+            if (akv_params.compress_k) {
+                if (layer.k->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(layer.k, dense_k.data(), 0, dense_k.size() * sizeof(float));
+                } else {
+                    std::vector<ggml_fp16_t> dense_k_fp16(dense_k.size());
+                    for (size_t i = 0; i < dense_k.size(); i++) dense_k_fp16[i] = ggml_fp32_to_fp16(dense_k[i]);
+                    ggml_backend_tensor_set(layer.k, dense_k_fp16.data(), 0, dense_k_fp16.size() * sizeof(ggml_fp16_t));
+                }
+            }
+            if (akv_params.compress_v) {
+                if (layer.v->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(layer.v, dense_v.data(), 0, dense_v.size() * sizeof(float));
+                } else {
+                    std::vector<ggml_fp16_t> dense_v_fp16(dense_v.size());
+                    for (size_t i = 0; i < dense_v.size(); i++) dense_v_fp16[i] = ggml_fp32_to_fp16(dense_v[i]);
+                    ggml_backend_tensor_set(layer.v, dense_v_fp16.data(), 0, dense_v_fp16.size() * sizeof(ggml_fp16_t));
+                }
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_DENSE_TEST=1 - wrote decompressed reconstruction into dense "
+                "cache for %d layers, skipping shared scratch/graph-op setup\n", __func__, n_layer);
+        return;
     }
 
 // allocate the shared dense scratch buffers (one layer's worth of K and V)

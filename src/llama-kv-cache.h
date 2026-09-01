@@ -184,8 +184,14 @@ public:
     void anchor_kv_compress_all();
     bool get_anchor_kv_enabled() const { return anchor_kv_enabled; }
     bool get_anchor_kv_compressed() const { return !anchor_kv_data.empty(); }
-    bool get_anchor_kv_compressed_k() const { return !anchor_kv_data.empty() && akv_params.compress_k; }
-    bool get_anchor_kv_compressed_v() const { return !anchor_kv_data.empty() && akv_params.compress_v; }
+    // ANCHOR_KV_DENSE_TEST diagnostic: compression still happened (anchor_kv_data
+    // is populated, so these two stay true - re-trigger guards / state I/O /
+    // shift-blocking are unaffected), but decode must NOT route through the
+    // shared scratch buffer or the GGML_OP_ANCHOR_DECOMPRESS graph op - the
+    // reconstruction was already written back into the dense tensors once.
+    // See anchor_kv_parse_env / anchor_kv_compress_all for where this is set.
+    bool get_anchor_kv_compressed_k() const { return !anchor_kv_data.empty() && akv_params.compress_k && !anchor_kv_dense_test; }
+    bool get_anchor_kv_compressed_v() const { return !anchor_kv_data.empty() && akv_params.compress_v && !anchor_kv_dense_test; }
     const anchor_kv_layer * get_anchor_kv_layer(int32_t il) const;
 
     // AnchorKV: build the in-graph decompress node for one layer. The op writes
@@ -358,6 +364,9 @@ private:
 
     // AnchorKV: per-layer compressed representation (populated after prefill)
     bool anchor_kv_enabled = false;
+    // ANCHOR_KV_DENSE_TEST diagnostic flag - see get_anchor_kv_compressed_k/v
+    // and anchor_kv_compress_all for what this changes.
+    bool anchor_kv_dense_test = false;
     struct anchor_kv_params akv_params;
     std::vector<anchor_kv_layer> anchor_kv_data;  // one per cache layer
 
@@ -401,6 +410,15 @@ private:
 
     // AnchorKV: free the dense per-layer KV buffers after compression
     void anchor_kv_free_dense();
+
+    // AnchorKV: fetch this layer's RoPE params (freq_base/scale, n_rot, YaRN,
+    // rope_factors) and rotate `keys` (dense [S_used, n_embd_k_gqa] float, in
+    // place) - forward=false inverts (pre-compression), forward=true re-applies
+    // (ANCHOR_KV_DENSE_TEST reconstruction writeback). Single source of truth
+    // for both directions so they can't drift apart - see anchor_kv_invert_rope_k.
+    void anchor_kv_apply_rope_to_dense_k(
+            std::vector<float> & keys, uint32_t S_used, int n_embd_k_gqa,
+            uint32_t head_k, int n_head_kv_k, uint32_t layer_il, bool forward);
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
