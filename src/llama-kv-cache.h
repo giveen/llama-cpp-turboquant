@@ -430,6 +430,19 @@ private:
     // AnchorKV: free the dense per-layer KV buffers after compression
     void anchor_kv_free_dense();
 
+    // AnchorKV diagnostic (ANCHOR_KV_GRAPH_DIFF=<layer> env var): runs the real
+    // GGML_OP_ANCHOR_DECOMPRESS kernel standalone for one layer, on a throwaway
+    // destination tensor, and diffs its output value-by-value against the
+    // independent float32 CPU reference (anchor_kv_decompress_head + forward
+    // RoPE - the same math ANCHOR_KV_DENSE_TEST writes into the dense cache).
+    // Since the compressed representation and the shared-scratch decompress
+    // output never change across decode steps for positions [0, S), this is
+    // equivalent to diffing at the first decode step without needing to hook
+    // into live graph execution. CPU-backend only (requires -ngl 0) - see
+    // AnchorKV-status memory for why the graph-integration layer, not the
+    // compression math, is the current suspect.
+    void anchor_kv_debug_graph_diff(int32_t il);
+
     // AnchorKV: fetch this layer's RoPE params (freq_base/scale, n_rot, YaRN,
     // rope_factors) and rotate `keys` (dense [S_used, n_embd_k_gqa] float, in
     // place) - forward=false inverts (pre-compression), forward=true re-applies

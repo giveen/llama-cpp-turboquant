@@ -2184,6 +2184,21 @@ void llama_kv_cache::anchor_kv_compress_all() {
         anchor_kv_upload_layer(ikv);
     }
 
+    // ANCHOR_KV_GRAPH_DIFF=<layer>: diff the real graph-op reconstruction
+    // against the independent float32 reference for one layer, before the
+    // dense buffers it's compared against conceptually (not physically - the
+    // reference is recomputed from anchor_kv_data, not read back from dense)
+    // are freed below. See anchor_kv_debug_graph_diff for what this checks.
+    if (const char * diff_env = getenv("ANCHOR_KV_GRAPH_DIFF")) {
+        const int32_t diff_layer = atoi(diff_env);
+        if (diff_layer >= 0 && diff_layer < n_layer) {
+            anchor_kv_debug_graph_diff(diff_layer);
+        } else {
+            LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF=%s out of range [0, %d) - ignoring\n",
+                    __func__, diff_env, n_layer);
+        }
+    }
+
     // the dense per-layer KV buffers are no longer referenced by decode graphs
     anchor_kv_free_dense();
 
@@ -2239,6 +2254,135 @@ ggml_tensor * llama_kv_cache::anchor_kv_build_decompress(ggml_context * ctx, int
     chain = result;
 
     return result;
+}
+
+void llama_kv_cache::anchor_kv_debug_graph_diff(int32_t il) {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    const anchor_kv_gpu   & g      = anchor_kv_gpu_data[ikv];
+    const anchor_kv_layer & clayer = anchor_kv_data[ikv];
+
+    if (!ggml_backend_buft_is_host(ggml_backend_buffer_get_type(g.anchors->buffer))) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF requires a CPU backend (-ngl 0) - skipping layer %d\n",
+                __func__, il);
+        return;
+    }
+
+    const int      n_heads = clayer.n_heads;
+    const int      D       = (int) g.anchors->ne[0];
+    const uint32_t S       = (uint32_t) g.anchor_of->ne[0];
+
+    LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF: layer=%d n_heads=%d D=%d S=%u - diffing the graph op against "
+            "the independent float32 CPU reference\n", __func__, il, n_heads, D, S);
+
+    // Independent float32 reference: exactly the ANCHOR_KV_DENSE_TEST math
+    // (anchor_kv_decompress_head + forward RoPE), computed straight from the
+    // host-side anchor_kv_data - never touches the bf16/fp16 GPU tensors that
+    // anchor_kv_upload_layer packed. Any divergence beyond fp16 rounding
+    // localizes the bug to the packing/graph-op layer rather than the math.
+    std::vector<float> ref_k, ref_v;
+    if (akv_params.compress_k) ref_k.assign((size_t) S * n_heads * D, 0.0f);
+    if (akv_params.compress_v) ref_v.assign((size_t) S * n_heads * D, 0.0f);
+
+    std::vector<float> recon_k(S * D), recon_v(S * D);
+    for (int h = 0; h < n_heads; h++) {
+        anchor_kv_decompress_head(clayer.heads[h],
+                akv_params.compress_k ? recon_k.data() : nullptr,
+                akv_params.compress_v ? recon_v.data() : nullptr);
+
+        if (akv_params.compress_k) {
+            for (uint32_t t = 0; t < S; t++) {
+                memcpy(&ref_k[(size_t) t * n_heads * D + (size_t) h * D], &recon_k[(size_t) t * D], D * sizeof(float));
+            }
+        }
+        if (akv_params.compress_v) {
+            for (uint32_t t = 0; t < S; t++) {
+                memcpy(&ref_v[(size_t) t * n_heads * D + (size_t) h * D], &recon_v[(size_t) t * D], D * sizeof(float));
+            }
+        }
+    }
+    if (akv_params.compress_k) {
+        anchor_kv_apply_rope_to_dense_k(ref_k, S, n_heads * D, (uint32_t) D, n_heads, il, /* forward = */ true);
+    }
+
+    const int n_rot = (int) hparams.n_rot(il);
+    float freq_base  = hparams.rope_freq_base_train;
+    float freq_scale = hparams.rope_freq_scale_train;
+    if (anchor_cparams) {
+        freq_base  = model.get_rope_freq_base (*anchor_cparams, il);
+        freq_scale = model.get_rope_freq_scale(*anchor_cparams, il);
+    }
+
+    // Run the REAL GGML_OP_ANCHOR_DECOMPRESS kernel standalone: same op, same
+    // uploaded tensors and op_params the real decode graph would use for this
+    // layer, but writing into a throwaway destination on a private CPU
+    // backend instance instead of the shared scratch buffer - the real decode
+    // graph and its chain-ordering state are completely untouched by this.
+    auto diff_side = [&](bool is_k, const char * name, const std::vector<float> & ref) {
+        if (ref.empty()) {
+            return;
+        }
+
+        ggml_init_params iparams = {
+            // dst (leaf) + the view tensor ggml_anchor_decompress creates over it
+            /* .mem_size   = */ 2 * ggml_tensor_overhead() + ggml_graph_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context * ctx = ggml_init(iparams);
+        if (!ctx) {
+            LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: failed to create diagnostic context\n", __func__);
+            return;
+        }
+
+        ggml_tensor * dst  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, (int64_t) n_heads * D, S);
+        ggml_tensor * node = ggml_anchor_decompress(ctx, dst,
+                g.anchors, g.anchor_of, g.gamma, g.slot_of,
+                g.k_res_codes, g.k_res_scales, g.v_res_codes, g.v_res_scales,
+                is_k, /* prev_dep = */ nullptr, n_rot, freq_base, freq_scale);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: failed to allocate diagnostic buffer\n", __func__);
+            ggml_free(ctx);
+            return;
+        }
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, node);
+
+        ggml_backend_t backend = ggml_backend_cpu_init();
+        ggml_backend_graph_compute(backend, gf);
+
+        std::vector<ggml_fp16_t> out(ref.size());
+        ggml_backend_tensor_get(node, out.data(), 0, out.size() * sizeof(ggml_fp16_t));
+
+        ggml_backend_free(backend);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+
+        double max_abs = 0.0, sum_abs = 0.0;
+        size_t max_at  = 0;
+        for (size_t i = 0; i < out.size(); i++) {
+            const float  gv = ggml_fp16_to_fp32(out[i]);
+            const double d  = std::fabs((double) gv - (double) ref[i]);
+            sum_abs += d;
+            if (d > max_abs) {
+                max_abs = d;
+                max_at  = i;
+            }
+        }
+
+        const size_t stride = (size_t) n_heads * D;
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF layer=%d side=%s: mean_abs_diff=%.6g max_abs_diff=%.6g "
+                "at t=%zu head=%zu dim=%zu (graph=%.6g ref=%.6g)\n",
+                __func__, il, name, sum_abs / out.size(), max_abs,
+                max_at / stride, (max_at % stride) / D, (max_at % stride) % D,
+                (double) ggml_fp16_to_fp32(out[max_at]), (double) ref[max_at]);
+    };
+
+    diff_side(true,  "K", ref_k);
+    diff_side(false, "V", ref_v);
 }
 
 void llama_kv_cache::anchor_kv_free_dense() {
