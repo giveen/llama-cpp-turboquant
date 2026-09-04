@@ -2409,6 +2409,11 @@ void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, std::vecto
     anchor_kv_diff_done_k = anchor_kv_diff_ref_k.empty();
     anchor_kv_diff_done_v = anchor_kv_diff_ref_v.empty();
 
+    anchor_kv_diff_name_get_k = "anchor_get_l" + std::to_string(il) + "_k";
+    anchor_kv_diff_name_get_v = "anchor_get_l" + std::to_string(il) + "_v";
+    anchor_kv_diff_done_get_k = anchor_kv_diff_ref_k.empty();
+    anchor_kv_diff_done_get_v = anchor_kv_diff_ref_v.empty();
+
     // anchor_cparams points at the live llama_context::cparams (see
     // anchor_kv_set_cparams) - mutating cb_eval here takes effect on the very
     // next graph rebuild, which process_ubatch() performs immediately after
@@ -2462,7 +2467,53 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
         done = true;
     }
 
-    if (self->anchor_kv_diff_done_k && self->anchor_kv_diff_done_v) {
+    // Post-append attention-read check: get_k()/get_v()'s view, captured
+    // AFTER cpy_k()/cpy_v() has written the newly decoded token past S. The
+    // first S rows should still match the exact same reference the raw
+    // decompress output already matched - if they don't, the append
+    // corrupted the compressed range. The new token's own row has no
+    // independent reference (it's whatever the model just generated), so
+    // it's logged for a sanity look rather than diffed.
+    for (int side = 0; side < 2; side++) {
+        const bool           is_k = side == 0;
+        std::string        & name = is_k ? self->anchor_kv_diff_name_get_k : self->anchor_kv_diff_name_get_v;
+        std::vector<float>  & ref = is_k ? self->anchor_kv_diff_ref_k      : self->anchor_kv_diff_ref_v;
+        bool                & done = is_k ? self->anchor_kv_diff_done_get_k : self->anchor_kv_diff_done_get_v;
+
+        if (done || ref.empty() || name != t->name) {
+            continue;
+        }
+
+        const int64_t n_kv   = t->ne[2];
+        const int64_t stride = t->ne[0] * t->ne[1]; // n_heads * D
+        const int64_t S      = (int64_t) ref.size() / stride;
+
+        std::vector<ggml_fp16_t> out((size_t) n_kv * stride);
+        ggml_backend_tensor_get(t, out.data(), 0, out.size() * sizeof(ggml_fp16_t));
+
+        double max_abs = 0.0, sum_abs = 0.0;
+        for (size_t i = 0; i < ref.size(); i++) {
+            const float  gv = ggml_fp16_to_fp32(out[i]);
+            const double d  = std::fabs((double) gv - (double) ref[i]);
+            sum_abs += d;
+            max_abs = std::max(max_abs, d);
+        }
+
+        std::string new_row;
+        for (int64_t d = 0; d < std::min<int64_t>(stride, 8) && S < n_kv; d++) {
+            new_row += (d ? ", " : "") + std::to_string(ggml_fp16_to_fp32(out[(size_t) S * stride + d]));
+        }
+
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF LIVE %s (post-append, n_kv=%lld S=%lld): "
+                "existing-range mean_abs_diff=%.6g max_abs_diff=%.6g; new token row[0:8)=[%s]\n",
+                __func__, t->name, (long long) n_kv, (long long) S,
+                sum_abs / ref.size(), max_abs, new_row.c_str());
+
+        done = true;
+    }
+
+    if (self->anchor_kv_diff_done_k     && self->anchor_kv_diff_done_v &&
+        self->anchor_kv_diff_done_get_k && self->anchor_kv_diff_done_get_v) {
         llama_cparams * mutable_cparams = const_cast<llama_cparams *>(self->anchor_cparams);
         mutable_cparams->cb_eval           = nullptr;
         mutable_cparams->cb_eval_user_data = nullptr;
@@ -2582,6 +2633,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 
     if (get_anchor_kv_compressed_k()) {
+        // named so ANCHOR_KV_GRAPH_DIFF's live capture can identify this
+        // layer's post-append attention-read view during real graph execution
+        ggml_set_name(result, ("anchor_get_l" + std::to_string(il) + "_k").c_str());
+
         // this read becomes the new tail of the chain so a later layer's
         // decompress (which threads in the chain as its prev_dep) is forced to
         // wait for this read to be scheduled first
@@ -2632,7 +2687,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     }
 
     if (get_anchor_kv_compressed_v()) {
-        // see get_k: makes this read the new tail of the V chain
+        // see get_k: named for live capture, makes this read the new tail of the V chain
+        ggml_set_name(result, ("anchor_get_l" + std::to_string(il) + "_v").c_str());
         anchor_chain_v = result;
     }
 

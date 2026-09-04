@@ -463,6 +463,16 @@ private:
     bool               anchor_kv_diff_done_k = false;
     bool               anchor_kv_diff_done_v = false;
 
+    // Same capture, but targeting get_k()/get_v()'s attention-read view AFTER
+    // cpy_k()/cpy_v() has appended the newly decoded token past S - checks
+    // that the append doesn't corrupt the already-verified [0, S) range, and
+    // logs the new token's own row for a sanity look (no independent
+    // reference exists for it, unlike the compressed range).
+    std::string        anchor_kv_diff_name_get_k;
+    std::string        anchor_kv_diff_name_get_v;
+    bool               anchor_kv_diff_done_get_k = false;
+    bool               anchor_kv_diff_done_get_v = false;
+
     // AnchorKV: fetch this layer's RoPE params (freq_base/scale, n_rot, YaRN,
     // rope_factors) and rotate `keys` (dense [S_used, n_embd_k_gqa] float, in
     // place) - forward=false inverts (pre-compression), forward=true re-applies
