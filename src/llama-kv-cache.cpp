@@ -2251,6 +2251,10 @@ ggml_tensor * llama_kv_cache::anchor_kv_build_decompress(ggml_context * ctx, int
         is_k, /* prev_dep = */ chain,
         n_rot, freq_base, freq_scale);
 
+    // named so ANCHOR_KV_GRAPH_DIFF's live capture (anchor_kv_debug_eval_cb)
+    // can identify this layer's node during real graph execution
+    ggml_set_name(result, ("anchor_decompress_l" + std::to_string(il) + (is_k ? "_k" : "_v")).c_str());
+
     chain = result;
 
     return result;
@@ -2383,6 +2387,88 @@ void llama_kv_cache::anchor_kv_debug_graph_diff(int32_t il) {
 
     diff_side(true,  "K", ref_k);
     diff_side(false, "V", ref_v);
+
+    anchor_kv_debug_install_live_capture(il, ref_k, ref_v);
+}
+
+void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, std::vector<float> ref_k, std::vector<float> ref_v) {
+    if (!anchor_cparams) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF live capture requires cparams to be set - skipping\n", __func__);
+        return;
+    }
+    if (anchor_cparams->cb_eval) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: a cb_eval is already installed - skipping live capture "
+                "to avoid clobbering it\n", __func__);
+        return;
+    }
+
+    anchor_kv_diff_name_k = "anchor_decompress_l" + std::to_string(il) + "_k";
+    anchor_kv_diff_name_v = "anchor_decompress_l" + std::to_string(il) + "_v";
+    anchor_kv_diff_ref_k  = std::move(ref_k);
+    anchor_kv_diff_ref_v  = std::move(ref_v);
+    anchor_kv_diff_done_k = anchor_kv_diff_ref_k.empty();
+    anchor_kv_diff_done_v = anchor_kv_diff_ref_v.empty();
+
+    // anchor_cparams points at the live llama_context::cparams (see
+    // anchor_kv_set_cparams) - mutating cb_eval here takes effect on the very
+    // next graph rebuild, which process_ubatch() performs immediately after
+    // this function returns (mctx->apply() runs before the graph is built -
+    // see llama_context::process_ubatch), i.e. the real first decode step.
+    llama_cparams * mutable_cparams = const_cast<llama_cparams *>(anchor_cparams);
+    mutable_cparams->cb_eval           = &llama_kv_cache::anchor_kv_debug_eval_cb;
+    mutable_cparams->cb_eval_user_data = this;
+
+    LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF: installed live capture for layer %d ('%s'/'%s') - "
+            "will fire on the next real decode graph\n",
+            __func__, il, anchor_kv_diff_name_k.c_str(), anchor_kv_diff_name_v.c_str());
+}
+
+bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    if (ask) {
+        return true;
+    }
+
+    auto * self = (llama_kv_cache *) user_data;
+
+    for (int side = 0; side < 2; side++) {
+        const bool           is_k = side == 0;
+        std::string        & name = is_k ? self->anchor_kv_diff_name_k : self->anchor_kv_diff_name_v;
+        std::vector<float>  & ref = is_k ? self->anchor_kv_diff_ref_k  : self->anchor_kv_diff_ref_v;
+        bool                & done = is_k ? self->anchor_kv_diff_done_k : self->anchor_kv_diff_done_v;
+
+        if (done || ref.empty() || name != t->name) {
+            continue;
+        }
+
+        std::vector<ggml_fp16_t> out(ref.size());
+        ggml_backend_tensor_get(t, out.data(), 0, out.size() * sizeof(ggml_fp16_t));
+
+        double max_abs = 0.0, sum_abs = 0.0;
+        size_t max_at  = 0;
+        for (size_t i = 0; i < out.size(); i++) {
+            const float  gv = ggml_fp16_to_fp32(out[i]);
+            const double d  = std::fabs((double) gv - (double) ref[i]);
+            sum_abs += d;
+            if (d > max_abs) {
+                max_abs = d;
+                max_at  = i;
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF LIVE %s: mean_abs_diff=%.6g max_abs_diff=%.6g at flat_idx=%zu "
+                "(graph=%.6g ref=%.6g)\n", __func__, t->name, sum_abs / out.size(), max_abs, max_at,
+                (double) ggml_fp16_to_fp32(out[max_at]), (double) ref[max_at]);
+
+        done = true;
+    }
+
+    if (self->anchor_kv_diff_done_k && self->anchor_kv_diff_done_v) {
+        llama_cparams * mutable_cparams = const_cast<llama_cparams *>(self->anchor_cparams);
+        mutable_cparams->cb_eval           = nullptr;
+        mutable_cparams->cb_eval_user_data = nullptr;
+    }
+
+    return true;
 }
 
 void llama_kv_cache::anchor_kv_free_dense() {

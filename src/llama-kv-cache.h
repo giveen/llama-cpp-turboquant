@@ -443,6 +443,26 @@ private:
     // compression math, is the current suspect.
     void anchor_kv_debug_graph_diff(int32_t il);
 
+    // AnchorKV live graph-diff capture, called by anchor_kv_debug_graph_diff:
+    // installs a temporary ggml_backend_sched eval callback (via the live
+    // llama_cparams this cache was given - see anchor_kv_set_cparams) that
+    // fires the instant this layer's REAL decompress node computes during
+    // the next graph build/compute - i.e. the actual first decode step after
+    // compression - and diffs it against `ref_k`/`ref_v` before the next
+    // layer's decompress overwrites the shared scratch buffer. No-ops (with
+    // a warning) if a real cb_eval is already installed, so this never
+    // clobbers a caller's own eval-callback tooling. Resets cb_eval to
+    // nullptr once both sides have been captured.
+    void anchor_kv_debug_install_live_capture(int32_t il, std::vector<float> ref_k, std::vector<float> ref_v);
+    static bool anchor_kv_debug_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
+
+    std::string        anchor_kv_diff_name_k;
+    std::string        anchor_kv_diff_name_v;
+    std::vector<float> anchor_kv_diff_ref_k;
+    std::vector<float> anchor_kv_diff_ref_v;
+    bool               anchor_kv_diff_done_k = false;
+    bool               anchor_kv_diff_done_v = false;
+
     // AnchorKV: fetch this layer's RoPE params (freq_base/scale, n_rot, YaRN,
     // rope_factors) and rotate `keys` (dense [S_used, n_embd_k_gqa] float, in
     // place) - forward=false inverts (pre-compression), forward=true re-applies
