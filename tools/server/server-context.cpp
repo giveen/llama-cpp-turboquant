@@ -1379,26 +1379,6 @@ private:
                             path_dft, &mparams_measure, &cparams_dft,
                             params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
                             measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR);
-                        if (!spec_mtp) {
-                            return data;
-                        }
-
-                        std::vector<ggml_backend_dev_t> target_devs;
-                        uint32_t target_ngl = 0;
-                        uint32_t target_nct = 0;
-                        uint32_t target_nex = 0;
-                        const auto target = common_get_device_memory_data(
-                            params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
-                            target_devs, target_ngl, target_nct, target_nex, GGML_LOG_LEVEL_ERROR);
-                        if (target_devs != measured_devs || target.size() != data.size()) {
-                            throw std::runtime_error("MTP and target memory devices differ");
-                        }
-                        for (size_t i = 0; i < data.size(); i++) {
-                            if (target[i].compute > SIZE_MAX - data[i].compute) {
-                                throw std::runtime_error("MTP memory estimate overflowed");
-                            }
-                            data[i].compute += target[i].compute;
-                        }
                         return data;
                     };
 
@@ -2754,7 +2734,8 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const int id_task = slot.task->id;
+        // Slot restore can synthesize a checkpoint without an active inference task.
+        const int id_task = slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task

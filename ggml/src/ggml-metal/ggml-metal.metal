@@ -1828,6 +1828,51 @@ kernel void kernel_tq3_unrotate_act(
     x[base + tiisg] = val * tq3_inv_sqrt32 * tq3_signs[tiisg];
 }
 
+constant float convrot_h4[4][4] = {
+    { 1.0f,  1.0f,  1.0f, -1.0f},
+    { 1.0f,  1.0f, -1.0f,  1.0f},
+    { 1.0f, -1.0f,  1.0f,  1.0f},
+    {-1.0f,  1.0f,  1.0f,  1.0f},
+};
+
+kernel void kernel_convrot(
+        device const float * src [[buffer(0)]],
+        device       float * dst [[buffer(1)]],
+        uint group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float buf[2][QK8_CR];
+
+    for (ushort i = tid; i < QK8_CR; i += 64) {
+        buf[0][i] = src[group * QK8_CR + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ushort rd = 0;
+    ushort wr = 1;
+    for (ushort len = 4, shift = 0; len <= QK8_CR; len *= 4, shift += 2) {
+        const ushort quarter = len / 4;
+        for (ushort i = tid; i < QK8_CR; i += 64) {
+            const ushort base = i & ~(len - 1);
+            const ushort row = (i >> shift) & 3;
+            const ushort col = i & (quarter - 1);
+
+            float sum = 0.0f;
+            for (ushort j = 0; j < 4; ++j) {
+                sum += convrot_h4[row][j] * buf[rd][base + j * quarter + col];
+            }
+            buf[wr][i] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const ushort tmp = rd;
+        rd = wr;
+        wr = tmp;
+    }
+
+    for (ushort i = tid; i < QK8_CR; i += 64) {
+        dst[group * QK8_CR + i] = buf[rd][i] * (1.0f / 16.0f);
+    }
+}
+
 enum ggml_sort_order {
     GGML_SORT_ORDER_ASC,
     GGML_SORT_ORDER_DESC,
@@ -3502,15 +3547,41 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
-    // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
-    // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
+    // emit_mode==0: full state snapshots (existing behavior). emit_mode==1: per-token replay
+    // ingredients (k,v,g,beta), a fixed-cost trailing final-state block, and (when n_tokens>K)
+    // a checkpoint block holding the state immediately before the K-token retained window
+    // starts -- see ggml_gated_delta_net's emit_mode contract (ggml.h) and the CPU reference
+    // (ggml-cpu/ops.cpp) for the exact layout this mirrors.
+    //
+    // NOTE: this emit_mode==1 path has not been built or run on real Metal hardware (ported by
+    // hand from the CPU/CUDA implementations, which are). ggml_metal_supports_op currently
+    // refuses emit_mode==1 unconditionally until it's been verified on real hardware.
+    const bool emit_ingr = (args.emit_mode == 1);
+    const short snap_rows_per_head = emit_ingr ? (short)4 : (short)S_v;
+
+    // snapshot slot mapping (emit_mode==0): slot 0 = most recent state, slot s = s tokens back.
+    // ingredient slot mapping (emit_mode==1): slot 0 = oldest of the K retained tokens
+    // (chronological order -- see the CPU reference's comment on why this differs from emit_mode==0).
+    // When n_tokens < K, only a subset of slots are written; the rest are caller-owned.
 
     // output state base offset: after attention scores
     const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
-    // output state per-slot size: S_v * S_v * H * n_seqs
-    const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
-    // per-(seq,head) offset within a slot
+    // output state per-slot size: S_v*S_v*H*n_seqs (emit_mode==0) or 4*S_v*H*n_seqs (emit_mode==1)
+    const uint state_size_per_snap = (uint)snap_rows_per_head * S_v * args.ne21 * args.ne23;
+    // per-(seq,head) offset within a slot -- full S_v*S_v state layout (emit_mode==0, and also
+    // shared by the final/ckpt blocks below, which are always full-state-shaped)
     const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    // per-(seq,head) offset within a slot -- ingredient layout (emit_mode==1 only; no per-row
+    // term, since k/v/g/beta are packed as 4 whole S_v-wide rows per head, not per-row)
+    const uint ingr_head_off = (i23*args.ne21 + i21)*(4u*S_v);
+
+    // emit_mode==1 only: fixed-cost trailing final-state block, and (when n_tokens>K) a
+    // checkpoint block -- both free to capture since the recurrence already passes through
+    // them, avoiding a second op call over the prefix on the caller's side.
+    const bool  needs_ckpt      = emit_ingr && ((int)args.ne22 > (int)K);
+    const int   t_ckpt          = (int)args.ne22 - (int)K - 1;
+    const uint  final_state_base = attn_size + (uint)K * state_size_per_snap;
+    const uint  ckpt_state_base  = final_state_base + (uint)S_v*S_v*args.ne21*args.ne23;
 
     for (short t = 0; t < args.ne22; t++) {
         float s_k = 0.0f;
@@ -3553,30 +3624,74 @@ kernel void kernel_gated_delta_net_impl(
             dst_attn[t*args.ne21*S_v] = y*scale;
         }
 
+        // must run before the pointer-advance below: ingredients need THIS token's k/g/beta,
+        // and the full-snapshot write only needs ls[] so ordering doesn't matter for it.
+        if (K > 1 || emit_ingr) {
+            const int target_slot = emit_ingr
+                ? ((int)t - ((int)args.ne22 - (int)K))
+                : ((int)args.ne22 - 1 - (int)t);
+            if (target_slot >= 0 && target_slot < (int)K) {
+                if (!emit_ingr) {
+                    device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
+                    FOR_UNROLL (short j = 0; j < NSG; j++) {
+                        const short is = tx*NSG + j;
+                        dst_state[is] = ls[j];
+                    }
+                } else {
+                    // ingredients: k, v, g, beta -- each padded/broadcast to width S_v, packed
+                    // as 4 consecutive rows in that order. k/g/beta don't vary with i20 (the row
+                    // this threadgroup owns), so only the i20==0 threadgroup writes them -- it
+                    // still covers the full S_v range cooperatively via its own tx/NSG lanes,
+                    // same as it already does to read k_ptr/g_ptr for the math above. v DOES
+                    // vary with i20 (v_ptr[i20] is this threadgroup's own single element of the
+                    // v vector), so every threadgroup writes its own element, via lane tx==0.
+                    device float * ingr_base = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + ingr_head_off;
+                    if (tx == 0) {
+                        ingr_base[S_v + i20] = v_ptr[i20];
+                    }
+                    if (i20 == 0) {
+                        FOR_UNROLL (short j = 0; j < NSG; j++) {
+                            const short is = tx*NSG + j;
+                            ingr_base[is]           = k_ptr[is];
+                            ingr_base[2*S_v + is]   = (G == 1) ? g_ptr[0] : g_ptr[is]; // raw, pre-exp
+                            ingr_base[3*S_v + is]   = b_ptr[0];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (needs_ckpt && (int)t == t_ckpt) {
+            device float * dst_ckpt = (device float *) (dst) + ckpt_state_base + state_out_base;
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                dst_ckpt[is] = ls[j];
+            }
+        }
+
         q_ptr += args.ns02;
         k_ptr += args.ns12;
         v_ptr += args.ns22;
 
         b_ptr += args.ne21;
         g_ptr += args.ne21*G;
-
-        if (K > 1) {
-            const int target_slot = (int)args.ne22 - 1 - (int)t;
-            if (target_slot >= 0 && target_slot < (int)K) {
-                device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
-                FOR_UNROLL (short j = 0; j < NSG; j++) {
-                    const short is = tx*NSG + j;
-                    dst_state[is] = ls[j];
-                }
-            }
-        }
     }
 
-    if (K == 1) {
+    if (K == 1 && !emit_ingr) {
         device float * dst_state = (device float *) (dst) + attn_size + state_out_base;
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];
+        }
+    }
+
+    // emit_mode==1: also write the true final state (ls[] holds it, since it was updated in
+    // place through the whole token loop) -- fixed cost, not scaled by K, unconditional on K.
+    if (emit_ingr) {
+        device float * dst_final = (device float *) (dst) + final_state_base + state_out_base;
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            const short is = tx*NSG + j;
+            dst_final[is] = ls[j];
         }
     }
 

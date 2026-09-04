@@ -435,7 +435,10 @@ extern "C" {
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_Q8_CR   = 48, // Q8_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q5_CR   = 49, // Q5_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
+        GGML_TYPE_COUNT   = 51,
     };
 
     // precision
@@ -480,6 +483,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q8_CR   = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q5_CR   = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors
     };
 
     // available tensor operations:
@@ -2437,6 +2443,12 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2574,9 +2586,29 @@ extern "C" {
     //   beta  : [1, H_v, n_tokens, n_seqs]
     //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
     //
-    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K trailing
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    //
+    // emit_mode selects what a snapshot slot holds:
+    //   0 (default) - a full recurrent state [S_v, S_v, H_v] per slot, as above.
+    //   1 (ingredients) - the small per-token (k, v, g, beta) that produced that step's state,
+    //     each broadcast/padded to width S_v, packed as 4 rows of [S_v, H_v] per slot (k, v, g,
+    //     beta in that order), followed by ONE extra full [S_v, S_v, H_v] block (same layout as
+    //     emit_mode == 0's slot 0) holding the true final state after all n_tokens -- a fixed
+    //     once-per-call cost, not scaled by K. Replaying the K ingredients through another call to
+    //     this op with K == 1, using the checkpoint state s tokens back as `state`, reconstructs
+    //     the same state as that trailing final-state block (or as slot 0 of the emit_mode == 0
+    //     output) -- at O(S_v) storage per retained step instead of O(S_v^2), since q is not
+    //     needed to reconstruct state (only to produce attention output, which the replay caller
+    //     is expected to discard). When n_tokens > K, ONE further extra full [S_v, S_v, H_v] block
+    //     follows the final-state block: the state after processing the first (n_tokens - K)
+    //     tokens, i.e. immediately before the K-token retained window starts -- also a fixed,
+    //     once-per-call cost. This lets a caller replaying a partial-accept rollback start from
+    //     "the state before the whole uncertain window" without a second op call to recompute it:
+    //     the recurrence already passes through that exact intermediate value on its way to the
+    //     final state, so capturing it here is free relative to a separate K=1 call over the same
+    //     prefix. Omitted (and not counted in the output size) when n_tokens <= K.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2585,7 +2617,8 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            int64_t               K);
+            int64_t               K,
+            int32_t               emit_mode);
 
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize

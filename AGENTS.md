@@ -70,6 +70,7 @@ Coverage limits (each caused a real miss):
 - `test-backend-ops` reports `Backend ...: OK` even when every case was skipped: the backend verdict is `n_ok == tests_run`, and 0/0 passes. See issue #242 (open). This is how the turbo3 wave64 ballot bug in `copy_to_quant.comp` shipped: FLASH_ATTN_EXT (read path) passed, SET_ROWS (write path) was silently skipped on GCN4, and the corrupted V cache was released (#241, fixed in #243).
 - The generic SET_ROWS sweep has a view variant with `r/2` rows. At r=1 that is 0 rows: the case writes nothing and passes for every type in `all_types`, including TQ4_1S.
 - The MUL_MAT_ID sweep used n=16 only, and the mat-vec decode path is selected only when `src2->ne[1] <= 8` (`ggml_vk_use_mul_mat_vec_id`). n=16 exercises mul_mm_id only; MoE decode was never touched. The n=1 cases and the DSv4-shaped sweep (commit 637300387, PR #269) now cover both sides of that threshold.
+- The harness initializer wrote quantized tensors with one packed `ggml_backend_tensor_set`, which copies `size` bytes contiguously and never strides by `nb[1]`. For a strided view (the `k_v > k` MUL_MAT cases view `k` rows of a `k_v`-row base) the data landed at `i*row_size` instead of `i*nb[1]` and the last rows were never written; the CPU reference read the stale tail and produced NaN, which presented as the CUDA backend failing because CPU is the reference and is skipped as a backend under test. Fixed by row-by-row init for non-contiguous tensors (issue #268, PR #276). The TQ4_1S `k_v=1600` case now passes: the CUDA NaN #276 observed no longer occurs because PR #277 gates the fused TQ mul_mat paths on contiguous `src1`/`dst`, routing this view to the stride-aware fallback.
 
 A green run means the cases that ran passed, not that your change was exercised. Check that your cases actually ran:
 
@@ -87,9 +88,9 @@ A green run means the cases that ran passed, not that your change was exercised.
 - **Metal**: turbo kernels need their `[[host_name]]` instantiations; a missing one is a NULL-pipeline deref on the first turbo KV write.
 - **Vulkan**: SET_ROWS pipeline registration must include TURBO2_0/3_0/4_0 with `require_full_subgroups=true, subgroup_size=32`, or every turbo KV write aborts.
 - **CUDA dispatch**: TQ weights must be excluded from the mmvq path before the fused-TQ branch (`ggml_cuda_should_use_mmvq`), or `GGML_TQ_NATIVE=1` aborts.
-- **CUDA TQ4_1S decode**: the centroid LUT in `mmvq-tq.cu` must use plain shifts, not `__byte_perm` - constant selectors fold differently from runtime ones on some toolchains and silently produce garbage output (NMSE ~1.0). Comment in the file explains; do not "clean up" the shift code.
+- **CUDA TQ4_1S decode**: the centroid LUT in `mmvq-tq.cu` decodes through `get_int_from_table_16`, then re-interleaves even/odd bytes with constant selectors (`__byte_perm(v.x, v.y, 0x5140 / 0x7362)` on nvcc and MUSA, `__builtin_amdgcn_perm` on HIP), the same pattern `vecdotq.cuh` already uses. The old garbage output (NMSE ~1.0) came from the earlier permute chain, not from constant selectors. Verified numerically on GB10 (sm_121) and MI210 (gfx90a). Gate any change to this function on a CUDA-side `test-backend-ops -o MUL_MAT -p type_a=tq4_1s` run on an NVIDIA card plus the AMD run, not on a clean compile.
 - **DeepSeek/MLA**: K and V cache types must be identical; turbo FA auto-enable runs before upstream's quantized-V FA check.
-- **MoE models**: CUDA graphs are auto-disabled for TQ `MUL_MAT_ID`.
+- **MoE models**: the small-batch TQ `MUL_MAT_ID` path routes experts on device and stays CUDA-graph capturable (`[TAG_MUL_MAT_ID_CUDA_GRAPHS]` in `ggml-cuda.cu`); buffers it hands to kernels must outlive every captured graph, so caches retire outgrown buffers instead of freeing them. The large-batch path dequantizes to f16 cuBLAS and synchronizes the stream.
 - **gguf-py**: keep model constants deduplicated; stacked-duplicate merge artifacts crash `import gguf`.
 
 > [!IMPORTANT]
