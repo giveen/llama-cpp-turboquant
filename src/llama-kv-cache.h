@@ -456,12 +456,18 @@ private:
     void anchor_kv_debug_install_live_capture(int32_t il, std::vector<float> ref_k, std::vector<float> ref_v);
     static bool anchor_kv_debug_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Fires once per real decode step for a given target tensor name -
+    // ANCHOR_KV_GRAPH_DIFF_STEP (default 1) selects which occurrence actually
+    // gets captured/logged (hits reaching that count), so step 2, 3, ... can
+    // be checked for drift instead of only the first decode step. Earlier
+    // occurrences are silently skipped (hits just increments).
+    int                anchor_kv_diff_target_step = 1;
     std::string        anchor_kv_diff_name_k;
     std::string        anchor_kv_diff_name_v;
     std::vector<float> anchor_kv_diff_ref_k;
     std::vector<float> anchor_kv_diff_ref_v;
-    bool               anchor_kv_diff_done_k = false;
-    bool               anchor_kv_diff_done_v = false;
+    int                anchor_kv_diff_hits_k = 0;
+    int                anchor_kv_diff_hits_v = 0;
 
     // Same capture, but targeting get_k()/get_v()'s attention-read view AFTER
     // cpy_k()/cpy_v() has appended the newly decoded token past S - checks
@@ -470,8 +476,8 @@ private:
     // reference exists for it, unlike the compressed range).
     std::string        anchor_kv_diff_name_get_k;
     std::string        anchor_kv_diff_name_get_v;
-    bool               anchor_kv_diff_done_get_k = false;
-    bool               anchor_kv_diff_done_get_v = false;
+    int                anchor_kv_diff_hits_get_k = 0;
+    int                anchor_kv_diff_hits_get_v = 0;
 
     // AnchorKV: fetch this layer's RoPE params (freq_base/scale, n_rot, YaRN,
     // rope_factors) and rotate `keys` (dense [S_used, n_embd_k_gqa] float, in

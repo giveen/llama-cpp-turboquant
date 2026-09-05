@@ -2402,17 +2402,25 @@ void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, std::vecto
         return;
     }
 
+    anchor_kv_diff_target_step = 1;
+    if (const char * step_env = getenv("ANCHOR_KV_GRAPH_DIFF_STEP")) {
+        const int step = atoi(step_env);
+        if (step >= 1) {
+            anchor_kv_diff_target_step = step;
+        }
+    }
+
     anchor_kv_diff_name_k = "anchor_decompress_l" + std::to_string(il) + "_k";
     anchor_kv_diff_name_v = "anchor_decompress_l" + std::to_string(il) + "_v";
     anchor_kv_diff_ref_k  = std::move(ref_k);
     anchor_kv_diff_ref_v  = std::move(ref_v);
-    anchor_kv_diff_done_k = anchor_kv_diff_ref_k.empty();
-    anchor_kv_diff_done_v = anchor_kv_diff_ref_v.empty();
+    anchor_kv_diff_hits_k = 0;
+    anchor_kv_diff_hits_v = 0;
 
     anchor_kv_diff_name_get_k = "anchor_get_l" + std::to_string(il) + "_k";
     anchor_kv_diff_name_get_v = "anchor_get_l" + std::to_string(il) + "_v";
-    anchor_kv_diff_done_get_k = anchor_kv_diff_ref_k.empty();
-    anchor_kv_diff_done_get_v = anchor_kv_diff_ref_v.empty();
+    anchor_kv_diff_hits_get_k = 0;
+    anchor_kv_diff_hits_get_v = 0;
 
     // anchor_cparams points at the live llama_context::cparams (see
     // anchor_kv_set_cparams) - mutating cb_eval here takes effect on the very
@@ -2423,9 +2431,10 @@ void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, std::vecto
     mutable_cparams->cb_eval           = &llama_kv_cache::anchor_kv_debug_eval_cb;
     mutable_cparams->cb_eval_user_data = this;
 
-    LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF: installed live capture for layer %d ('%s'/'%s') - "
-            "will fire on the next real decode graph\n",
-            __func__, il, anchor_kv_diff_name_k.c_str(), anchor_kv_diff_name_v.c_str());
+    LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF: installed live capture for layer %d ('%s'/'%s'), "
+            "target decode step %d\n",
+            __func__, il, anchor_kv_diff_name_k.c_str(), anchor_kv_diff_name_v.c_str(),
+            anchor_kv_diff_target_step);
 }
 
 bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
@@ -2435,14 +2444,20 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
 
     auto * self = (llama_kv_cache *) user_data;
 
+    const int target_step = self->anchor_kv_diff_target_step;
+
     for (int side = 0; side < 2; side++) {
         const bool           is_k = side == 0;
         std::string        & name = is_k ? self->anchor_kv_diff_name_k : self->anchor_kv_diff_name_v;
         std::vector<float>  & ref = is_k ? self->anchor_kv_diff_ref_k  : self->anchor_kv_diff_ref_v;
-        bool                & done = is_k ? self->anchor_kv_diff_done_k : self->anchor_kv_diff_done_v;
+        int                 & hits = is_k ? self->anchor_kv_diff_hits_k : self->anchor_kv_diff_hits_v;
 
-        if (done || ref.empty() || name != t->name) {
+        if (ref.empty() || hits >= target_step || name != t->name) {
             continue;
+        }
+        hits++;
+        if (hits != target_step) {
+            continue; // not the decode step we're targeting yet
         }
 
         std::vector<ggml_fp16_t> out(ref.size());
@@ -2460,11 +2475,10 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
             }
         }
 
-        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF LIVE %s: mean_abs_diff=%.6g max_abs_diff=%.6g at flat_idx=%zu "
-                "(graph=%.6g ref=%.6g)\n", __func__, t->name, sum_abs / out.size(), max_abs, max_at,
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF LIVE %s (decode step %d): mean_abs_diff=%.6g max_abs_diff=%.6g "
+                "at flat_idx=%zu (graph=%.6g ref=%.6g)\n", __func__, t->name, target_step,
+                sum_abs / out.size(), max_abs, max_at,
                 (double) ggml_fp16_to_fp32(out[max_at]), (double) ref[max_at]);
-
-        done = true;
     }
 
     // Post-append attention-read check: get_k()/get_v()'s view, captured
@@ -2478,15 +2492,23 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
         const bool           is_k = side == 0;
         std::string        & name = is_k ? self->anchor_kv_diff_name_get_k : self->anchor_kv_diff_name_get_v;
         std::vector<float>  & ref = is_k ? self->anchor_kv_diff_ref_k      : self->anchor_kv_diff_ref_v;
-        bool                & done = is_k ? self->anchor_kv_diff_done_get_k : self->anchor_kv_diff_done_get_v;
+        int                 & hits = is_k ? self->anchor_kv_diff_hits_get_k : self->anchor_kv_diff_hits_get_v;
 
-        if (done || ref.empty() || name != t->name) {
+        if (ref.empty() || hits >= target_step || name != t->name) {
             continue;
         }
+        hits++;
+        if (hits != target_step) {
+            continue; // not the decode step we're targeting yet
+        }
 
-        const int64_t n_kv   = t->ne[2];
-        const int64_t stride = t->ne[0] * t->ne[1]; // n_heads * D
-        const int64_t S      = (int64_t) ref.size() / stride;
+        const int64_t n_kv    = t->ne[2];
+        const int64_t stride  = t->ne[0] * t->ne[1]; // n_heads * D
+        const int64_t S       = (int64_t) ref.size() / stride;
+        // n_kv is padded up to a fixed bucket (see get_n_kv) so it is NOT the
+        // real used length - the actual newest token sits at S + step - 1,
+        // with everything from there to n_kv-1 unused zeroed padding.
+        const int64_t newest  = S + target_step - 1;
 
         std::vector<ggml_fp16_t> out((size_t) n_kv * stride);
         ggml_backend_tensor_get(t, out.data(), 0, out.size() * sizeof(ggml_fp16_t));
@@ -2500,20 +2522,23 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
         }
 
         std::string new_row;
-        for (int64_t d = 0; d < std::min<int64_t>(stride, 8) && S < n_kv; d++) {
-            new_row += (d ? ", " : "") + std::to_string(ggml_fp16_to_fp32(out[(size_t) S * stride + d]));
+        for (int64_t d = 0; d < std::min<int64_t>(stride, 8) && newest >= 0 && newest < n_kv; d++) {
+            new_row += (d ? ", " : "") + std::to_string(ggml_fp16_to_fp32(out[(size_t) newest * stride + d]));
         }
 
-        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF LIVE %s (post-append, n_kv=%lld S=%lld): "
-                "existing-range mean_abs_diff=%.6g max_abs_diff=%.6g; new token row[0:8)=[%s]\n",
-                __func__, t->name, (long long) n_kv, (long long) S,
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF LIVE %s (decode step %d, post-append, n_kv=%lld newest=%lld): "
+                "existing-range mean_abs_diff=%.6g max_abs_diff=%.6g; newest token row[0:8)=[%s]\n",
+                __func__, t->name, target_step, (long long) n_kv, (long long) newest,
                 sum_abs / ref.size(), max_abs, new_row.c_str());
-
-        done = true;
     }
 
-    if (self->anchor_kv_diff_done_k     && self->anchor_kv_diff_done_v &&
-        self->anchor_kv_diff_done_get_k && self->anchor_kv_diff_done_get_v) {
+    auto satisfied = [target_step](const std::vector<float> & ref, int hits) {
+        return ref.empty() || hits >= target_step;
+    };
+    if (satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_k) &&
+        satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_v) &&
+        satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_get_k) &&
+        satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_get_v)) {
         llama_cparams * mutable_cparams = const_cast<llama_cparams *>(self->anchor_cparams);
         mutable_cparams->cb_eval           = nullptr;
         mutable_cparams->cb_eval_user_data = nullptr;
