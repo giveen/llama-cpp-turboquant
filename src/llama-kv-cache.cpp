@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -2101,6 +2102,14 @@ void llama_kv_cache::anchor_kv_compress_all() {
                 total_K_res, total_V_res);
     }
 
+    // ANCHOR_KV_HIDDEN_DUMP=<path>: install before the dense-test branch so
+    // it works for both paths (that's the whole point - comparing a
+    // ANCHOR_KV_DENSE_TEST run's hidden states against a normal
+    // graph-integrated run's, layer by layer, on the same input).
+    if (const char * hidden_dump_env = getenv("ANCHOR_KV_HIDDEN_DUMP")) {
+        anchor_kv_debug_install_hidden_dump(hidden_dump_env);
+    }
+
     if (anchor_kv_dense_test) {
         // ANCHOR_KV_DENSE_TEST: skip the shared scratch + graph op entirely -
         // decompress once now and write the lossy reconstruction directly into
@@ -2491,6 +2500,116 @@ void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, int n_head
             anchor_kv_diff_target_step);
 }
 
+void llama_kv_cache::anchor_kv_debug_install_hidden_dump(const std::string & path) {
+    if (!anchor_cparams) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_HIDDEN_DUMP requires cparams to be set - skipping\n", __func__);
+        return;
+    }
+    if (anchor_cparams->cb_eval) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_HIDDEN_DUMP: a cb_eval is already installed - skipping\n", __func__);
+        return;
+    }
+
+    anchor_kv_hidden_dump_path   = path;
+    anchor_kv_hidden_target_step = 1;
+    if (const char * step_env = getenv("ANCHOR_KV_HIDDEN_DUMP_STEP")) {
+        const int step = atoi(step_env);
+        if (step >= 1) {
+            anchor_kv_hidden_target_step = step;
+        }
+    }
+    anchor_kv_hidden_n_layer = (int) layers.size();
+    anchor_kv_hidden_hits.clear();
+    anchor_kv_hidden_captured.clear();
+
+    llama_cparams * mutable_cparams = const_cast<llama_cparams *>(anchor_cparams);
+    mutable_cparams->cb_eval           = &llama_kv_cache::anchor_kv_debug_eval_cb;
+    mutable_cparams->cb_eval_user_data = this;
+
+    LLAMA_LOG_INFO("%s: ANCHOR_KV_HIDDEN_DUMP: installed for %d layers, target decode step %d, path='%s'\n",
+            __func__, anchor_kv_hidden_n_layer, anchor_kv_hidden_target_step, path.c_str());
+}
+
+void llama_kv_cache::anchor_kv_debug_finalize_hidden_dump() {
+    llama_cparams * mutable_cparams = const_cast<llama_cparams *>(anchor_cparams);
+    mutable_cparams->cb_eval           = nullptr;
+    mutable_cparams->cb_eval_user_data = nullptr;
+
+    FILE * f = fopen(anchor_kv_hidden_dump_path.c_str(), "rb");
+    if (!f) {
+        // dump doesn't exist yet - this run establishes the reference
+        f = fopen(anchor_kv_hidden_dump_path.c_str(), "wb");
+        if (!f) {
+            LLAMA_LOG_WARN("%s: ANCHOR_KV_HIDDEN_DUMP: failed to open '%s' for writing\n",
+                    __func__, anchor_kv_hidden_dump_path.c_str());
+            anchor_kv_hidden_dump_path.clear();
+            return;
+        }
+        for (const auto & [il, data] : anchor_kv_hidden_captured) {
+            const int32_t il32 = il;
+            const int64_t n    = (int64_t) data.size();
+            fwrite(&il32, sizeof(il32), 1, f);
+            fwrite(&n, sizeof(n), 1, f);
+            fwrite(data.data(), sizeof(float), data.size(), f);
+        }
+        fclose(f);
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_HIDDEN_DUMP: wrote reference dump for %d layers to '%s'\n",
+                __func__, (int) anchor_kv_hidden_captured.size(), anchor_kv_hidden_dump_path.c_str());
+        anchor_kv_hidden_dump_path.clear();
+        return;
+    }
+
+    // dump exists - load it and diff this run's states against it, layer by layer
+    std::map<int, std::vector<float>> reference;
+    while (true) {
+        int32_t il32;
+        int64_t n;
+        if (fread(&il32, sizeof(il32), 1, f) != 1) break;
+        if (fread(&n, sizeof(n), 1, f) != 1) break;
+        std::vector<float> data(n);
+        if (fread(data.data(), sizeof(float), n, f) != (size_t) n) break;
+        reference[il32] = std::move(data);
+    }
+    fclose(f);
+
+    LLAMA_LOG_INFO("%s: ANCHOR_KV_HIDDEN_DUMP: loaded reference (%d layers) from '%s' - "
+            "diffing this run's hidden states against it, layer by layer\n",
+            __func__, (int) reference.size(), anchor_kv_hidden_dump_path.c_str());
+
+    for (const auto & [il, data] : anchor_kv_hidden_captured) {
+        auto it = reference.find(il);
+        if (it == reference.end()) {
+            LLAMA_LOG_WARN("%s: ANCHOR_KV_HIDDEN_DUMP: layer %d missing from reference dump\n", __func__, il);
+            continue;
+        }
+        const std::vector<float> & ref = it->second;
+        if (ref.size() != data.size()) {
+            LLAMA_LOG_WARN("%s: ANCHOR_KV_HIDDEN_DUMP: layer %d size mismatch (this=%zu ref=%zu)\n",
+                    __func__, il, data.size(), ref.size());
+            continue;
+        }
+
+        double max_abs = 0.0, sum_abs = 0.0, sum_abs_ref = 0.0;
+        size_t max_at = 0;
+        for (size_t i = 0; i < data.size(); i++) {
+            const double d = std::fabs((double) data[i] - (double) ref[i]);
+            sum_abs += d;
+            sum_abs_ref += std::fabs((double) ref[i]);
+            if (d > max_abs) {
+                max_abs = d;
+                max_at  = i;
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_HIDDEN_DUMP layer %2d: mean_abs_diff=%.6g max_abs_diff=%.6g "
+                "mean_abs_ref=%.6g (this=%.6g ref=%.6g at idx=%zu)\n",
+                __func__, il, sum_abs / data.size(), max_abs, sum_abs_ref / ref.size(),
+                (double) data[max_at], (double) ref[max_at], max_at);
+    }
+
+    anchor_kv_hidden_dump_path.clear();
+}
+
 bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     if (ask) {
         return true;
@@ -2627,15 +2746,57 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
         }
     }
 
+    // ANCHOR_KV_HIDDEN_DUMP: capture every layer's residual-stream output
+    // for the target step. Independent of, and mutually exclusive with (only
+    // one cb_eval can be installed at a time - anchor_kv_debug_install_*
+    // refuses to clobber an existing one), the graph-diff capture above.
+    const bool hidden_dump_active = !self->anchor_kv_hidden_dump_path.empty();
+    if (hidden_dump_active) {
+        static const std::string prefix = "anchor_hidden_l";
+        const std::string name = t->name;
+        if (name.rfind(prefix, 0) == 0) {
+            const int il = atoi(name.c_str() + prefix.size());
+            int & hits = self->anchor_kv_hidden_hits[il];
+            if (hits < self->anchor_kv_hidden_target_step) {
+                hits++;
+                if (hits == self->anchor_kv_hidden_target_step) {
+                    const int64_t nelem = ggml_nelements(t);
+                    std::vector<float> data(nelem);
+                    if (t->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(t, data.data(), 0, nelem * sizeof(float));
+                    } else {
+                        LLAMA_LOG_WARN("%s: ANCHOR_KV_HIDDEN_DUMP: layer %d tensor has unexpected type %s\n",
+                                __func__, il, ggml_type_name(t->type));
+                    }
+                    self->anchor_kv_hidden_captured[il] = std::move(data);
+
+                    if ((int) self->anchor_kv_hidden_captured.size() == self->anchor_kv_hidden_n_layer) {
+                        self->anchor_kv_debug_finalize_hidden_dump();
+                    }
+                }
+            }
+        }
+    }
+
+    // graph-diff mode is "active" only if actually installed (ref_k/ref_v
+    // non-empty means anchor_kv_debug_install_live_capture ran) - otherwise
+    // this check would trivially see everything as "satisfied" on the very
+    // first callback of any kind and reset cb_eval before hidden-dump (or
+    // whatever else installed it) ever gets a chance to run.
+    const bool graph_diff_active = !self->anchor_kv_diff_ref_k.empty() || !self->anchor_kv_diff_ref_v.empty();
     auto satisfied = [target_step](const std::vector<float> & ref, int hits) {
         return ref.empty() || hits >= target_step;
     };
-    if (satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_k) &&
-        satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_v) &&
-        satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_get_k) &&
-        satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_get_v) &&
-        self->anchor_kv_diff_hits_q     >= target_step &&
-        self->anchor_kv_diff_hits_fattn >= target_step) {
+    const bool graph_diff_done =
+        !graph_diff_active ||
+        (satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_k) &&
+         satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_v) &&
+         satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_get_k) &&
+         satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_get_v) &&
+         self->anchor_kv_diff_hits_q     >= target_step &&
+         self->anchor_kv_diff_hits_fattn >= target_step);
+
+    if (graph_diff_active && graph_diff_done && !hidden_dump_active) {
         llama_cparams * mutable_cparams = const_cast<llama_cparams *>(self->anchor_cparams);
         mutable_cparams->cb_eval           = nullptr;
         mutable_cparams->cb_eval_user_data = nullptr;

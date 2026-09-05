@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 #include "anchor-kv.h"
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -505,6 +506,26 @@ private:
     int64_t anchor_kv_diff_q_n_tokens = 0;
 
     void anchor_kv_debug_reference_attn(const struct ggml_tensor * fattn_node);
+
+    // ANCHOR_KV_HIDDEN_DUMP=<path> diagnostic (independent of
+    // ANCHOR_KV_GRAPH_DIFF, but shares the same eval-callback plumbing):
+    // captures every layer's post-block residual-stream output
+    // ("anchor_hidden_l<N>", named in models/qwen3.cpp) for one decode step.
+    // If the dump file doesn't exist yet, writes this run's per-layer
+    // states to it (e.g. an ANCHOR_KV_DENSE_TEST run establishing the
+    // reference). If it does exist, loads it and diffs this run's states
+    // against it layer by layer, logging where the two runs' hidden states
+    // first diverge beyond reconstruction-error scale - the only way left
+    // to localize a data-independent bug once every individual value/op has
+    // already been measured correct in isolation.
+    void anchor_kv_debug_install_hidden_dump(const std::string & path);
+    void anchor_kv_debug_finalize_hidden_dump();
+
+    std::string anchor_kv_hidden_dump_path;
+    int         anchor_kv_hidden_target_step = 1;
+    int         anchor_kv_hidden_n_layer     = 0;
+    std::map<int, int>                anchor_kv_hidden_hits;
+    std::map<int, std::vector<float>> anchor_kv_hidden_captured;
 
     // AnchorKV: fetch this layer's RoPE params (freq_base/scale, n_rot, YaRN,
     // rope_factors) and rotate `keys` (dense [S_used, n_embd_k_gqa] float, in

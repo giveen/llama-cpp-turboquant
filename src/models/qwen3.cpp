@@ -136,6 +136,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+        // ANCHOR_KV_HIDDEN_DUMP diagnostic: name the per-layer residual-
+        // stream output so llama_kv_cache's live capture can compare it,
+        // layer by layer, against a dump from a different run (e.g.
+        // ANCHOR_KV_DENSE_TEST vs the graph-integrated path) - see
+        // anchor_kv_debug_eval_cb in llama-kv-cache.cpp. Unconditional
+        // (cheap - a name string) and harmless for every other run since
+        // nothing looks for this name unless the diagnostic is enabled.
+        ggml_set_name(cur, ("anchor_hidden_l" + std::to_string(il)).c_str());
 
         // input for next layer
         inpL = cur;
