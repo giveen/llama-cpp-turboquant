@@ -1794,13 +1794,26 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
     const int n_K_eff = akv_params.compress_k ? n_K_max : 1;
     const int n_V_eff = akv_params.compress_v ? n_V_max : 1;
 
+    // ANCHOR_KV_FP32_PACK=1: pack anchors/gamma as plain F32 instead of the
+    // production BF16/F16 - diagnostic to test whether that packing
+    // precision, not the shared-scratch/graph-integration layer, is the
+    // source of the graph-integrated path's gibberish output. CPU backend
+    // only - the CUDA anchor-decompress kernel doesn't support F32 inputs.
+    const bool fp32_pack = getenv("ANCHOR_KV_FP32_PACK") != nullptr;
+    if (fp32_pack && !ggml_backend_buft_is_host(buft)) {
+        throw std::runtime_error("ANCHOR_KV_FP32_PACK requires a CPU backend (-ngl 0) - "
+                "the CUDA anchor-decompress kernel only supports the production BF16/F16 packing");
+    }
+    const ggml_type anchors_type = fp32_pack ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+    const ggml_type gamma_type   = fp32_pack ? GGML_TYPE_F32 : GGML_TYPE_F16;
+
     // Tensor dims must match the data packing in the loops below:
     // data is packed C-order [n_heads, 2, k, D] with D contiguous,
     // so ne[0]=D (contiguous), ne[1]=k, ne[2]=2, ne[3]=n_heads.
-    g.anchors      = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, D, k, 2, n_heads);
+    g.anchors      = ggml_new_tensor_4d(ctx, anchors_type, D, k, 2, n_heads);
     // anchor_of/gamma/slot_of packed as [2, n_heads, S] with S contiguous
     g.anchor_of    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, S, n_heads, 2);
-    g.gamma        = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, S, n_heads, 2);
+    g.gamma        = ggml_new_tensor_3d(ctx, gamma_type, S, n_heads, 2);
     g.slot_of      = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, S, n_heads, 2);
     // k/v res codes packed as [n_heads, n_K_eff, cpr] with cpr contiguous
     g.k_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  cpr, n_K_eff, n_heads);
@@ -1808,9 +1821,21 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
     g.v_res_codes  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  cpr, n_V_eff, n_heads);
     g.v_res_scales = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_V_eff, n_heads);
 
-    std::vector<ggml_bf16_t> anchors(n_heads * 2 * k * D, ggml_fp32_to_bf16(0.0f));
+    std::vector<ggml_bf16_t> anchors_bf16;
+    std::vector<float>       anchors_f32;
+    if (fp32_pack) {
+        anchors_f32.assign((size_t) n_heads * 2 * k * D, 0.0f);
+    } else {
+        anchors_bf16.assign((size_t) n_heads * 2 * k * D, ggml_fp32_to_bf16(0.0f));
+    }
     std::vector<int32_t> anchor_of(2 * n_heads * S, 0);
-    std::vector<ggml_fp16_t> gamma(2 * n_heads * S, ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> gamma_fp16;
+    std::vector<float>       gamma_f32;
+    if (fp32_pack) {
+        gamma_f32.assign((size_t) 2 * n_heads * S, 0.0f);
+    } else {
+        gamma_fp16.assign((size_t) 2 * n_heads * S, ggml_fp32_to_fp16(0.0f));
+    }
     std::vector<int32_t> slot_of(2 * n_heads * S, -1);
     std::vector<uint8_t> k_codes((size_t) n_heads * n_K_eff * cpr, 0);
     std::vector<float> k_scales((size_t) n_heads * n_K_eff, 0.0f);
@@ -1822,20 +1847,33 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
 
         for (int a = 0; a < head.k; a++) {
             if (akv_params.compress_k) {
-                ggml_fp32_to_bf16_row(&head.anchor_keys[a * D],
-                        &anchors[((h * 2 + 0) * k + a) * D], D);
+                if (fp32_pack) {
+                    memcpy(&anchors_f32[((h * 2 + 0) * k + a) * D], &head.anchor_keys[a * D], D * sizeof(float));
+                } else {
+                    ggml_fp32_to_bf16_row(&head.anchor_keys[a * D],
+                            &anchors_bf16[((h * 2 + 0) * k + a) * D], D);
+                }
             }
             if (akv_params.compress_v) {
-                ggml_fp32_to_bf16_row(&head.anchor_values[a * D],
-                        &anchors[((h * 2 + 1) * k + a) * D], D);
+                if (fp32_pack) {
+                    memcpy(&anchors_f32[((h * 2 + 1) * k + a) * D], &head.anchor_values[a * D], D * sizeof(float));
+                } else {
+                    ggml_fp32_to_bf16_row(&head.anchor_values[a * D],
+                            &anchors_bf16[((h * 2 + 1) * k + a) * D], D);
+                }
             }
         }
 
         for (int t = 0; t < S; t++) {
             anchor_of[(0 * n_heads + h) * S + t] = head.k_anchor_of[t];
             anchor_of[(1 * n_heads + h) * S + t] = head.v_anchor_of[t];
-            gamma[(0 * n_heads + h) * S + t]     = ggml_fp32_to_fp16(head.k_gamma[t]);
-            gamma[(1 * n_heads + h) * S + t]     = ggml_fp32_to_fp16(head.v_gamma[t]);
+            if (fp32_pack) {
+                gamma_f32[(0 * n_heads + h) * S + t] = head.k_gamma[t];
+                gamma_f32[(1 * n_heads + h) * S + t] = head.v_gamma[t];
+            } else {
+                gamma_fp16[(0 * n_heads + h) * S + t] = ggml_fp32_to_fp16(head.k_gamma[t]);
+                gamma_fp16[(1 * n_heads + h) * S + t] = ggml_fp32_to_fp16(head.v_gamma[t]);
+            }
             slot_of[(0 * n_heads + h) * S + t]   = head.k_slot_of[t];
             slot_of[(1 * n_heads + h) * S + t]   = head.v_slot_of[t];
         }
@@ -1860,9 +1898,14 @@ void llama_kv_cache::anchor_kv_upload_layer(int32_t ikv) {
         throw std::runtime_error("failed to allocate buffer for AnchorKV compressed data");
     }
 
-    ggml_backend_tensor_set(g.anchors,      anchors.data(), 0, anchors.size() * sizeof(ggml_bf16_t));
+    if (fp32_pack) {
+        ggml_backend_tensor_set(g.anchors, anchors_f32.data(), 0, anchors_f32.size() * sizeof(float));
+        ggml_backend_tensor_set(g.gamma,   gamma_f32.data(),   0, gamma_f32.size()   * sizeof(float));
+    } else {
+        ggml_backend_tensor_set(g.anchors, anchors_bf16.data(), 0, anchors_bf16.size() * sizeof(ggml_bf16_t));
+        ggml_backend_tensor_set(g.gamma,   gamma_fp16.data(),   0, gamma_fp16.size()   * sizeof(ggml_fp16_t));
+    }
     ggml_backend_tensor_set(g.anchor_of,    anchor_of.data(), 0, anchor_of.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(g.gamma,        gamma.data(), 0, gamma.size() * sizeof(ggml_fp16_t));
     ggml_backend_tensor_set(g.slot_of,      slot_of.data(), 0, slot_of.size() * sizeof(int32_t));
     ggml_backend_tensor_set(g.k_res_codes,  k_codes.data(), 0, k_codes.size());
     ggml_backend_tensor_set(g.k_res_scales, k_scales.data(), 0, k_scales.size() * sizeof(float));
