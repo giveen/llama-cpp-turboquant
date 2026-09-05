@@ -323,6 +323,7 @@ static const std::vector<std::pair<std::string, float>> anchor_kv_types = {
     {"anchor1", 0.2f},   // 5x compression, best quality
     {"anchor2", 0.1f},   // 10x compression, good quality
     {"anchor3", 0.05f},  // 20x compression, aggressive
+    {"anchor4", 0.9f},   // TEMP diagnostic: near-lossless (~1.1x), see AnchorKV theta-independence test
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

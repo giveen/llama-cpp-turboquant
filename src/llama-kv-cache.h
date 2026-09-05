@@ -453,7 +453,7 @@ private:
     // a warning) if a real cb_eval is already installed, so this never
     // clobbers a caller's own eval-callback tooling. Resets cb_eval to
     // nullptr once both sides have been captured.
-    void anchor_kv_debug_install_live_capture(int32_t il, std::vector<float> ref_k, std::vector<float> ref_v);
+    void anchor_kv_debug_install_live_capture(int32_t il, int n_heads, int D, std::vector<float> ref_k, std::vector<float> ref_v);
     static bool anchor_kv_debug_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
     // Fires once per real decode step for a given target tensor name -
@@ -478,6 +478,33 @@ private:
     std::string        anchor_kv_diff_name_get_v;
     int                anchor_kv_diff_hits_get_k = 0;
     int                anchor_kv_diff_hits_get_v = 0;
+
+    // Reference-attention diagnostic, extending ANCHOR_KV_GRAPH_DIFF: once
+    // decompress+append are already verified correct, also capture Q, the
+    // real KQ mask, and the real FLASH_ATTN_EXT node/output for this layer,
+    // then compute attention from scratch (softmax(QK^T*scale + mask)V with
+    // GQA head-group broadcasting) using the SAME already-verified
+    // get_k()/get_v() values, and diff the result against the real op's
+    // output. The only way left to localize a bug in attention math itself,
+    // since every value feeding into it has already been measured correct.
+    std::string anchor_kv_diff_name_q;
+    std::string anchor_kv_diff_name_fattn;
+    int         anchor_kv_diff_hits_q     = 0;
+    int         anchor_kv_diff_hits_fattn = 0;
+
+    int anchor_kv_diff_n_heads_kv = 0;
+    int anchor_kv_diff_head_dim   = 0;
+
+    std::vector<float> anchor_kv_diff_captured_k; // [n_kv][n_heads_kv][D], from anchor_get_l<il>_k
+    std::vector<float> anchor_kv_diff_captured_v; // [n_kv][n_heads_kv][D], from anchor_get_l<il>_v
+    int64_t            anchor_kv_diff_captured_n_kv = 0;
+
+    std::vector<float> anchor_kv_diff_captured_q; // [D_q][n_head_q][n_tokens], from attn_q_l<il>
+    int64_t anchor_kv_diff_q_head_dim = 0;
+    int64_t anchor_kv_diff_q_n_heads  = 0;
+    int64_t anchor_kv_diff_q_n_tokens = 0;
+
+    void anchor_kv_debug_reference_attn(const struct ggml_tensor * fattn_node);
 
     // AnchorKV: fetch this layer's RoPE params (freq_base/scale, n_rot, YaRN,
     // rope_factors) and rotate `keys` (dense [S_used, n_embd_k_gqa] float, in

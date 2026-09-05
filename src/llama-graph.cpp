@@ -2895,6 +2895,15 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // ANCHOR_KV_GRAPH_DIFF diagnostic: name Q so a live capture can build a
+    // reference attention computation for this layer (see
+    // anchor_kv_debug_eval_cb in llama-kv-cache.cpp) - no-op for every other
+    // path since get_anchor_active() is false unless AnchorKV compression
+    // actually ran.
+    if (mctx_cur->get_anchor_active()) {
+        ggml_set_name(q, ("attn_q_l" + std::to_string(il)).c_str());
+    }
+
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
@@ -2911,6 +2920,17 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+    if (mctx_cur->get_anchor_active()) {
+        // cur is build_attn_mha's final reshaped view - a pure view/reshape
+        // op may never get a compute callback (nothing to compute), so name
+        // the actual FLASH_ATTN_EXT node underneath it instead (cur->src[0]
+        // right after build_attn_mha's internal reshape - see there) and
+        // reach q/k/v/mask via its own src[0..3] from the live capture.
+        if (cur->src[0] && cur->src[0]->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_set_name(cur->src[0], ("attn_fattn_l" + std::to_string(il)).c_str());
+        }
+        ggml_set_name(cur, ("attn_out_l" + std::to_string(il)).c_str());
+    }
 
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).

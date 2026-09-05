@@ -2431,10 +2431,10 @@ void llama_kv_cache::anchor_kv_debug_graph_diff(int32_t il) {
     diff_side(true,  "K", ref_k);
     diff_side(false, "V", ref_v);
 
-    anchor_kv_debug_install_live_capture(il, ref_k, ref_v);
+    anchor_kv_debug_install_live_capture(il, n_heads, D, ref_k, ref_v);
 }
 
-void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, std::vector<float> ref_k, std::vector<float> ref_v) {
+void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, int n_heads, int D, std::vector<float> ref_k, std::vector<float> ref_v) {
     if (!anchor_cparams) {
         LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF live capture requires cparams to be set - skipping\n", __func__);
         return;
@@ -2464,6 +2464,17 @@ void llama_kv_cache::anchor_kv_debug_install_live_capture(int32_t il, std::vecto
     anchor_kv_diff_name_get_v = "anchor_get_l" + std::to_string(il) + "_v";
     anchor_kv_diff_hits_get_k = 0;
     anchor_kv_diff_hits_get_v = 0;
+
+    anchor_kv_diff_name_q      = "attn_q_l" + std::to_string(il);
+    anchor_kv_diff_name_fattn  = "attn_fattn_l" + std::to_string(il);
+    anchor_kv_diff_hits_q      = 0;
+    anchor_kv_diff_hits_fattn  = 0;
+    anchor_kv_diff_n_heads_kv  = n_heads;
+    anchor_kv_diff_head_dim    = D;
+    anchor_kv_diff_captured_k.clear();
+    anchor_kv_diff_captured_v.clear();
+    anchor_kv_diff_captured_n_kv = 0;
+    anchor_kv_diff_captured_q.clear();
 
     // anchor_cparams points at the live llama_context::cparams (see
     // anchor_kv_set_cparams) - mutating cb_eval here takes effect on the very
@@ -2573,6 +2584,47 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
                 "existing-range mean_abs_diff=%.6g max_abs_diff=%.6g; newest token row[0:8)=[%s]\n",
                 __func__, t->name, target_step, (long long) n_kv, (long long) newest,
                 sum_abs / ref.size(), max_abs, new_row.c_str());
+
+        // Stash the full captured range (not just the diff stats) for the
+        // reference-attention computation below - this is the exact same
+        // memory attention itself reads, already proven correct.
+        std::vector<float> & captured = is_k ? self->anchor_kv_diff_captured_k : self->anchor_kv_diff_captured_v;
+        captured.resize(out.size());
+        for (size_t i = 0; i < out.size(); i++) {
+            captured[i] = ggml_fp16_to_fp32(out[i]);
+        }
+        self->anchor_kv_diff_captured_n_kv = n_kv;
+    }
+
+    // Capture Q (pre-permute, [D_q, n_head_q, n_tokens]) for the reference
+    // attention computation below.
+    if (self->anchor_kv_diff_hits_q < target_step && self->anchor_kv_diff_name_q == t->name) {
+        self->anchor_kv_diff_hits_q++;
+        if (self->anchor_kv_diff_hits_q == target_step) {
+            const int64_t nelem = ggml_nelements(t);
+            self->anchor_kv_diff_captured_q.resize(nelem);
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, self->anchor_kv_diff_captured_q.data(), 0, nelem * sizeof(float));
+            } else {
+                LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: Q tensor '%s' has unexpected type %s, "
+                        "skipping reference-attention computation\n", __func__, t->name, ggml_type_name(t->type));
+                self->anchor_kv_diff_captured_q.clear();
+            }
+            self->anchor_kv_diff_q_head_dim  = t->ne[0];
+            self->anchor_kv_diff_q_n_heads   = t->ne[1];
+            self->anchor_kv_diff_q_n_tokens  = t->ne[2];
+        }
+    }
+
+    // The real FLASH_ATTN_EXT node itself - reach the mask via its own
+    // src[3] (see ggml_flash_attn_ext) and read its own output directly,
+    // then compute the same attention from scratch using the
+    // already-captured (and already-verified-correct) Q/K/V and diff.
+    if (self->anchor_kv_diff_hits_fattn < target_step && self->anchor_kv_diff_name_fattn == t->name) {
+        self->anchor_kv_diff_hits_fattn++;
+        if (self->anchor_kv_diff_hits_fattn == target_step) {
+            self->anchor_kv_debug_reference_attn(t);
+        }
     }
 
     auto satisfied = [target_step](const std::vector<float> & ref, int hits) {
@@ -2581,13 +2633,154 @@ bool llama_kv_cache::anchor_kv_debug_eval_cb(ggml_tensor * t, bool ask, void * u
     if (satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_k) &&
         satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_v) &&
         satisfied(self->anchor_kv_diff_ref_k, self->anchor_kv_diff_hits_get_k) &&
-        satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_get_v)) {
+        satisfied(self->anchor_kv_diff_ref_v, self->anchor_kv_diff_hits_get_v) &&
+        self->anchor_kv_diff_hits_q     >= target_step &&
+        self->anchor_kv_diff_hits_fattn >= target_step) {
         llama_cparams * mutable_cparams = const_cast<llama_cparams *>(self->anchor_cparams);
         mutable_cparams->cb_eval           = nullptr;
         mutable_cparams->cb_eval_user_data = nullptr;
     }
 
     return true;
+}
+
+void llama_kv_cache::anchor_kv_debug_reference_attn(const ggml_tensor * fattn_node) {
+    if (anchor_kv_diff_captured_q.empty() || anchor_kv_diff_captured_k.empty() || anchor_kv_diff_captured_v.empty()) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: missing Q/K/V capture, skipping reference-attention check\n",
+                __func__);
+        return;
+    }
+
+    const ggml_tensor * mask_t = fattn_node->src[3];
+    if (!mask_t) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: FLASH_ATTN_EXT node has no mask, skipping\n", __func__);
+        return;
+    }
+
+    const int64_t D_v      = fattn_node->ne[0];
+    const int64_t n_head_q = fattn_node->ne[1];
+    const int64_t n_tokens = fattn_node->ne[2];
+    const int64_t n_stream = fattn_node->ne[3];
+
+    if (n_stream != 1) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: reference-attention check only supports n_stream==1 "
+                "(got %lld) - skipping\n", __func__, (long long) n_stream);
+        return;
+    }
+    if (anchor_kv_diff_q_n_heads != n_head_q || anchor_kv_diff_q_n_tokens != n_tokens) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: captured Q shape (heads=%lld tokens=%lld) doesn't match "
+                "FLASH_ATTN_EXT node (heads=%lld tokens=%lld) - skipping\n", __func__,
+                (long long) anchor_kv_diff_q_n_heads, (long long) anchor_kv_diff_q_n_tokens,
+                (long long) n_head_q, (long long) n_tokens);
+        return;
+    }
+
+    const int64_t D_q       = anchor_kv_diff_q_head_dim;
+    const int64_t D         = anchor_kv_diff_head_dim; // D_k == D_v for this (non-MLA) model
+    const int64_t n_head_kv = anchor_kv_diff_n_heads_kv;
+    const int64_t n_kv      = anchor_kv_diff_captured_n_kv;
+
+    if (D_q != D || n_head_q % n_head_kv != 0 || n_kv <= 0) {
+        LLAMA_LOG_WARN("%s: ANCHOR_KV_GRAPH_DIFF: shape mismatch (D_q=%lld D=%lld n_head_q=%lld n_head_kv=%lld "
+                "n_kv=%lld) - skipping reference-attention check\n", __func__,
+                (long long) D_q, (long long) D, (long long) n_head_q, (long long) n_head_kv, (long long) n_kv);
+        return;
+    }
+    const int64_t n_group = n_head_q / n_head_kv;
+
+    // ggml_flash_attn_ext packs {scale, max_bias, logit_softcap} into
+    // op_params via ggml_set_op_params - read scale directly (the accessor
+    // helper is ggml-internal, not part of the public API this file links).
+    float scale;
+    memcpy(&scale, fattn_node->op_params, sizeof(float));
+
+    std::vector<ggml_fp16_t> mask_raw(ggml_nelements(mask_t));
+    ggml_backend_tensor_get(mask_t, mask_raw.data(), 0, mask_raw.size() * sizeof(ggml_fp16_t));
+
+    std::vector<float> real_out(ggml_nelements(fattn_node));
+    ggml_backend_tensor_get(fattn_node, real_out.data(), 0, real_out.size() * sizeof(float));
+
+    const std::vector<float> & Q = anchor_kv_diff_captured_q;
+    const std::vector<float> & K = anchor_kv_diff_captured_k;
+    const std::vector<float> & V = anchor_kv_diff_captured_v;
+
+    LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF: computing reference attention from scratch - "
+            "n_head_q=%lld n_head_kv=%lld D=%lld n_kv=%lld n_tokens=%lld scale=%.6g\n",
+            __func__, (long long) n_head_q, (long long) n_head_kv, (long long) D, (long long) n_kv,
+            (long long) n_tokens, (double) scale);
+
+    // Sanity check the mask itself: does it actually ALLOW attending into
+    // the compressed [0, S) range, or does it incorrectly block it (which
+    // would starve the model of prompt context regardless of how accurate
+    // the reconstruction is - fitting the observed symptom that gibberish
+    // is identical across every compression ratio tested, including
+    // near-lossless).
+    {
+        const int64_t S = (int64_t) anchor_kv_diff_ref_k.size() / (n_head_kv * D);
+        auto mv = [&](int64_t j) { return (double) ggml_fp16_to_fp32(mask_raw[j]); };
+        LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF: mask sanity (tok=0): mask[0]=%.4g mask[S/2=%lld]=%.4g "
+                "mask[S-1=%lld]=%.4g mask[S(newest)=%lld]=%.4g mask[n_kv-1=%lld]=%.4g\n",
+                __func__, mv(0), (long long) (S / 2), mv(S / 2), (long long) (S - 1), mv(S - 1),
+                (long long) S, mv(S), (long long) (n_kv - 1), mv(n_kv - 1));
+    }
+
+    double max_abs = 0.0, sum_abs = 0.0, max_ref_val = 0.0, max_real_val = 0.0;
+    int64_t max_tok = -1, max_hq = -1, max_d = -1;
+    std::vector<double> scores(n_kv);
+
+    for (int64_t tok = 0; tok < n_tokens; tok++) {
+        for (int64_t hq = 0; hq < n_head_q; hq++) {
+            const int64_t hkv = hq / n_group;
+
+            double max_score = -std::numeric_limits<double>::infinity();
+            for (int64_t j = 0; j < n_kv; j++) {
+                double dot = 0.0;
+                const size_t q_off = (size_t) tok * n_head_q * D + (size_t) hq * D;
+                const size_t k_off = (size_t) j   * n_head_kv * D + (size_t) hkv * D;
+                for (int64_t d = 0; d < D; d++) {
+                    dot += (double) Q[q_off + d] * (double) K[k_off + d];
+                }
+                const double mv = (double) ggml_fp16_to_fp32(mask_raw[(size_t) tok * n_kv + j]);
+                const double s  = dot * scale + mv;
+                scores[j] = s;
+                max_score = std::max(max_score, s);
+            }
+
+            double sum_exp = 0.0;
+            for (int64_t j = 0; j < n_kv; j++) {
+                scores[j] = std::exp(scores[j] - max_score);
+                sum_exp += scores[j];
+            }
+
+            const size_t out_off = (size_t) tok * n_head_q * D_v + (size_t) hq * D_v;
+            for (int64_t d = 0; d < D_v; d++) {
+                double acc = 0.0;
+                for (int64_t j = 0; j < n_kv; j++) {
+                    const size_t v_off = (size_t) j * n_head_kv * D_v + (size_t) hkv * D_v + d;
+                    acc += scores[j] * (double) V[v_off];
+                }
+                const double ref_val  = acc / sum_exp;
+                const double real_val = real_out[out_off + d];
+                const double diff = std::fabs(ref_val - real_val);
+                sum_abs += diff;
+                if (diff > max_abs) {
+                    max_abs      = diff;
+                    max_ref_val  = ref_val;
+                    max_real_val = real_val;
+                    max_tok      = tok;
+                    max_hq       = hq;
+                    max_d        = d;
+                }
+            }
+        }
+    }
+
+    const size_t total = (size_t) n_tokens * n_head_q * D_v;
+    LLAMA_LOG_INFO("%s: ANCHOR_KV_GRAPH_DIFF REFERENCE-ATTN %s: mean_abs_diff=%.6g max_abs_diff=%.6g "
+            "at tok=%lld head=%lld dim=%lld (real=%.6g ref=%.6g)\n",
+            __func__, fattn_node->name, sum_abs / total, max_abs,
+            (long long) max_tok, (long long) max_hq, (long long) max_d,
+            max_real_val, max_ref_val);
 }
 
 void llama_kv_cache::anchor_kv_free_dense() {
