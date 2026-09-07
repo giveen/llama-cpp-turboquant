@@ -1627,15 +1627,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // KVarN's graph topology (how many set_1d_inplace/seal/cpy nodes cpy_k/
-    // cpy_v emit, and the destination byte offsets baked into them) depends
-    // on host-side position state (tail_count0/n_sealed0, derived from
-    // sinfo.idxs[0][0]) that llm_graph_params/can_reuse know nothing about -
-    // two ubatches with identical shape but different positions produce
-    // graphs that look reusable but write to different places. Reusing the
-    // previous graph would skip rebuilding those nodes entirely, silently
-    // replaying stale destination offsets against new input data. Force a
-    // rebuild on every call for kvarn-active contexts instead.
-    if (!graph_reuse_disable && !cparams.kvarn_active && res->can_reuse(gparams)) {
+    // cpy_v emit, and the destination byte offsets baked into them) USED TO
+    // depend on host-side position state (tail_count0/n_sealed0, derived
+    // from sinfo.idxs[0][0]) that llm_graph_params/can_reuse know nothing
+    // about - two ubatches with identical shape but different positions
+    // would produce graphs that look reusable but write to different
+    // places, and reusing the previous graph would silently replay stale
+    // destination offsets against new input data. Fixed by GGML_OP_KVARN_
+    // STORE/MATERIALIZE/ATTN_DECODE (see the KVarN graph-reuse plan doc):
+    // every kvarn op is now a single fixed-topology node regardless of
+    // position, deriving position-dependent decisions from k_idxs/v_idxs'
+    // actual tensor VALUES at kernel execution time - the same input
+    // tensors set_input_k_idxs/v_idxs already keeps correctly refreshed on
+    // every call, reused graph or not. No kvarn-specific carve-out needed
+    // here any more; kvarn-active contexts take the same reuse path every
+    // other cache type does.
+    if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
