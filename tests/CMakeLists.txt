@@ -354,6 +354,9 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 # TurboQuant WHT round-trip test (links ggml turbo codec symbols via llama)
 llama_build_and_test(test-turbo-quant.c LABEL "turbo")
 
+# KVarN CPU codec round-trip test (links ggml kvarn codec symbols via llama)
+llama_build_and_test(test-kvarn-quant.c LABEL "turbo")
+
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
     llama_build_and_test(test-gguf.cpp)
