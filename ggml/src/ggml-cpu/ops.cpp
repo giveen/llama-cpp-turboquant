@@ -11602,6 +11602,108 @@ void ggml_compute_forward_kvarn_attn_decode(
     }
 }
 
+// ggml_compute_forward_kvarn_store
+//
+// Fixed-topology write, safe under graph reuse (see ggml_kvarn_store's doc
+// comment in ggml.h): reads the absolute starting position from `idxs`'s
+// actual value at execution time, rather than from op_params baked at
+// graph-build time. Seals whichever 128-token groups this call completes
+// (0 or more - a single large prefill ubatch can complete many at once)
+// using the same per-tile math ggml_compute_forward_kvarn_seal uses, then
+// writes the leftover rows into the persistent tail. `dst` is a view of
+// `tail` (dst->data aliases it) - the in-place tail update below copies out
+// the old tail rows it still needs to read before overwriting any of them,
+// same as ggml_compute_forward_set_1d_inplace-style ops must.
+//
+// Single-threaded for now (matches SEAL/MATERIALIZE/ATTN_DECODE's existing
+// CPU reference kernels - correctness-focused, not the hot path; the CUDA
+// kernel is where real decode/prefill throughput comes from).
+
+void ggml_compute_forward_kvarn_store(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * cur    = dst->src[0]; // [128, n_head_kv, n_tokens] F32, rotated
+    const ggml_tensor * idxs   = dst->src[1]; // [n_tokens] I64
+    const ggml_tensor * sealed = dst->src[3]; // [tile_bytes, n_groups_max, n_head_kv] I8, persistent
+
+    int32_t key_bits, value_bits, sinkhorn_iters, is_v, max_groups_per_call;
+    memcpy(&key_bits,            dst->op_params + 0, sizeof(int32_t));
+    memcpy(&value_bits,          dst->op_params + 1, sizeof(int32_t));
+    memcpy(&sinkhorn_iters,      dst->op_params + 2, sizeof(int32_t));
+    memcpy(&is_v,                dst->op_params + 3, sizeof(int32_t));
+    memcpy(&max_groups_per_call, dst->op_params + 4, sizeof(int32_t));
+
+    const int64_t n_head_kv = cur->ne[1];
+    const int64_t n_tokens  = cur->ne[2];
+
+    const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
+    const int bits = is_v ? value_bits : key_bits;
+
+    const int64_t * idxs_data = (const int64_t *) idxs->data;
+    const int64_t pos0 = n_tokens > 0 ? idxs_data[0] : 0;
+    const uint32_t tail_count0 = (uint32_t) (pos0 % 128);
+    const uint32_t n_sealed0   = (uint32_t) (pos0 / 128);
+
+    const int64_t total_rows      = (int64_t) tail_count0 + n_tokens;
+    const int64_t n_complete      = total_rows / 128;
+    const uint32_t tail_count_end = (uint32_t) (total_rows % 128);
+
+    GGML_ASSERT(n_complete <= max_groups_per_call &&
+            "kvarn_store: host-computed max_groups_per_call was too small for this call's actual position/n_tokens");
+
+    const float * cur_data    = (const float *) cur->data;
+    float       * tail_data   = (float *) dst->data; // dst aliases tail's buffer (view)
+    uint8_t     * sealed_data = (uint8_t *) sealed->data;
+
+    const int64_t cur_head_floats  = cur->nb[1] / sizeof(float);
+    const int64_t cur_token_floats = cur->nb[2] / sizeof(float);
+    const size_t  sealed_head_stride = (size_t) sealed->nb[2];
+    const size_t  tile_bytes = layout.tile_bytes;
+
+    std::vector<float> old_tail((size_t) tail_count0 * 128);
+
+    for (int64_t h = 0; h < n_head_kv; h++) {
+        float * tail_h = tail_data + (size_t) h * 128 * 128;
+
+        if (tail_count0 > 0) {
+            memcpy(old_tail.data(), tail_h, (size_t) tail_count0 * 128 * sizeof(float));
+        }
+
+        auto stream_row = [&](int64_t r, float * out_row) {
+            if (r < (int64_t) tail_count0) {
+                memcpy(out_row, old_tail.data() + r * 128, 128 * sizeof(float));
+            } else {
+                const int64_t tok = r - tail_count0;
+                const float * src = cur_data + h * cur_head_floats + tok * cur_token_floats;
+                memcpy(out_row, src, 128 * sizeof(float));
+            }
+        };
+
+        float tile[128 * 128];
+        for (int64_t g = 0; g < n_complete; g++) {
+            for (int64_t r = 0; r < 128; r++) {
+                stream_row(g * 128 + r, tile + r * 128);
+            }
+
+            const uint32_t group_idx = n_sealed0 + (uint32_t) g;
+            uint8_t * record = sealed_data + (size_t) h * sealed_head_stride + (size_t) group_idx * tile_bytes;
+            if (is_v) {
+                kvarn_quantize_v_tile(tile, sinkhorn_iters, bits, &layout, record);
+            } else {
+                kvarn_quantize_k_tile(tile, sinkhorn_iters, bits, &layout, record);
+            }
+        }
+
+        for (uint32_t r = 0; r < tail_count_end; r++) {
+            stream_row(n_complete * 128 + (int64_t) r, tail_h + (size_t) r * 128);
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

@@ -289,18 +289,6 @@ private:
         // to advance this host-side bookkeeping as ubatches are processed.
         mutable std::vector<uint32_t> kvarn_tail_count; // per head, tokens currently in the tail (0..127)
         mutable std::vector<uint32_t> kvarn_n_sealed;   // per head, sealed groups so far
-
-        // Per head, one entry per K group completed (tail_count0+n_tokens
-        // crossed a 128-token boundary) during the current cpy_k call, in
-        // order, each a VIEW into that call's own freshly-assembled scratch
-        // buffer (see cpy_kvarn) - never overwritten by a later group in the
-        // same call, unlike writing every group into the single recycled
-        // kvarn_k_tail/v_tail buffer would be. cpy_k repopulates this list
-        // from scratch each call (cleared, then appended to in completion
-        // order); cpy_v consumes it in the same order for its own
-        // completions, which are guaranteed to line up 1:1 since K and V
-        // process identical (tail_count0, n_tokens) for a given ubatch.
-        mutable std::vector<std::vector<ggml_tensor *>> kvarn_k_seal_ready;
     };
 
     bool v_trans = true;  // the value tensor is transposed

@@ -589,6 +589,7 @@ extern "C" {
         GGML_OP_KVARN_SEAL,
         GGML_OP_KVARN_MATERIALIZE,
         GGML_OP_KVARN_ATTN_DECODE,
+        GGML_OP_KVARN_STORE,
 
         GGML_OP_UNARY,
 
@@ -2669,6 +2670,53 @@ extern "C" {
             int                   n_total,
             int                   tail_count,
             float                 kq_scale);
+
+    // KVarN: write one call's worth of tokens into a layer's tail/sealed
+    // storage, sealing any 128-token group(s) it completes. Fixed-shape
+    // output (a view of `tail`) and op_params containing only n_tokens-
+    // derived constants regardless of `idxs`'s actual position values -
+    // unlike GGML_OP_KVARN_SEAL (still used by the CPU reference oracle
+    // path / older call sites during the transition), this op is safe
+    // under llama.cpp's graph-reuse optimization: everything position-
+    // dependent (how many groups this call completes, and where) is
+    // derived from `idxs`'s tensor VALUES at kernel execution time, which
+    // graph-reuse correctly re-patches every call, instead of being baked
+    // into op_params at graph-BUILD time (which graph-reuse does not
+    // re-evaluate on a reused graph - see the KVarN graph-reuse plan doc
+    // for the bug class this replaces).
+    //
+    // `cur` must already be Hadamard-rotated (ggml_turbo_wht, direction=0,
+    // group_size=128, applied once to the whole [128, n_head_kv, n_tokens]
+    // tensor by the caller - ne[0]==128 already, so no per-head slicing is
+    // needed for that step).
+    //
+    // key_bits/value_bits are both required even for a V-only call: they
+    // determine the shared per-group record layout (kvarn_make_layout),
+    // since K's and V's sub-fields live in one combined record even though
+    // this op only ever writes its own side's sub-fields (`is_v` selects
+    // which). K's and V's ggml_kvarn_store calls for the same ubatch have
+    // no data dependency on each other (each only reads its own `cur`/
+    // `tail` and writes disjoint byte ranges of `sealed`) - correct
+    // ordering relative to this same call's later reads (get_kvarn /
+    // build_attn_decode_kvarn) comes from build_attn already inserting
+    // cpy_k/cpy_v's nodes into the graph before those read-side nodes.
+    //
+    // max_groups_per_call is a host-computed UPPER BOUND on how many
+    // 128-token groups this call could possibly complete (n_tokens/128+2),
+    // used only to size the kernel's internal loop/launch geometry - it is
+    // a pure function of n_tokens (part of the graph's topology-determining
+    // params), never of position, so baking it into op_params is safe.
+    GGML_API struct ggml_tensor * ggml_kvarn_store(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,     // [128, n_head_kv, n_tokens] F32, rotated
+            struct ggml_tensor  * idxs,    // [n_tokens] I64, absolute position (k_idxs/v_idxs)
+            struct ggml_tensor  * tail,    // [128, 128, n_head_kv] F32, persistent
+            struct ggml_tensor  * sealed,  // [tile_bytes, n_groups_max, n_head_kv] I8, persistent
+            int                   key_bits,
+            int                   value_bits,
+            int                   sinkhorn_iters,
+            int                   is_v,
+            int                   max_groups_per_call);
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

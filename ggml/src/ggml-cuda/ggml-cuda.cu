@@ -2356,6 +2356,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_KVARN_ATTN_DECODE:
             ggml_cuda_op_kvarn_attn_decode(ctx, dst);
             break;
+        case GGML_OP_KVARN_STORE:
+            ggml_cuda_op_kvarn_store(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -5447,6 +5450,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I8 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32;
+        case GGML_OP_KVARN_STORE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I64 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_I8 &&
+                   op->src[0]->ne[0] == 128;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:

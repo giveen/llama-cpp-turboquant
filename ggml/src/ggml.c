@@ -1152,6 +1152,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KVARN_SEAL",
     "KVARN_MATERIALIZE",
     "KVARN_ATTN_DECODE",
+    "KVARN_STORE",
 
     "UNARY",
 
@@ -1169,7 +1170,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1271,6 +1272,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kvarn_seal(k_tail, v_tail)",
     "kvarn_materialize(sealed, tail)",
     "kvarn_attn_decode(q, sealed, k_tail, v_tail)",
+    "kvarn_store(cur, idxs, tail, sealed)",
 
     "unary(x)",
 
@@ -1288,7 +1290,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6541,6 +6543,53 @@ struct ggml_tensor * ggml_kvarn_attn_decode(
     memcpy(result->op_params + 4, &n_total,           sizeof(int32_t));
     memcpy(result->op_params + 5, &tail_count,        sizeof(int32_t));
     memcpy(result->op_params + 6, &kq_scale,          sizeof(float));
+
+    return result;
+}
+
+// ggml_kvarn_store
+//
+// Fixed-topology write: one node per (layer, side) call regardless of how
+// many 128-token groups the call completes. See the doc comment on the
+// declaration (ggml.h) for the invariant this exists to protect: op_params
+// here must only ever hold values derivable from n_tokens/config, never
+// from `idxs`'s actual position values - the kernel reads position from
+// `idxs` itself, at execution time, which graph-reuse correctly re-patches
+// every call (unlike op_params, baked once at graph-build time).
+
+struct ggml_tensor * ggml_kvarn_store(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * idxs,
+        struct ggml_tensor  * tail,
+        struct ggml_tensor  * sealed,
+        int                   key_bits,
+        int                   value_bits,
+        int                   sinkhorn_iters,
+        int                   is_v,
+        int                   max_groups_per_call) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && cur->ne[0] == 128);
+    GGML_ASSERT(ggml_is_contiguous(cur));
+    GGML_ASSERT(idxs->type == GGML_TYPE_I64 && idxs->ne[0] == cur->ne[2]);
+    GGML_ASSERT(tail->type == GGML_TYPE_F32 && tail->ne[0] == 128 && tail->ne[1] == 128);
+    GGML_ASSERT(tail->ne[2] == cur->ne[1] && "tail's head count must match cur's");
+    GGML_ASSERT(sealed->type == GGML_TYPE_I8 && sealed->ne[2] == cur->ne[1]);
+    GGML_ASSERT(ggml_is_contiguous(tail) && ggml_is_contiguous(sealed));
+    GGML_ASSERT(max_groups_per_call >= 1 && sinkhorn_iters > 0);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, tail);
+
+    result->op     = GGML_OP_KVARN_STORE;
+    result->src[0] = cur;
+    result->src[1] = idxs;
+    result->src[2] = tail;
+    result->src[3] = sealed;
+
+    ggml_set_op_params_i32(result, 0, key_bits);
+    ggml_set_op_params_i32(result, 1, value_bits);
+    ggml_set_op_params_i32(result, 2, sinkhorn_iters);
+    ggml_set_op_params_i32(result, 3, is_v);
+    ggml_set_op_params_i32(result, 4, max_groups_per_call);
 
     return result;
 }

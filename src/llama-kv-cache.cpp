@@ -453,7 +453,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, nullptr, nullptr, nullptr, 0, 0, 0, {}, {}, {} });
+        layers.push_back({ il, k, v, k_stream, v_stream, nullptr, nullptr, nullptr, 0, 0, 0, {}, {} });
 
         if (kvarn_active) {
             GGML_ASSERT(n_embd_head_k == 128 && n_embd_head_v == 128 && "KVarN v1 requires head_dim == 128");
@@ -478,8 +478,6 @@ llama_kv_cache::llama_kv_cache(
             ggml_format_name(layer.kvarn_k_tail, "cache_%skvarn_k_tail_l%d", name_tag, il);
             ggml_format_name(layer.kvarn_v_tail, "cache_%skvarn_v_tail_l%d", name_tag, il);
             ggml_format_name(layer.kvarn_sealed, "cache_%skvarn_sealed_l%d", name_tag, il);
-
-            layer.kvarn_k_seal_ready.resize(n_head_kv);
         }
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
@@ -1585,15 +1583,31 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 // rotated - matches how build_attn calls cpy_k/cpy_v with plain k_cur/v_cur;
 // turbo's own rotation happens inside its SET_ROWS backend kernel, invisible
 // at this level) into this layer's tail, sealing any group that completes.
-// Applies the per-token Hadamard rotation itself, reusing ggml_turbo_wht
-// (direction=0, group=128) rather than adding a third custom op - SEAL's
-// Sinkhorn balancing only cares about the statistics of whatever floats are
-// in the tail, not which orthonormal rotation produced them, so sharing
-// turbo's (sign-randomized) transform instead of kvarn_hadamard_128's plain
-// one changes nothing about correctness, only which valid rotation is used.
-// Called once for K then once for V per ubatch, always in that order (matches
-// build_attn) - the V call's seal depends on that order to see K's freshly
-// -written tail node from the same graph.
+//
+// Builds exactly ONE ggml_kvarn_store node regardless of how many groups
+// this call completes (0 or more - a single large prefill ubatch can cross
+// many 128-token boundaries at once): the per-group looping and the
+// decision of where each completed group's destination is now happen
+// *inside* GGML_OP_KVARN_STORE's kernel, driven by `idxs`'s actual tensor
+// VALUE at execution time. This is what makes the op safe under
+// llama.cpp's graph-reuse optimization - see the KVarN graph-reuse plan
+// doc for the two bugs this replaced:
+//   (1) a variable number of host-built GGML_OP_KVARN_SEAL/ggml_cpy nodes
+//       per call (topology depended on position, which isn't part of
+//       gparams - a reused graph from a call that completed a different
+//       number of groups was silently wrong), and
+//   (2) op_params values (n_total/tail_count on the read side) baked from
+//       host counters at graph-build time, never re-evaluated on reuse.
+// This function only fixes (1) for the write side; (2) - get_kvarn's and
+// build_attn_decode_kvarn's op_params - is a separate, not-yet-done phase
+// (graph reuse for kvarn-active contexts stays disabled until both sides
+// are fixed - see llama_context::process_ubatch).
+//
+// Applies the per-token Hadamard rotation via ggml_turbo_wht (direction=0,
+// group=128) applied ONCE to the whole `cur` tensor rather than per-head:
+// group_size=128 already matches cur's ne[0], so every (head, token) 128
+// -vector rotates independently regardless of the higher dims - no need
+// to slice per head first the way the old per-head loop did.
 ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v, uint32_t pos0) const {
     const int32_t ikv = map_layer_ids.at(il);
     const kv_layer & clayer = layers[ikv];
@@ -1610,152 +1624,40 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
     const int32_t key_bits   = (int32_t) layer.kvarn_key_bits;
     const int32_t value_bits = (int32_t) layer.kvarn_value_bits;
 
-    const size_t tail_row_bytes  = 128 * sizeof(float);
-    const size_t tail_head_bytes = 128 * tail_row_bytes;
+    if (!ggml_is_contiguous(cur)) {
+        cur = ggml_cont(ctx, cur);
+    }
+    ggml_tensor * cur_rot = ggml_turbo_wht(ctx, cur, /*direction=*/0, 128, nullptr);
 
-    // Derive starting state from the absolute position (sinfo.idxs[0][0] at
-    // the call site), NOT from layer.kvarn_tail_count/n_sealed directly:
-    // llama_context::sched_reserve() builds several speculative graphs with
-    // hypothetical (non-monotonic, often large) ubatch sizes purely to size
-    // compute buffers, calling this function repeatedly outside any real
-    // decode sequence. An accumulating counter overflows kvarn_sealed's fixed
-    // capacity after a couple of those dry runs; deriving from pos0 instead
-    // makes repeated calls at the same position idempotent (matches how
-    // find_slot/v_cells are already reserve-safe), while still advancing
-    // correctly across genuine sequential decode, since pos0 there strictly
-    // increases exactly as the old counter would have.
-    const uint32_t tail_count0 = pos0 % 128;
-    const uint32_t n_sealed0   = pos0 / 128;
+    // Upper bound on groups this call could complete, purely a function of
+    // n_tokens (part of the graph's topology-determining params, safe to
+    // bake) - matches graph_max_nodes()'s own headroom formula for the same
+    // reason. The kernel asserts against this at runtime as a sanity check.
+    const int32_t max_groups_per_call = (int32_t) (n_tokens / 128 + 2);
 
-    ggml_tensor * result   = nullptr;
-    ggml_tensor * chain    = nullptr; // see `link` below
-    ggml_tensor * fallback = nullptr;
+    ggml_tensor * result = ggml_kvarn_store(ctx, cur_rot, idxs, tail_base, layer.kvarn_sealed,
+            key_bits, value_bits, /*sinkhorn_iters=*/16, is_v ? 1 : 0, max_groups_per_call);
 
-    // ggml_build_forward_expand only walks ANCESTORS of the single tensor it
-    // is given - anything produced here that isn't reachable that way is
-    // silently never scheduled or executed (confirmed against ggml.c's
-    // implementation), not merely "dropped from an optimization". The
-    // original version of this function reassigned a single `result`
-    // variable inside nested per-head/per-group loops with no dependency
-    // edge between successive iterations' writes, so only the LAST group of
-    // the LAST head ever actually ran - every earlier head's tail write and
-    // every earlier group's seal were quietly no-ops. `link` threads every
-    // write that has no other downstream consumer in this graph (tail
-    // writes always; seal writes, which nothing else reads afterward) onto
-    // one chain via an unused src slot, so the single tensor this function
-    // returns transitively reaches all of them.
-    auto link = [&](ggml_tensor * node) {
-        if (chain) {
-            node->src[GGML_MAX_SRC - 2] = chain;
-        }
-        chain  = node;
-        result = node;
-    };
+    // Host-side bookkeeping: still derived from pos0 (not accumulated),
+    // for the same reserve-safety reason as before (llama_context::
+    // sched_reserve's speculative dry-run graphs at hypothetical ubatch
+    // sizes must not corrupt real state) - kept only for get_kvarn's/
+    // build_attn_decode_kvarn's op_params sizing on the immediately
+    // -following read within this same (non-reused) build. Phase 2 of the
+    // graph-reuse plan replaces this read-side usage with the same
+    // on-device derivation used above; until then these fields are not
+    // meaningful across a *reused* graph, which is exactly why reuse stays
+    // disabled for kvarn-active contexts for now.
+    const uint32_t tail_count0    = pos0 % 128;
+    const uint32_t n_sealed0      = pos0 / 128;
+    const int64_t  total_rows     = (int64_t) tail_count0 + n_tokens;
+    const int64_t  n_complete     = total_rows / 128;
+    const uint32_t tail_count_end = (uint32_t) (total_rows % 128);
 
     for (int64_t h = 0; h < n_head_kv; h++) {
-        // fresh view rooted at the persistent base tensor - a node from the
-        // previous ubatch's (now freed) graph would be dangling.
-        ggml_tensor * tail_view = ggml_view_2d(ctx, tail_base, 128, 128, tail_row_bytes, (size_t) h * tail_head_bytes);
-
-        ggml_tensor * cur_h = ggml_cont(ctx, ggml_view_2d(ctx, cur, 128, n_tokens, cur->nb[2], (size_t) h * cur->nb[1]));
-        cur_h = ggml_turbo_wht(ctx, cur_h, /*direction=*/0, 128, nullptr);
-
-        // Assemble every row this call will touch - the still-live old tail
-        // (if any) followed by the new tokens - into one contiguous, freshly
-        // allocated buffer. A single call can complete more than one group
-        // (e.g. a 2048-token prefill crosses 16 group boundaries): writing
-        // each completed group into the single recycled tail_base, as the
-        // original code did, means group 2's write overwrites group 1's
-        // data in-place before cpy_v's seal (a separate call, running after
-        // ALL of cpy_k's groups have already been written) ever reads it -
-        // "node_track[h]" for group 1 and group 2 are different ggml_tensor
-        // objects but the SAME underlying memory. Building a per-call
-        // scratch stream instead means each completed group keeps its own,
-        // never-overwritten byte range for cpy_v to read from later.
-        const int64_t total_rows     = (int64_t) tail_count0 + n_tokens;
-        const int64_t n_complete     = total_rows / 128;
-        const uint32_t tail_count_end = (uint32_t) (total_rows % 128);
-
-        ggml_tensor * stream = cur_h;
-        if (tail_count0 > 0) {
-            ggml_tensor * old_tail = ggml_cont(ctx, ggml_view_2d(ctx, tail_view, 128, tail_count0, tail_view->nb[1], 0));
-            stream = ggml_concat(ctx, old_tail, cur_h, 1);
-        }
-        fallback = stream;
-
-        // K side: start this call's list of per-group completed-tail
-        // snapshots fresh (views into THIS call's own `stream`, so unlike
-        // the old node_track-based approach they are never overwritten by a
-        // later group in the same call). V side: walk it in the same
-        // completion order - guaranteed to line up 1:1 since K and V share
-        // the same (tail_count0, n_tokens) for a given ubatch.
-        if (!is_v) {
-            layer.kvarn_k_seal_ready[h].clear();
-        }
-
-        for (int64_t g = 0; g < n_complete; g++) {
-            ggml_tensor * group_view = ggml_view_2d(ctx, stream, 128, 128, stream->nb[1], (size_t) g * 128 * stream->nb[1]);
-
-            if (!is_v) {
-                layer.kvarn_k_seal_ready[h].push_back(group_view);
-                // Not linked here: nothing else in cpy_k's own call reads
-                // tail_base for this group again, but cpy_v's seal below
-                // (in the SEPARATE call that follows) holds a direct pointer
-                // to `group_view` as its k_node input, which transitively
-                // pulls in `stream`/`cur_h` when THAT call's own expansion
-                // runs - a second, independent ggml_build_forward_expand,
-                // not a re-walk of this one.
-            } else {
-                auto & k_ready = layer.kvarn_k_seal_ready[h];
-                GGML_ASSERT((size_t) g < k_ready.size() &&
-                        "KVarN: cpy_v sealed more groups than cpy_k completed for this head in the same call");
-                ggml_tensor * k_node = k_ready[g];
-
-                ggml_tensor * record = ggml_kvarn_seal(ctx, k_node, group_view, key_bits, value_bits, 16);
-
-                const size_t tile_bytes = layer.kvarn_sealed->nb[1];
-                const uint32_t group_idx = n_sealed0 + (uint32_t) g;
-                ggml_tensor * dst_slot = ggml_view_1d(ctx, layer.kvarn_sealed, (int64_t) tile_bytes,
-                        (size_t) h * layer.kvarn_sealed->nb[2] + (size_t) group_idx * tile_bytes);
-
-                link(ggml_cpy(ctx, record, dst_slot));
-            }
-        }
-
-        if (tail_count_end > 0) {
-            ggml_tensor * leftover = ggml_view_2d(ctx, stream, 128, tail_count_end, stream->nb[1], (size_t) n_complete * 128 * stream->nb[1]);
-            ggml_tensor * leftover_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, leftover), 128 * (int64_t) tail_count_end);
-            link(ggml_set_1d_inplace(ctx, tail_view, leftover_flat, 0));
-        }
-
         layer.kvarn_tail_count[h] = tail_count_end;
         layer.kvarn_n_sealed[h]   = n_sealed0 + (uint32_t) n_complete;
     }
-
-    // Every real call produces at least one linked write for is_v (a seal or
-    // a leftover-tail write always happens - total_rows can't simultaneously
-    // have leftover groups AND no remainder). is_v==false CAN legitimately
-    // link nothing (a perfectly group-aligned call, no leftover tail) since
-    // its group data has no consumer of its own within this call; fall back
-    // to the last head's `stream` so this function still returns a valid,
-    // non-null node to build_forward_expand in that case.
-    if (!chain) {
-        result = fallback;
-    }
-    GGML_ASSERT(result != nullptr);
-
-    // `idxs` (k_idxs/v_idxs) is built generically by build_attn for every KV
-    // layer and is unconditionally written by set_input_k_idxs/set_input_v_idxs
-    // regardless of whether this layer's cpy actually consumes it - kvarn's
-    // write path decides destination purely from host-side tail/seal state,
-    // so idxs's *value* is never read here. But leaving it fully disconnected
-    // from the graph means the scheduler treats it as unreachable and never
-    // gives it a real backend buffer, so that later write aborts. Attach it as
-    // an unused extra source (last slot, guaranteed free - ggml_set_1d_inplace
-    // and ggml_cpy each only populate src[0]/src[1]) purely to keep it live
-    // and allocated, the same idiom ggml_turbo_wht uses for its optional scale
-    // tensor in src[1].
-    result->src[GGML_MAX_SRC - 1] = idxs;
 
     return result;
 }
