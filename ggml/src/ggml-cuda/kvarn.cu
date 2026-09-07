@@ -1,4 +1,5 @@
 #include "kvarn.cuh"
+#include "kvarn-bits.cuh"
 #include "ggml-kvarn-quant.h"
 
 #include <cuda_fp16.h>
@@ -193,14 +194,8 @@ __global__ void k_kvarn_seal(
         uint8_t * row_bytes = record + payload_off + (size_t) t * (bits * KVARN_N / 8);
         const size_t row_bytes_n = (size_t) (bits * KVARN_N + 7) / 8;
         for (size_t i = 0; i < row_bytes_n; i++) row_bytes[i] = 0;
-        const uint8_t mask = (uint8_t) ((1u << bits) - 1u);
         for (int c = 0; c < KVARN_N; c++) {
-            const uint8_t value = q[c] & mask;
-            const size_t bit_offset = (size_t) c * bits;
-            for (int b = 0; b < bits; b++) {
-                const size_t dst_bit = bit_offset + b;
-                row_bytes[dst_bit / 8] |= (uint8_t) (((value >> b) & 1u) << (dst_bit % 8));
-            }
+            kvarn_pack_bits_fast(row_bytes, c, bits, q[c]);
         }
 
         // scale/zp/s_row stored SEPARATELY (not pre-multiplied) - see the
@@ -276,12 +271,7 @@ __global__ void k_kvarn_materialize(
         const uint8_t * payload = record + payload_off;
 
         for (int c = 0; c < KVARN_N; c++) {
-            const size_t bit_offset = (size_t) (r * KVARN_N + c) * bits;
-            uint8_t value = 0;
-            for (int b = 0; b < bits; b++) {
-                const size_t src_bit = bit_offset + b;
-                value = (uint8_t) (value | (((payload[src_bit / 8] >> (src_bit % 8)) & 1u) << b));
-            }
+            const uint32_t value = kvarn_unpack_bits_fast(payload, (int64_t) r * KVARN_N + c, bits);
 
             half scol_h;
             memcpy(&scol_h, record + s_col_off + (size_t) c * sizeof(half), sizeof(half));
@@ -478,14 +468,8 @@ __global__ void k_kvarn_store_seal(
         uint8_t * row_bytes = record + payload_off + (size_t) t * (bits * KVARN_N / 8);
         const size_t row_bytes_n = (size_t) (bits * KVARN_N + 7) / 8;
         for (size_t i = 0; i < row_bytes_n; i++) row_bytes[i] = 0;
-        const uint8_t mask = (uint8_t) ((1u << bits) - 1u);
         for (int c = 0; c < KVARN_N; c++) {
-            const uint8_t value = q[c] & mask;
-            const size_t bit_offset = (size_t) c * bits;
-            for (int b = 0; b < bits; b++) {
-                const size_t dst_bit = bit_offset + b;
-                row_bytes[dst_bit / 8] |= (uint8_t) (((value >> b) & 1u) << (dst_bit % 8));
-            }
+            kvarn_pack_bits_fast(row_bytes, c, bits, q[c]);
         }
 
         const half scale_h = __float2half(scale);

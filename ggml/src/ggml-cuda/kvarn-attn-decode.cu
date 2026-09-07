@@ -1,4 +1,5 @@
 #include "kvarn-attn-decode.cuh"
+#include "kvarn-bits.cuh"
 #include "ggml-kvarn-quant.h"
 
 #include <cuda_fp16.h>
@@ -120,12 +121,7 @@ __global__ void k_kvarn_attn_decode_partial(
             float dot = 0.0f;
 #pragma unroll 4
             for (int c = 0; c < KVARN_N; c++) {
-                const size_t bit_offset = (size_t) (r * KVARN_N + c) * key_bits;
-                uint8_t value = 0;
-                for (int b = 0; b < key_bits; b++) {
-                    const size_t bit = bit_offset + b;
-                    value = (uint8_t) (value | (((k_payload[bit / 8] >> (bit % 8)) & 1u) << b));
-                }
+                const uint32_t value = kvarn_unpack_bits_fast(k_payload, (int64_t) r * KVARN_N + c, key_bits);
                 const float k_val = k_ramp * ((float) value * k_scale + k_zp) * s_col_k[c];
                 dot += q_sh[c] * k_val;
             }
@@ -172,12 +168,7 @@ __global__ void k_kvarn_attn_decode_partial(
                 const float v_scale = __half2float(vscale_h);
                 const float v_zp    = __half2float(vzp_h);
                 const float v_ramp  = __half2float(vramp_h);
-                const size_t bit_offset = (size_t) (rr * KVARN_N + r) * value_bits;
-                uint8_t value = 0;
-                for (int b = 0; b < value_bits; b++) {
-                    const size_t bit = bit_offset + b;
-                    value = (uint8_t) (value | (((v_payload[bit / 8] >> (bit % 8)) & 1u) << b));
-                }
+                const uint32_t value = kvarn_unpack_bits_fast(v_payload, (int64_t) rr * KVARN_N + r, value_bits);
                 const float v_val = v_ramp * ((float) value * v_scale + v_zp) * s_col_v[r];
                 acc_local += w_row[rr] * v_val;
             }
