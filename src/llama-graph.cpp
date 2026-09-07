@@ -2899,6 +2899,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
+    ggml_tensor * cur;
+
+    if (mctx_cur->is_kvarn(il) && q_cur->ne[2] == 1) {
+        cur = mctx_cur->build_attn_decode_kvarn(ctx0, q, il, kq_scale);
+        cb(cur, "kqv_out", il);
+    } else {
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
@@ -2916,7 +2922,7 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.
@@ -2950,6 +2956,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    }
     }
 
     if (wo) {

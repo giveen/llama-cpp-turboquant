@@ -317,6 +317,9 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+    llama_build_and_test(test-kvarn-ops.cpp LABEL "turbo")
+    llama_build_and_test(test-kvarn-ops-cuda.cpp LABEL "turbo")
+    llama_build_and_test(test-kvarn-attn-decode.cpp LABEL "turbo")
 endif()
 
 # libmtmd

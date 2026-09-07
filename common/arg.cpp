@@ -2411,6 +2411,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kvarn-key-bits"}, "N",
+        "KVarN: enable variance-normalized K cache compression at N bits (2, 3, 4, 5, or 6; 0 = disabled). "
+        "EXPERIMENTAL: requires --kvarn-value-bits set to the same non-zero range, a single sequence, "
+        "a unified cache, no sliding-window attention, no MLA, and head_dim == 128 for every KV layer. "
+        "2 and 3 bits trade fidelity for size more aggressively than the 4-6 bit range and have not been "
+        "benchmarked upstream - measure quality for your use case.",
+        [](common_params & params, int value) {
+            if (value != 0 && (value < 2 || value > 6)) {
+                throw std::runtime_error("--kvarn-key-bits must be 0, or between 2 and 6");
+            }
+            params.kvarn_key_bits = value;
+        }
+    ).set_env("LLAMA_ARG_KVARN_KEY_BITS"));
+    add_opt(common_arg(
+        {"--kvarn-value-bits"}, "N",
+        "KVarN: enable variance-normalized V cache compression at N bits (2, 3, 4, 5, or 6; 0 = disabled). See --kvarn-key-bits.",
+        [](common_params & params, int value) {
+            if (value != 0 && (value < 2 || value > 6)) {
+                throw std::runtime_error("--kvarn-value-bits must be 0, or between 2 and 6");
+            }
+            params.kvarn_value_bits = value;
+        }
+    ).set_env("LLAMA_ARG_KVARN_VALUE_BITS"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

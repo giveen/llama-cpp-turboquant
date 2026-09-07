@@ -9,6 +9,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-kvarn-quant.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -1148,6 +1149,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "KVARN_SEAL",
+    "KVARN_MATERIALIZE",
+    "KVARN_ATTN_DECODE",
 
     "UNARY",
 
@@ -1165,7 +1169,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1264,6 +1268,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "kvarn_seal(k_tail, v_tail)",
+    "kvarn_materialize(sealed, tail)",
+    "kvarn_attn_decode(q, sealed, k_tail, v_tail)",
 
     "unary(x)",
 
@@ -1281,7 +1288,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6427,6 +6434,122 @@ struct ggml_tensor * ggml_turbo_wht(
     // Store direction and group_size in op_params
     memcpy(result->op_params + 0, &direction, sizeof(int));
     memcpy(result->op_params + sizeof(int), &group_size, sizeof(int));
+
+    return result;
+}
+
+// ggml_kvarn_seal
+//
+// Quantizes one completed 128-token group (K and V tiles, already
+// post-RoPE, post-Hadamard-rotated) into a single packed record. Called
+// once per layer per sealed group, from llama_kv_cache once find_slot()
+// determines a group has just completed - see ggml-kvarn-quant.c for the
+// per-tile math (kvarn_quantize_k_tile/v_tile).
+
+struct ggml_tensor * ggml_kvarn_seal(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_tail, // [128, 128] F32: 128 tokens x 128 channels
+        struct ggml_tensor  * v_tail, // [128, 128] F32
+        int                   key_bits,
+        int                   value_bits,
+        int                   sinkhorn_iters) {
+    GGML_ASSERT(k_tail->type == GGML_TYPE_F32 && v_tail->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_tail->ne[0] == 128 && k_tail->ne[1] == 128);
+    GGML_ASSERT(v_tail->ne[0] == 128 && v_tail->ne[1] == 128);
+    GGML_ASSERT(ggml_is_contiguous(k_tail) && ggml_is_contiguous(v_tail));
+
+    const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) layout.tile_bytes);
+
+    result->op     = GGML_OP_KVARN_SEAL;
+    result->src[0] = k_tail;
+    result->src[1] = v_tail;
+
+    memcpy(result->op_params + 0, &key_bits,       sizeof(int32_t));
+    memcpy(result->op_params + 1, &value_bits,     sizeof(int32_t));
+    memcpy(result->op_params + 2, &sinkhorn_iters, sizeof(int32_t));
+
+    return result;
+}
+
+// ggml_kvarn_materialize
+//
+// Reconstructs `n_total` tokens of one side (K or V, per `is_v`) into a
+// dense F32 tensor, mixing dequantized sealed groups with the still-exact
+// live tail. Called once per side per layer whenever attention needs to
+// read a kvarn-backed cache. Output stays in the rotated domain, same
+// convention as this fork's existing turbo dequantize functions.
+
+struct ggml_tensor * ggml_kvarn_materialize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sealed, // [tile_bytes, n_groups] I8 (n_groups may be 0)
+        struct ggml_tensor  * tail,   // [128, 128] F32, only the first tail_count rows are valid
+        int                   key_bits,
+        int                   value_bits,
+        int                   is_v,
+        int                   n_total,
+        int                   tail_count) {
+    GGML_ASSERT(sealed->type == GGML_TYPE_I8);
+    GGML_ASSERT(tail->type == GGML_TYPE_F32 && tail->ne[0] == 128);
+    GGML_ASSERT(ggml_is_contiguous(sealed) && ggml_is_contiguous(tail));
+    GGML_ASSERT(n_total >= 0 && tail_count >= 0 && tail_count <= 128);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, n_total > 0 ? n_total : 1);
+
+    result->op     = GGML_OP_KVARN_MATERIALIZE;
+    result->src[0] = sealed;
+    result->src[1] = tail;
+
+    memcpy(result->op_params + 0, &key_bits,   sizeof(int32_t));
+    memcpy(result->op_params + 1, &value_bits, sizeof(int32_t));
+    memcpy(result->op_params + 2, &is_v,       sizeof(int32_t));
+    memcpy(result->op_params + 3, &n_total,    sizeof(int32_t));
+    memcpy(result->op_params + 4, &tail_count, sizeof(int32_t));
+
+    return result;
+}
+
+// ggml_kvarn_attn_decode
+//
+// Fused single-token decode attention: reads sealed + tail storage directly
+// instead of materializing the full history first. See the doc comment on
+// the declaration (ggml.h) for the rotation convention this relies on.
+
+struct ggml_tensor * ggml_kvarn_attn_decode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,      // [128, n_head_q, 1] F32, rotated
+        struct ggml_tensor  * sealed, // [tile_bytes, n_groups_max, n_head_kv] I8
+        struct ggml_tensor  * k_tail, // [128, 128, n_head_kv] F32
+        struct ggml_tensor  * v_tail, // [128, 128, n_head_kv] F32
+        int                   key_bits,
+        int                   value_bits,
+        int                   n_head_kv,
+        int                   n_total,
+        int                   tail_count,
+        float                 kq_scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
+    GGML_ASSERT(sealed->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_tail->type == GGML_TYPE_F32 && v_tail->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[1] % n_head_kv == 0 && "n_head_q must be an exact multiple of n_head_kv");
+    GGML_ASSERT(ggml_is_contiguous(q));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, q->ne[1], 1);
+
+    result->op     = GGML_OP_KVARN_ATTN_DECODE;
+    result->src[0] = q;
+    result->src[1] = sealed;
+    result->src[2] = k_tail;
+    result->src[3] = v_tail;
+
+    const int32_t n_group_broadcast = (int32_t) (q->ne[1] / n_head_kv);
+    memcpy(result->op_params + 0, &key_bits,          sizeof(int32_t));
+    memcpy(result->op_params + 1, &value_bits,        sizeof(int32_t));
+    memcpy(result->op_params + 2, &n_head_kv,         sizeof(int32_t));
+    memcpy(result->op_params + 3, &n_group_broadcast, sizeof(int32_t));
+    memcpy(result->op_params + 4, &n_total,           sizeof(int32_t));
+    memcpy(result->op_params + 5, &tail_count,        sizeof(int32_t));
+    memcpy(result->op_params + 6, &kq_scale,          sizeof(float));
 
     return result;
 }

@@ -606,6 +606,11 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // KVarN: variance-normalized KV cache compression (4/5/6-bit). 0 = disabled.
+    // See llama_context_params::kvarn_key_bits for the restrictions this requires.
+    int32_t kvarn_key_bits   = 0;
+    int32_t kvarn_value_bits = 0;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

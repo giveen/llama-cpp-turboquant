@@ -2271,6 +2271,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_KVARN_SEAL:
+            {
+                ggml_compute_forward_kvarn_seal(params, tensor);
+            } break;
+        case GGML_OP_KVARN_MATERIALIZE:
+            {
+                ggml_compute_forward_kvarn_materialize(params, tensor);
+            } break;
+        case GGML_OP_KVARN_ATTN_DECODE:
+            {
+                ggml_compute_forward_kvarn_attn_decode(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2461,6 +2473,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
+        case GGML_OP_KVARN_SEAL:
+        case GGML_OP_KVARN_MATERIALIZE:
+        case GGML_OP_KVARN_ATTN_DECODE:
             {
                 n_tasks = 1;
             } break;
@@ -3206,8 +3221,11 @@ struct ggml_cplan ggml_graph_plan(
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_TURBO_WHT:
+                case GGML_OP_KVARN_SEAL:
+                case GGML_OP_KVARN_MATERIALIZE:
+                case GGML_OP_KVARN_ATTN_DECODE:
                     {
-                        cur = 0;  // no extra workspace needed
+                        cur = 0;  // no extra workspace needed (fixed-size on-stack buffers)
                     } break;
                 case GGML_OP_LIGHTNING_INDEXER:
                     {

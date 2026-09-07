@@ -19,6 +19,11 @@ struct llama_memory_params {
     ggml_type type_k;
     ggml_type type_v;
 
+    // KVarN: variance-normalized KV cache compression. 0 = disabled. See
+    // llama_context_params::kvarn_key_bits for the restrictions this requires.
+    int32_t kvarn_key_bits;
+    int32_t kvarn_value_bits;
+
     // use full-size SWA cache
     bool swa_full;
 

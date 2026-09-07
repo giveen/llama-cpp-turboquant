@@ -586,6 +586,9 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_KVARN_SEAL,
+        GGML_OP_KVARN_MATERIALIZE,
+        GGML_OP_KVARN_ATTN_DECODE,
 
         GGML_OP_UNARY,
 
@@ -2631,6 +2634,47 @@ extern "C" {
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // KVarN: quantize one completed 128-token K+V group into a packed record
+    GGML_API struct ggml_tensor * ggml_kvarn_seal(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_tail,
+            struct ggml_tensor  * v_tail,
+            int                   key_bits,
+            int                   value_bits,
+            int                   sinkhorn_iters);
+
+    // KVarN: reconstruct n_total tokens of one side (K or V) from sealed
+    // records + the live tail
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sealed,
+            struct ggml_tensor  * tail,
+            int                   key_bits,
+            int                   value_bits,
+            int                   is_v,
+            int                   n_total,
+            int                   tail_count);
+
+    // KVarN: fused single-token decode attention against sealed + tail
+    // storage directly (avoids materializing the full dequantized history to
+    // a separate buffer first). q must be [128, n_head_q, 1], already
+    // rotated (ggml_turbo_wht direction=0); result is [128, n_head_q, 1],
+    // still rotated (apply ggml_turbo_wht direction=1 to un-rotate) - same
+    // convention as the graph-level Q/output rotation turbo4 already uses.
+    // n_head_q must be an exact multiple of n_head_kv (GQA broadcast).
+    GGML_API struct ggml_tensor * ggml_kvarn_attn_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * sealed,
+            struct ggml_tensor  * k_tail,
+            struct ggml_tensor  * v_tail,
+            int                   key_bits,
+            int                   value_bits,
+            int                   n_head_kv,
+            int                   n_total,
+            int                   tail_count,
+            float                 kq_scale);
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

@@ -113,7 +113,9 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+                     int32_t    kvarn_key_bits = 0,   // 0 = disabled; see kv_layer::kvarn_key_bits
+                     int32_t    kvarn_value_bits = 0);
 
     ~llama_kv_cache() = default;
 
@@ -206,6 +208,16 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // true if this layer's K/V are stored via the KVarN sealed+tail scheme
+    // (kv_layer::kvarn_key_bits > 0) rather than as a plain type_k/type_v tensor.
+    bool is_kvarn(int32_t il) const;
+
+    // Fused single-token decode attention reading sealed+tail storage directly
+    // (see ggml_kvarn_attn_decode). Only valid when is_kvarn(il) and must be
+    // called after this ubatch's cpy_k/cpy_v so the tail/seal state reflects
+    // the token(s) just written. `q` is [128, n_head_q, 1], un-rotated.
+    ggml_tensor * build_attn_decode_kvarn(ggml_context * ctx, ggml_tensor * q, int32_t il, float kq_scale) const;
+
     //
     // preparation API
     //
@@ -259,6 +271,38 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // KVarN: per-head tail (exact F32) + sealed (packed) storage, used
+        // instead of k/v when kvarn_key_bits/kvarn_value_bits are nonzero.
+        // k/v above still get allocated as normal (currently unused, kept so
+        // every other code path that assumes non-null layer tensors - defrag,
+        // memory_breakdown, state I/O - needs no changes for this first pass).
+        // Restricted to n_seq_max==1, n_stream==1, no SWA, no MLA, head_dim==128
+        // - see the asserts at construction time.
+        ggml_tensor * kvarn_k_tail = nullptr; // [128, 128, n_head_kv] F32
+        ggml_tensor * kvarn_v_tail = nullptr; // [128, 128, n_head_kv] F32
+        ggml_tensor * kvarn_sealed = nullptr; // [tile_bytes, n_groups_max, n_head_kv] I8
+
+        uint32_t kvarn_key_bits   = 0; // 0 = kvarn disabled for this layer
+        uint32_t kvarn_value_bits = 0;
+        uint32_t kvarn_n_head_kv  = 0;
+
+        // mutable: cpy_k/cpy_v are const (see llama_kv_cache::cpy_k), but need
+        // to advance this host-side bookkeeping as ubatches are processed.
+        mutable std::vector<uint32_t> kvarn_tail_count; // per head, tokens currently in the tail (0..127)
+        mutable std::vector<uint32_t> kvarn_n_sealed;   // per head, sealed groups so far
+
+        // Per head, one entry per K group completed (tail_count0+n_tokens
+        // crossed a 128-token boundary) during the current cpy_k call, in
+        // order, each a VIEW into that call's own freshly-assembled scratch
+        // buffer (see cpy_kvarn) - never overwritten by a later group in the
+        // same call, unlike writing every group into the single recycled
+        // kvarn_k_tail/v_tail buffer would be. cpy_k repopulates this list
+        // from scratch each call (cleared, then appended to in completion
+        // order); cpy_v consumes it in the same order for its own
+        // completions, which are guaranteed to line up 1:1 since K and V
+        // process identical (tail_count0, n_tokens) for a given ubatch.
+        mutable std::vector<std::vector<ggml_tensor *>> kvarn_k_seal_ready;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -326,6 +370,12 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    // KVarN: shared implementation for cpy_k/cpy_v and get_k/get_v when
+    // kv_layer::kvarn_key_bits is nonzero (see llama-kv-cache.cpp for the
+    // group-staging design). `cur` is [128, n_head_kv, n_tokens].
+    ggml_tensor * cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v, uint32_t pos0) const;
+    ggml_tensor * get_kvarn(ggml_context * ctx, int32_t il, uint32_t n_kv, bool is_v) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -406,6 +456,9 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    bool is_kvarn(int32_t il) const;
+    ggml_tensor * build_attn_decode_kvarn(ggml_context * ctx, ggml_tensor * q, int32_t il, float kq_scale) const;
 
     // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;
