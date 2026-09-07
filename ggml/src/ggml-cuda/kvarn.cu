@@ -20,6 +20,22 @@
 
 #define KVARN_N 128
 
+// k_kvarn_seal/k_kvarn_store_seal's per-thread Sinkhorn/quantize state
+// (balanced[128], q[128], etc.) measured at REG:167-168 with STACK:128
+// (i.e. already spilling to local memory) via `cuobjdump --dump-resource-
+// usage` - at 128 threads/block that's only ~3 resident blocks/SM on a
+// 65536-register file, far under the ~48-64 warps modern SMs can host.
+// Anbeeld/beellama.cpp's KVarN fork hit the same register-bound profile in
+// its own (structurally unrelated) decode kernel and found that capping
+// registers for more resident blocks - accepting any resulting extra
+// spill - won on net (-27% kernel time, +7-8% end-to-end, per their
+// measurement). KVARN_SEAL_MIN_BLOCKS asks the compiler for the same
+// trade; verify with a real before/after measurement (tok/s and
+// `cuobjdump --dump-resource-usage`) before trusting this number, not
+// just the presence of the directive - the transferable lesson is "profile
+// registers, don't assume", not "4 is universally right".
+#define KVARN_SEAL_MIN_BLOCKS 4
+
 __device__ __forceinline__ float kvarn_clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -57,6 +73,7 @@ __device__ __forceinline__ float kvarn_cur_at(const float * tile, const float * 
 
 // One block per side. blockIdx.y selects K (0) or V (1). Both write into the
 // same output record (disjoint byte ranges: K's payload/metadata vs V's).
+__launch_bounds__(KVARN_N, KVARN_SEAL_MIN_BLOCKS)
 __global__ void k_kvarn_seal(
         const float * __restrict__ k_tail,
         const float * __restrict__ v_tail,
@@ -316,6 +333,7 @@ __global__ void k_kvarn_materialize(
 // One block per (head, candidate group slot). blockIdx.y >= the actual
 // number of groups this call completes is a normal, expected no-op (the
 // grid is sized from max_groups_per_call, a host-computed UPPER bound).
+__launch_bounds__(KVARN_N, KVARN_SEAL_MIN_BLOCKS)
 __global__ void k_kvarn_store_seal(
         const float   * __restrict__ cur,    // [128, n_head_kv, n_tokens], rotated, contiguous
         const int64_t * __restrict__ idxs,   // [n_tokens]
