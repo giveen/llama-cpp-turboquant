@@ -1,5 +1,5 @@
 // Correctness check for GGML_OP_KVARN_ATTN_DECODE: builds a synthetic
-// sealed+tail cache (1 sealed group + partial tail, 2 KV heads, 2x GQA
+// sealed+tail cache (multiple sealed groups + partial tail, 2 KV heads, 4x GQA
 // broadcast), runs the fused decode-attention op on both CPU and any
 // available GPU backend, and compares against a plain dense-attention
 // reference computed directly from the known ground-truth (pre-rotation)
@@ -67,35 +67,37 @@ static void reference_attention(
 static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
     const int head_dim   = 128;
     const int n_head_kv  = 2;
-    const int n_group_bc = 2;
+    const int n_group_bc = 4;
     const int n_head_q   = n_head_kv * n_group_bc;
+    const int n_sealed_g = 9;
     const int tail_count = 44;
-    const int n_total    = 128 + tail_count;
+    const int n_total    = n_sealed_g * 128 + tail_count;
 
     struct ggml_init_params params = { (size_t) 16 * 1024 * 1024, NULL, true };
     struct ggml_context * ctx = ggml_init(params);
 
-    struct ggml_tensor * k_tail0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
-    struct ggml_tensor * v_tail0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
     struct ggml_tensor * k_tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
     struct ggml_tensor * v_tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
     struct ggml_tensor * q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head_q, 1);
 
-    struct ggml_tensor * sealed = ggml_kvarn_seal(ctx, k_tail0, v_tail0, bits, bits, 16);
-    // seal only handles one head at a time (its own kernel loops per-block
-    // over 2 blocks: K and V for ONE head) - call it per head, writing into
-    // a combined [tile_bytes, 1, n_head_kv] tensor view.
-    // (ggml_kvarn_seal's builder always allocates fresh output, so for this
-    // multi-head test we call it once per head and assemble the combined
-    // sealed tensor via ggml_concat along dim 2.)
-    struct ggml_tensor * combined_sealed = sealed;
-    for (int h = 1; h < n_head_kv; h++) {
-        struct ggml_tensor * k_tail0_h = ggml_view_2d(ctx, k_tail0, head_dim, 128, k_tail0->nb[1], (size_t) h * k_tail0->nb[2]);
-        struct ggml_tensor * v_tail0_h = ggml_view_2d(ctx, v_tail0, head_dim, 128, v_tail0->nb[1], (size_t) h * v_tail0->nb[2]);
-        struct ggml_tensor * sealed_h  = ggml_kvarn_seal(ctx, ggml_cont(ctx, k_tail0_h), ggml_cont(ctx, v_tail0_h), bits, bits, 16);
-        combined_sealed = ggml_concat(ctx, combined_sealed, ggml_reshape_3d(ctx, sealed_h, sealed_h->ne[0], 1, 1), 2);
+    std::vector<struct ggml_tensor *> sealed_k_inputs;
+    std::vector<struct ggml_tensor *> sealed_v_inputs;
+    struct ggml_tensor * combined_sealed = nullptr;
+    for (int h = 0; h < n_head_kv; h++) {
+        struct ggml_tensor * head_sealed = nullptr;
+        for (int g = 0; g < n_sealed_g; g++) {
+            struct ggml_tensor * k_group = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, 128);
+            struct ggml_tensor * v_group = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, 128);
+            sealed_k_inputs.push_back(k_group);
+            sealed_v_inputs.push_back(v_group);
+            struct ggml_tensor * sealed_h = ggml_kvarn_seal(ctx, k_group, v_group, bits, bits, 16);
+            struct ggml_tensor * sealed_h_3d = ggml_reshape_3d(ctx, sealed_h, sealed_h->ne[0], 1, 1);
+            head_sealed = g == 0 ? sealed_h_3d : ggml_concat(ctx, head_sealed, sealed_h_3d, 1);
+        }
+        head_sealed = ggml_reshape_3d(ctx, head_sealed, head_sealed->ne[0], n_sealed_g, 1);
+        combined_sealed = h == 0 ? head_sealed : ggml_concat(ctx, combined_sealed, head_sealed, 2);
     }
-    combined_sealed = ggml_reshape_3d(ctx, combined_sealed, combined_sealed->ne[0], 1, n_head_kv);
+    combined_sealed = ggml_reshape_3d(ctx, combined_sealed, combined_sealed->ne[0], n_sealed_g, n_head_kv);
 
     const float kq_scale = 1.0f / sqrtf((float) head_dim);
     struct ggml_tensor * attn_out = ggml_kvarn_attn_decode(
@@ -107,24 +109,29 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
     std::vector<float> q_rot((size_t) head_dim * n_head_q);
     std::vector<std::vector<float>> Kh(n_head_kv, std::vector<float>((size_t) n_total * head_dim));
     std::vector<std::vector<float>> Vh(n_head_kv, std::vector<float>((size_t) n_total * head_dim));
-    std::vector<float> k_tail0_data((size_t) n_head_kv * 128 * head_dim);
-    std::vector<float> v_tail0_data((size_t) n_head_kv * 128 * head_dim);
+    std::vector<float> sealed_k_data((size_t) n_sealed_g * n_head_kv * 128 * head_dim);
+    std::vector<float> sealed_v_data((size_t) n_sealed_g * n_head_kv * 128 * head_dim);
     std::vector<float> k_tail_data((size_t) n_head_kv * 128 * head_dim, 0.0f);
     std::vector<float> v_tail_data((size_t) n_head_kv * 128 * head_dim, 0.0f);
 
     for (int h = 0; h < n_head_kv; h++) {
-        for (int t = 0; t < 128; t++) {
-            float k[128], v[128];
-            make_token_vec(k, head_dim, (unsigned) t, (unsigned) (h * 10000));
-            make_token_vec(v, head_dim, (unsigned) t, (unsigned) (h * 10000 + 1000));
-            memcpy(Kh[h].data() + (size_t) t * head_dim, k, head_dim * sizeof(float));
-            memcpy(Vh[h].data() + (size_t) t * head_dim, v, head_dim * sizeof(float));
-            hadamard_128(k); hadamard_128(v);
-            memcpy(k_tail0_data.data() + ((size_t) h * 128 + t) * head_dim, k, head_dim * sizeof(float));
-            memcpy(v_tail0_data.data() + ((size_t) h * 128 + t) * head_dim, v, head_dim * sizeof(float));
+        for (int g = 0; g < n_sealed_g; g++) {
+            for (int t = 0; t < 128; t++) {
+                const int gt = g * 128 + t;
+                float k[128], v[128];
+                make_token_vec(k, head_dim, (unsigned) gt, (unsigned) (h * 10000));
+                make_token_vec(v, head_dim, (unsigned) gt, (unsigned) (h * 10000 + 1000));
+                memcpy(Kh[h].data() + (size_t) gt * head_dim, k, head_dim * sizeof(float));
+                memcpy(Vh[h].data() + (size_t) gt * head_dim, v, head_dim * sizeof(float));
+                hadamard_128(k); hadamard_128(v);
+                memcpy(sealed_k_data.data() + ((size_t) g * n_head_kv + h) * 128 * head_dim + (size_t) t * head_dim,
+                       k, head_dim * sizeof(float));
+                memcpy(sealed_v_data.data() + ((size_t) g * n_head_kv + h) * 128 * head_dim + (size_t) t * head_dim,
+                       v, head_dim * sizeof(float));
+            }
         }
         for (int t = 0; t < tail_count; t++) {
-            const int gt = 128 + t;
+            const int gt = n_sealed_g * 128 + t;
             float k[128], v[128];
             make_token_vec(k, head_dim, (unsigned) gt, (unsigned) (h * 10000));
             make_token_vec(v, head_dim, (unsigned) gt, (unsigned) (h * 10000 + 1000));
@@ -136,6 +143,16 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
         }
     }
 
+    for (size_t i = 0; i < sealed_k_inputs.size(); i++) {
+        const size_t head = i / n_sealed_g;
+        const size_t group = i % n_sealed_g;
+        const size_t group_head = head * n_sealed_g + group;
+        ggml_backend_tensor_set(sealed_k_inputs[i],
+                sealed_k_data.data() + group_head * 128 * head_dim, 0, ggml_nbytes(sealed_k_inputs[i]));
+        ggml_backend_tensor_set(sealed_v_inputs[i],
+                sealed_v_data.data() + group_head * 128 * head_dim, 0, ggml_nbytes(sealed_v_inputs[i]));
+    }
+
     for (int qh = 0; qh < n_head_q; qh++) {
         float q_raw[128];
         make_token_vec(q_raw, head_dim, 999u, (unsigned) (qh * 777));
@@ -145,8 +162,6 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
         memcpy(q_rot.data() + (size_t) qh * head_dim, q_r, head_dim * sizeof(float));
     }
 
-    ggml_backend_tensor_set(k_tail0, k_tail0_data.data(), 0, ggml_nbytes(k_tail0));
-    ggml_backend_tensor_set(v_tail0, v_tail0_data.data(), 0, ggml_nbytes(v_tail0));
     ggml_backend_tensor_set(k_tail,  k_tail_data.data(),  0, ggml_nbytes(k_tail));
     ggml_backend_tensor_set(v_tail,  v_tail_data.data(),  0, ggml_nbytes(v_tail));
     ggml_backend_tensor_set(q,       q_rot.data(),        0, ggml_nbytes(q));

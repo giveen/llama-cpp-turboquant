@@ -5732,9 +5732,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32;
         case GGML_OP_KVARN_ATTN_DECODE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I8 &&
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I8 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32;
+                   op->src[0]->ne[0] == 128 && op->src[0]->ne[2] == 1 &&
+                   op->src[0]->ne[3] == 1 && ggml_is_contiguous(op->src[0]) &&
+                   op->src[1]->ne[2] == op->src[2]->ne[2] &&
+                   op->src[1]->ne[2] == op->src[3]->ne[2] &&
+                   op->src[1]->ne[0] > 0 && op->src[1]->ne[1] > 0 &&
+                   op->src[2]->ne[0] == 128 && op->src[2]->ne[1] == 128 &&
+                   op->src[3]->ne[0] == 128 && op->src[3]->ne[1] == 128 &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op->src[3]) &&
+                   op->op_params[0] >= 2 && op->op_params[0] <= 6 &&
+                   op->op_params[1] >= 2 && op->op_params[1] <= 6 &&
+                   op->op_params[2] > 0 && op->op_params[3] > 0 &&
+                   op->op_params[2] * op->op_params[3] == op->src[0]->ne[1] &&
+                   (op->op_params[3] == 1 || op->op_params[3] == 2 ||
+                    op->op_params[3] == 4 || op->op_params[3] == 8) &&
+                   op->op_params[4] >= op->op_params[5] && op->op_params[5] >= 0 &&
+                   op->op_params[5] < 128 &&
+                   (op->op_params[4] - op->op_params[5]) % 128 == 0 &&
+                   (op->op_params[4] - op->op_params[5]) / 128 <= op->src[1]->ne[1];
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:

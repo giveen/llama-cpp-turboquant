@@ -6,20 +6,11 @@
 // KVarN fused decode attention, split-K ("flash-decoding") version.
 //
 // v1 of this kernel used one block per Q head processing every sealed group
-// sequentially - correct, but at long context that is one block doing
-// hundreds of groups' worth of serial work while the rest of the GPU sits
-// idle (measured: 3.7-4.3x slower than the plain materialize-then-dense-
-// attend path even after removing an atomics-contention bug, see the
-// project's plan notes). The fix ported here is the same one the beellama
-// KVarN fork/upstream used to get a real win at depth: split the KV history
-// across many independent blocks (a handful of sealed groups each) so the
-// GPU actually has enough concurrent work to fill its SMs, then merge the
-// per-split partial (running max, running sum, weighted-V) results with a
-// second, tiny combine kernel using the standard online-softmax merge
-// identity. This does NOT need beellama's tensor-core MMA kernel to be a
-// real win - splitting alone turns "1 block always" into "one block per
-// GROUPS_PER_SPLIT sealed groups", which is what actually starves the GPU
-// at long context.
+// sequentially - correct, but at long context that left too little parallel
+// work. The current kernel uses one block per KV head and computes the whole
+// compile-time GQA group together, so each compressed tile is staged once and
+// reused by all query heads that share it. Split-K still divides the sealed
+// history across blocks and the combine kernel merges their partial results.
 //
 // Q must already be rotated (ggml_turbo_wht, direction=0) by the caller,
 // same as turbo4's existing graph-level convention - K/V dequantize to the
@@ -39,7 +30,30 @@
 // work, launch overhead) stays a small fraction of total work.
 #define KVARN_GROUPS_PER_SPLIT 4
 
-// One block's contribution: online-softmax state for one (q_head, split) pair.
+template<int Bits>
+__device__ __forceinline__ uint32_t kvarn_unpack_row_value(
+        const uint8_t * row, int index) {
+    static_assert(Bits >= 2 && Bits <= 6, "unsupported KVarN bit width");
+
+    if constexpr (Bits == 2) {
+        return (row[index >> 2] >> ((index & 3) * 2)) & 3u;
+    } else if constexpr (Bits == 4) {
+        return (row[index >> 1] >> ((index & 1) * 4)) & 15u;
+    } else {
+        const int bit_offset = index * Bits;
+        const int byte_offset = bit_offset >> 3;
+        const int bit_shift = bit_offset & 7;
+        const uint32_t packed =
+            (uint32_t) row[byte_offset + 0] |
+            ((uint32_t) row[byte_offset + 1] << 8) |
+            ((uint32_t) row[byte_offset + 2] << 16) |
+            ((uint32_t) row[byte_offset + 3] << 24);
+        return (packed >> bit_shift) & ((1u << Bits) - 1u);
+    }
+}
+
+// One block's contribution: online-softmax state for one KV head and its GQA group.
+template<int KeyBits, int ValueBits, int Gqa>
 __global__ void k_kvarn_attn_decode_partial(
         const float   * __restrict__ q,        // [128, n_head_q] rotated
         const uint8_t * __restrict__ sealed,    // [tile_bytes, n_groups_max, n_head_kv]
@@ -48,28 +62,40 @@ __global__ void k_kvarn_attn_decode_partial(
         float * __restrict__ partial_out,       // [n_splits, n_head_q, 128]
         float * __restrict__ partial_max,       // [n_splits, n_head_q]
         float * __restrict__ partial_sum,       // [n_splits, n_head_q]
-        int key_bits, int value_bits,
-        int n_head_kv, int n_group_broadcast, // n_head_q = n_head_kv * n_group_broadcast
         int n_groups_max, int n_total, int tail_count,
         int n_splits_sealed, // blockIdx.y in [0, n_splits_sealed) => sealed groups; == n_splits_sealed => tail
         float kq_scale,
         struct kvarn_tile_layout layout) {
-    const int q_head  = blockIdx.x;
-    const int kv_head = q_head / n_group_broadcast;
     const int split_id = blockIdx.y;
-    const int r        = threadIdx.x; // 0..127
+    const int q_slot  = threadIdx.x / KVARN_N;
+    const int r        = threadIdx.x % KVARN_N; // 0..127
+    const int q_head   = blockIdx.x * Gqa + q_slot;
+    const int kv_head  = blockIdx.x;
 
-    __shared__ float q_sh[KVARN_N];
+    __shared__ float q_sh[Gqa * KVARN_N];
     __shared__ float s_col_k[KVARN_N];
     __shared__ float s_col_v[KVARN_N];
-    __shared__ float row_score[KVARN_N];
-    __shared__ float out_acc[KVARN_N];
-    __shared__ float running_max;
-    __shared__ float running_sum;
+    __shared__ float k_scale_sh[KVARN_N];
+    __shared__ float k_zp_sh[KVARN_N];
+    __shared__ float k_ramp_sh[KVARN_N];
+    __shared__ float v_scale_sh[KVARN_N];
+    __shared__ float v_zp_sh[KVARN_N];
+    __shared__ float v_ramp_sh[KVARN_N];
+    __shared__ uint8_t k_payload_sh[KeyBits * KVARN_N * KVARN_N / 8];
+    __shared__ uint8_t v_payload_sh[ValueBits * KVARN_N * KVARN_N / 8];
+    __shared__ float row_score[Gqa * KVARN_N];
+    __shared__ float out_acc[Gqa * KVARN_N];
+    __shared__ float w_row[Gqa * KVARN_N];
+    __shared__ float running_max[Gqa];
+    __shared__ float running_sum[Gqa];
+    __shared__ float group_max[Gqa];
 
-    q_sh[r]    = q[(size_t) q_head * KVARN_N + r];
-    out_acc[r] = 0.0f;
-    if (r == 0) { running_max = -1e30f; running_sum = 0.0f; }
+    q_sh[q_slot * KVARN_N + r] = q[(size_t) q_head * KVARN_N + r];
+    out_acc[q_slot * KVARN_N + r] = 0.0f;
+    if (r == 0) {
+        running_max[q_slot] = -1e30f;
+        running_sum[q_slot] = 0.0f;
+    }
     __syncthreads();
 
     const size_t tile_bytes = layout.tile_bytes;
@@ -83,61 +109,71 @@ __global__ void k_kvarn_attn_decode_partial(
         for (int g = g_begin; g < g_end; g++) {
             const uint8_t * record = sealed_kv + (size_t) g * tile_bytes;
 
-            half h;
-            memcpy(&h, record + layout.k_s_col_off + (size_t) r * sizeof(half), sizeof(half));
-            s_col_k[r] = __half2float(h);
-            memcpy(&h, record + layout.v_s_col_off + (size_t) r * sizeof(half), sizeof(half));
-            s_col_v[r] = __half2float(h);
+            if (q_slot == 0) {
+                half h;
+                memcpy(&h, record + layout.k_s_col_off + (size_t) r * sizeof(half), sizeof(half));
+                s_col_k[r] = __half2float(h);
+                memcpy(&h, record + layout.v_s_col_off + (size_t) r * sizeof(half), sizeof(half));
+                s_col_v[r] = __half2float(h);
+                memcpy(&h, record + layout.k_s_row_off + (size_t) r * sizeof(half), sizeof(half));
+                k_scale_sh[r] = __half2float(h);
+                memcpy(&h, record + layout.k_zp_off + (size_t) r * sizeof(half), sizeof(half));
+                k_zp_sh[r] = __half2float(h);
+                memcpy(&h, record + layout.k_row_amp_off + (size_t) r * sizeof(half), sizeof(half));
+                k_ramp_sh[r] = __half2float(h);
+                memcpy(&h, record + layout.v_s_row_off + (size_t) r * sizeof(half), sizeof(half));
+                v_scale_sh[r] = __half2float(h);
+                memcpy(&h, record + layout.v_zp_off + (size_t) r * sizeof(half), sizeof(half));
+                v_zp_sh[r] = __half2float(h);
+                memcpy(&h, record + layout.v_row_amp_off + (size_t) r * sizeof(half), sizeof(half));
+                v_ramp_sh[r] = __half2float(h);
+            }
             __syncthreads();
 
-            // This row's K dot product with Q (sequential over 128 channels).
-            // scale/zp/row-amplitude are stored SEPARATELY, not pre-multiplied
-            // - see ggml-kvarn-quant.c's kvarn_quantize_tile for why (fp16
-            // overflow for real, less-well-conditioned model activations).
-            half scale_h, zp_h, ramp_h;
-            memcpy(&scale_h, record + layout.k_s_row_off   + (size_t) r * sizeof(half), sizeof(half));
-            memcpy(&zp_h,    record + layout.k_zp_off      + (size_t) r * sizeof(half), sizeof(half));
-            memcpy(&ramp_h,  record + layout.k_row_amp_off + (size_t) r * sizeof(half), sizeof(half));
-            const float k_scale = __half2float(scale_h);
-            const float k_zp    = __half2float(zp_h);
-            const float k_ramp  = __half2float(ramp_h);
-
             const uint8_t * k_payload = record + layout.k_payload_off;
+            const uint8_t * v_payload = record + layout.v_payload_off;
+            constexpr int k_payload_bytes = KeyBits * KVARN_N * KVARN_N / 8;
+            constexpr int v_payload_bytes = ValueBits * KVARN_N * KVARN_N / 8;
+            for (int i = threadIdx.x; i < k_payload_bytes; i += blockDim.x) {
+                k_payload_sh[i] = k_payload[i];
+            }
+            for (int i = threadIdx.x; i < v_payload_bytes; i += blockDim.x) {
+                v_payload_sh[i] = v_payload[i];
+            }
+            __syncthreads();
+
+            const size_t k_row_bytes = (size_t) (KeyBits * KVARN_N / 8);
+            const uint8_t * k_row_payload = k_payload_sh + (size_t) r * k_row_bytes;
             float dot = 0.0f;
 #pragma unroll 4
             for (int c = 0; c < KVARN_N; c++) {
-                const size_t bit_offset = (size_t) (r * KVARN_N + c) * key_bits;
-                uint8_t value = 0;
-                for (int b = 0; b < key_bits; b++) {
-                    const size_t bit = bit_offset + b;
-                    value = (uint8_t) (value | (((k_payload[bit / 8] >> (bit % 8)) & 1u) << b));
-                }
-                const float k_val = k_ramp * ((float) value * k_scale + k_zp) * s_col_k[c];
-                dot += q_sh[c] * k_val;
+                const uint32_t value = kvarn_unpack_row_value<KeyBits>(k_row_payload, c);
+                const float k_val = k_ramp_sh[r] * ((float) value * k_scale_sh[r] + k_zp_sh[r]) * s_col_k[c];
+                dot += q_sh[q_slot * KVARN_N + c] * k_val;
             }
-            row_score[r] = dot * kq_scale;
+            const int row_idx = q_slot * KVARN_N + r;
+            row_score[row_idx] = dot * kq_scale;
             __syncthreads();
 
             // Block-wide max over this group's 128 scores.
-            __shared__ float group_max;
+            float m = row_score[q_slot * KVARN_N];
             if (r == 0) {
-                float m = row_score[0];
-                for (int i = 1; i < KVARN_N; i++) m = fmaxf(m, row_score[i]);
-                group_max = m;
+                m = row_score[q_slot * KVARN_N];
+                for (int i = 1; i < KVARN_N; i++) m = fmaxf(m, row_score[q_slot * KVARN_N + i]);
+                group_max[q_slot] = m;
             }
             __syncthreads();
 
-            const float new_max = fmaxf(running_max, group_max);
-            const float rescale = expf(running_max - new_max);
-            out_acc[r] *= rescale; // each thread rescales its own output channel
-            __shared__ float w_row[KVARN_N];
-            w_row[r] = expf(row_score[r] - new_max);
+            const float new_max = fmaxf(running_max[q_slot], group_max[q_slot]);
+            const float rescale = expf(running_max[q_slot] - new_max);
+            out_acc[row_idx] *= rescale;
+            w_row[row_idx] = expf(row_score[row_idx] - new_max);
             __syncthreads();
             if (r == 0) {
                 float sum_local = 0.0f;
-                for (int i = 0; i < KVARN_N; i++) sum_local += expf(row_score[i] - new_max);
-                running_sum = running_sum * rescale + sum_local;
-                running_max = new_max;
+                for (int i = 0; i < KVARN_N; i++) sum_local += w_row[q_slot * KVARN_N + i];
+                running_sum[q_slot] = running_sum[q_slot] * rescale + sum_local;
+                running_max[q_slot] = new_max;
             }
             __syncthreads();
 
@@ -147,27 +183,18 @@ __global__ void k_kvarn_attn_decode_partial(
             // For a fixed loop iteration rr, adjacent threads r/r+1 read
             // adjacent bit offsets ((rr*128+r)*value_bits), so this stays
             // reasonably coalesced despite the per-thread bit-level unpacking.
-            const uint8_t * v_payload = record + layout.v_payload_off;
+            constexpr size_t v_row_bytes = (size_t) (ValueBits * KVARN_N / 8);
+            const float v_col_scale = s_col_v[r];
             float acc_local = 0.0f;
 #pragma unroll 4
             for (int rr = 0; rr < KVARN_N; rr++) {
-                half vscale_h, vzp_h, vramp_h;
-                memcpy(&vscale_h, record + layout.v_s_row_off   + (size_t) rr * sizeof(half), sizeof(half));
-                memcpy(&vzp_h,    record + layout.v_zp_off      + (size_t) rr * sizeof(half), sizeof(half));
-                memcpy(&vramp_h,  record + layout.v_row_amp_off + (size_t) rr * sizeof(half), sizeof(half));
-                const float v_scale = __half2float(vscale_h);
-                const float v_zp    = __half2float(vzp_h);
-                const float v_ramp  = __half2float(vramp_h);
-                const size_t bit_offset = (size_t) (rr * KVARN_N + r) * value_bits;
-                uint8_t value = 0;
-                for (int b = 0; b < value_bits; b++) {
-                    const size_t bit = bit_offset + b;
-                    value = (uint8_t) (value | (((v_payload[bit / 8] >> (bit % 8)) & 1u) << b));
-                }
-                const float v_val = v_ramp * ((float) value * v_scale + v_zp) * s_col_v[r];
-                acc_local += w_row[rr] * v_val;
+                const uint32_t value = kvarn_unpack_row_value<ValueBits>(
+                        v_payload_sh + (size_t) rr * v_row_bytes, r);
+                const float v_val = v_ramp_sh[rr] *
+                    ((float) value * v_scale_sh[rr] + v_zp_sh[rr]) * v_col_scale;
+                acc_local += w_row[q_slot * KVARN_N + rr] * v_val;
             }
-            out_acc[r] += acc_local;
+            out_acc[row_idx] += acc_local;
             __syncthreads();
         }
     } else {
@@ -178,55 +205,54 @@ __global__ void k_kvarn_attn_decode_partial(
         const float * v_tail_h = v_tail + (size_t) kv_head * KVARN_N * KVARN_N;
 
         if (from_tail > 0) {
+            const int tail_row_idx = q_slot * KVARN_N + r;
             float dot = 0.0f;
             const bool valid = r < from_tail;
             if (valid) {
 #pragma unroll 4
                 for (int c = 0; c < KVARN_N; c++) {
-                    dot += q_sh[c] * k_tail_h[r * KVARN_N + c];
+                    dot += q_sh[q_slot * KVARN_N + c] * k_tail_h[r * KVARN_N + c];
                 }
             }
-            row_score[r] = valid ? dot * kq_scale : -1e30f;
+            row_score[tail_row_idx] = valid ? dot * kq_scale : -1e30f;
             __syncthreads();
 
-            __shared__ float tail_max;
             if (r == 0) {
-                float m = row_score[0];
-                for (int i = 1; i < KVARN_N; i++) m = fmaxf(m, row_score[i]);
-                tail_max = m;
+                float m = row_score[q_slot * KVARN_N];
+                for (int i = 1; i < KVARN_N; i++) m = fmaxf(m, row_score[q_slot * KVARN_N + i]);
+                group_max[q_slot] = m;
             }
             __syncthreads();
 
-            const float new_max = fmaxf(running_max, tail_max);
-            const float rescale = expf(running_max - new_max);
-            out_acc[r] *= rescale;
-            __shared__ float w_row_tail[KVARN_N];
-            w_row_tail[r] = valid ? expf(row_score[r] - new_max) : 0.0f;
+            const float new_max = fmaxf(running_max[q_slot], group_max[q_slot]);
+            const float rescale = expf(running_max[q_slot] - new_max);
+            out_acc[tail_row_idx] *= rescale;
+            w_row[tail_row_idx] = valid ? expf(row_score[tail_row_idx] - new_max) : 0.0f;
             __syncthreads();
             if (r == 0) {
                 float sum_local = 0.0f;
-                for (int i = 0; i < from_tail; i++) sum_local += expf(row_score[i] - new_max);
-                running_sum = running_sum * rescale + sum_local;
-                running_max = new_max;
+                for (int i = 0; i < from_tail; i++) sum_local += w_row[q_slot * KVARN_N + i];
+                running_sum[q_slot] = running_sum[q_slot] * rescale + sum_local;
+                running_max[q_slot] = new_max;
             }
             __syncthreads();
 
             float acc_local = 0.0f;
 #pragma unroll 4
             for (int rr = 0; rr < KVARN_N; rr++) {
-                acc_local += w_row_tail[rr] * v_tail_h[rr * KVARN_N + r];
+                acc_local += w_row[q_slot * KVARN_N + rr] * v_tail_h[rr * KVARN_N + r];
             }
-            out_acc[r] += acc_local;
+            out_acc[tail_row_idx] += acc_local;
             __syncthreads();
         }
     }
 
-    const size_t out_idx = ((size_t) split_id * gridDim.x + q_head) * KVARN_N + r;
-    partial_out[out_idx] = out_acc[r];
+    const size_t out_idx = ((size_t) split_id * gridDim.x * Gqa + q_head) * KVARN_N + r;
+    partial_out[out_idx] = out_acc[q_slot * KVARN_N + r];
     if (r == 0) {
-        const size_t ms_idx = (size_t) split_id * gridDim.x + q_head;
-        partial_max[ms_idx] = running_max;
-        partial_sum[ms_idx] = running_sum;
+        const size_t ms_idx = (size_t) split_id * gridDim.x * Gqa + q_head;
+        partial_max[ms_idx] = running_max[q_slot];
+        partial_sum[ms_idx] = running_sum[q_slot];
     }
 }
 
@@ -274,6 +300,52 @@ __global__ void k_kvarn_attn_decode_combine(
     out[(size_t) q_head * KVARN_N + c] = acc / denom;
 }
 
+template<int KeyBits, int ValueBits, int Gqa>
+static void ggml_cuda_op_kvarn_attn_decode_launch(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * q, const ggml_tensor * sealed,
+        const ggml_tensor * k_tail, const ggml_tensor * v_tail,
+        int n_head_kv, int n_groups_max,
+        int n_total, int tail_count, int n_splits_sealed,
+        float kq_scale, const struct kvarn_tile_layout & layout, int n_splits_total, cudaStream_t stream) {
+    const int n_head_q = n_head_kv * Gqa;
+
+    ggml_cuda_pool_alloc<float> partial_out(ctx.pool(), (size_t) n_splits_total * n_head_q * KVARN_N);
+    ggml_cuda_pool_alloc<float> partial_max(ctx.pool(), (size_t) n_splits_total * n_head_q);
+    ggml_cuda_pool_alloc<float> partial_sum(ctx.pool(), (size_t) n_splits_total * n_head_q);
+
+    dim3 grid_partial(n_head_kv, n_splits_total);
+    dim3 block_partial(KVARN_N * Gqa);
+    k_kvarn_attn_decode_partial<KeyBits, ValueBits, Gqa><<<grid_partial, block_partial, 0, stream>>>(
+            (const float *) q->data, (const uint8_t *) sealed->data,
+            (const float *) k_tail->data, (const float *) v_tail->data,
+            partial_out.get(), partial_max.get(), partial_sum.get(),
+            n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout);
+
+    dim3 grid_combine(n_head_q);
+    dim3 block_combine(KVARN_N);
+    k_kvarn_attn_decode_combine<<<grid_combine, block_combine, 0, stream>>>(
+            partial_out.get(), partial_max.get(), partial_sum.get(),
+            (float *) dst->data, n_splits_total, n_head_q);
+}
+
+template<int KeyBits, int ValueBits>
+static void ggml_cuda_op_kvarn_attn_decode_dispatch(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * q, const ggml_tensor * sealed,
+        const ggml_tensor * k_tail, const ggml_tensor * v_tail,
+        int n_head_kv, int n_group_broadcast, int n_groups_max,
+        int n_total, int tail_count, int n_splits_sealed,
+        float kq_scale, const struct kvarn_tile_layout & layout, int n_splits_total, cudaStream_t stream) {
+    switch (n_group_broadcast) {
+        case 1: ggml_cuda_op_kvarn_attn_decode_launch<KeyBits, ValueBits, 1>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        case 2: ggml_cuda_op_kvarn_attn_decode_launch<KeyBits, ValueBits, 2>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        case 4: ggml_cuda_op_kvarn_attn_decode_launch<KeyBits, ValueBits, 4>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        case 8: ggml_cuda_op_kvarn_attn_decode_launch<KeyBits, ValueBits, 8>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        default: GGML_ABORT("unsupported KVarN GQA factor");
+    }
+}
+
 void ggml_cuda_op_kvarn_attn_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q      = dst->src[0];
     const ggml_tensor * sealed = dst->src[1];
@@ -290,37 +362,19 @@ void ggml_cuda_op_kvarn_attn_decode(ggml_backend_cuda_context & ctx, ggml_tensor
     memcpy(&tail_count,        dst->op_params + 5, sizeof(int32_t));
     memcpy(&kq_scale,          dst->op_params + 6, sizeof(float));
 
-    const int n_head_q = n_head_kv * n_group_broadcast;
-    const int n_groups_max = (int) sealed->ne[1]; // sealed is [tile_bytes, n_groups_max, n_head_kv]
+    const int n_groups_max = (int) sealed->ne[1];
     const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
-
     const int n_sealed = (n_total - tail_count) / KVARN_N;
     const int n_splits_sealed = (n_sealed + KVARN_GROUPS_PER_SPLIT - 1) / KVARN_GROUPS_PER_SPLIT;
-    const int n_splits_total  = n_splits_sealed + 1; // +1 dedicated tail split, always launched
-                                                      // (harmless no-op when tail_count == 0: from_tail
-                                                      // computes to 0 and the block just contributes
-                                                      // running_max=-1e30/running_sum=0/out_acc=0, which
-                                                      // the combine kernel's exp(-1e30-global_max)=0
-                                                      // weighting makes a no-op).
-
+    const int n_splits_total = n_splits_sealed + 1;
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<float> partial_out(ctx.pool(), (size_t) n_splits_total * n_head_q * KVARN_N);
-    ggml_cuda_pool_alloc<float> partial_max(ctx.pool(), (size_t) n_splits_total * n_head_q);
-    ggml_cuda_pool_alloc<float> partial_sum(ctx.pool(), (size_t) n_splits_total * n_head_q);
-
-    dim3 grid_partial(n_head_q, n_splits_total);
-    dim3 block_partial(KVARN_N);
-    k_kvarn_attn_decode_partial<<<grid_partial, block_partial, 0, stream>>>(
-            (const float *) q->data, (const uint8_t *) sealed->data,
-            (const float *) k_tail->data, (const float *) v_tail->data,
-            partial_out.get(), partial_max.get(), partial_sum.get(),
-            key_bits, value_bits, n_head_kv, n_group_broadcast,
-            n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout);
-
-    dim3 grid_combine(n_head_q);
-    dim3 block_combine(KVARN_N);
-    k_kvarn_attn_decode_combine<<<grid_combine, block_combine, 0, stream>>>(
-            partial_out.get(), partial_max.get(), partial_sum.get(),
-            (float *) dst->data, n_splits_total, n_head_q);
+    switch (key_bits * 10 + value_bits) {
+        case 22: ggml_cuda_op_kvarn_attn_decode_dispatch<2, 2>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_group_broadcast, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        case 33: ggml_cuda_op_kvarn_attn_decode_dispatch<3, 3>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_group_broadcast, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        case 44: ggml_cuda_op_kvarn_attn_decode_dispatch<4, 4>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_group_broadcast, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        case 55: ggml_cuda_op_kvarn_attn_decode_dispatch<5, 5>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_group_broadcast, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        case 66: ggml_cuda_op_kvarn_attn_decode_dispatch<6, 6>(ctx, dst, q, sealed, k_tail, v_tail, n_head_kv, n_group_broadcast, n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout, n_splits_total, stream); break;
+        default: GGML_ABORT("unsupported KVarN decode bit-width pair");
+    }
 }
