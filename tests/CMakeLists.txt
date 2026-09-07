@@ -357,6 +357,11 @@ llama_build_and_test(test-turbo-quant.c LABEL "turbo")
 # KVarN CPU codec round-trip test (links ggml kvarn codec symbols via llama)
 llama_build_and_test(test-kvarn-quant.c LABEL "turbo")
 
+# KVarN layer-store round-trip test (needs the internal llama-kvarn-store.h)
+llama_build_and_test(test-kvarn-store.cpp LABEL "turbo")
+target_include_directories(test-kvarn-store PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-kvarn-store PRIVATE llama)
+
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
     llama_build_and_test(test-gguf.cpp)
