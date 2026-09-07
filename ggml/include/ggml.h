@@ -2639,17 +2639,31 @@ extern "C" {
             int                   value_bits,
             int                   sinkhorn_iters);
 
-    // KVarN: reconstruct n_total tokens of one side (K or V) from sealed
-    // records + the live tail
+    // KVarN: reconstruct n_kv tokens of one side (K or V) from sealed
+    // records + the live tail. n_kv drives the OUTPUT SHAPE and must be the
+    // padded, reuse-stable bucket value (same one get_k/get_v's own n_kv
+    // parameter already is - see get_n_kv's own comment) - tensor shapes
+    // are fixed at graph-build time and can never depend on a runtime
+    // value, unlike the position-dependent CONTENT decisions below.
+    //
+    // The real (unpadded) content length and the tail/sealed split are
+    // derived from `idxs`'s actual tensor VALUE at kernel execution time
+    // (idxs[idxs->ne[0]-1] + 1), not from any op_params - this is what
+    // makes the op safe under llama.cpp's graph-reuse optimization (see
+    // ggml_kvarn_store's doc comment above for the general pattern this
+    // follows). Rows at or past the real content length are written as
+    // zero (finite, never left uninitialized) since kq_mask masks them out
+    // numerically but a NaN/Inf there could still poison a masked-to-zero
+    // softmax weight times an uninitialized value.
     GGML_API struct ggml_tensor * ggml_kvarn_materialize(
             struct ggml_context * ctx,
             struct ggml_tensor  * sealed,
             struct ggml_tensor  * tail,
+            struct ggml_tensor  * idxs,
             int                   key_bits,
             int                   value_bits,
             int                   is_v,
-            int                   n_total,
-            int                   tail_count);
+            int                   n_kv);
 
     // KVarN: fused single-token decode attention against sealed + tail
     // storage directly (avoids materializing the full dequantized history to
@@ -2658,17 +2672,24 @@ extern "C" {
     // still rotated (apply ggml_turbo_wht direction=1 to un-rotate) - same
     // convention as the graph-level Q/output rotation turbo4 already uses.
     // n_head_q must be an exact multiple of n_head_kv (GQA broadcast).
+    //
+    // `idxs` supplies the real content length/tail split at kernel execution
+    // time (idxs[idxs->ne[0]-1] + 1), replacing the n_total/tail_count int
+    // params this op used to take baked into op_params - this op's output
+    // shape never depends on position at all ([128, n_head_q, 1] regardless
+    // of history length), so unlike ggml_kvarn_materialize there is no
+    // shape-decoupling concern here, only the same op_params-staleness
+    // pattern ggml_kvarn_store's doc comment describes.
     GGML_API struct ggml_tensor * ggml_kvarn_attn_decode(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * sealed,
             struct ggml_tensor  * k_tail,
             struct ggml_tensor  * v_tail,
+            struct ggml_tensor  * idxs,
             int                   key_bits,
             int                   value_bits,
             int                   n_head_kv,
-            int                   n_total,
-            int                   tail_count,
             float                 kq_scale);
 
     // KVarN: write one call's worth of tokens into a layer's tail/sealed

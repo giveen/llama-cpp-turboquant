@@ -99,9 +99,15 @@ int main() {
             memcpy((float *) v_tail->data + (size_t) t * head_dim, v, head_dim * sizeof(float));
         }
 
+        // idxs: a stand-in for k_idxs/v_idxs - element [n_tokens-1]+1 must
+        // equal n_total (the real content length), which materialize now
+        // derives on-device instead of taking as an int param.
+        struct ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+        ((int64_t *) idxs->data)[0] = n_total - 1;
+
         struct ggml_tensor * sealed = ggml_kvarn_seal(ctx, k_tail0, v_tail0, bits, bits, 16);
-        struct ggml_tensor * mat_k  = ggml_kvarn_materialize(ctx, sealed, k_tail, bits, bits, /*is_v=*/0, n_total, tail_count);
-        struct ggml_tensor * mat_v  = ggml_kvarn_materialize(ctx, sealed, v_tail, bits, bits, /*is_v=*/1, n_total, tail_count);
+        struct ggml_tensor * mat_k  = ggml_kvarn_materialize(ctx, sealed, k_tail, idxs, bits, bits, /*is_v=*/0, n_total);
+        struct ggml_tensor * mat_v  = ggml_kvarn_materialize(ctx, sealed, v_tail, idxs, bits, bits, /*is_v=*/1, n_total);
 
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, sealed);

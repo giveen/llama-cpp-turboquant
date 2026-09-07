@@ -45,19 +45,34 @@ __global__ void k_kvarn_attn_decode_partial(
         const uint8_t * __restrict__ sealed,    // [tile_bytes, n_groups_max, n_head_kv]
         const float   * __restrict__ k_tail,    // [128, 128, n_head_kv]
         const float   * __restrict__ v_tail,    // [128, 128, n_head_kv]
+        const int64_t * __restrict__ idxs,      // [n_tokens] - element [idxs_n-1]+1 gives real content length
+        int64_t idxs_n,
         float * __restrict__ partial_out,       // [n_splits, n_head_q, 128]
         float * __restrict__ partial_max,       // [n_splits, n_head_q]
         float * __restrict__ partial_sum,       // [n_splits, n_head_q]
         int key_bits, int value_bits,
         int n_head_kv, int n_group_broadcast, // n_head_q = n_head_kv * n_group_broadcast
-        int n_groups_max, int n_total, int tail_count,
-        int n_splits_sealed, // blockIdx.y in [0, n_splits_sealed) => sealed groups; == n_splits_sealed => tail
+        int n_groups_max,
+        int n_splits_sealed_max, // FIXED upper bound (ceil(n_groups_max/GROUPS_PER_SPLIT)), not the real
+                                  // n_sealed - blockIdx.y in [0, n_splits_sealed_max) => sealed groups (a
+                                  // block whose g_begin is past the REAL n_sealed, computed on-device
+                                  // below, naturally contributes a harmless zero partial - see the
+                                  // g_end computation); == n_splits_sealed_max => dedicated tail split
         float kq_scale,
         struct kvarn_tile_layout layout) {
     const int q_head  = blockIdx.x;
     const int kv_head = q_head / n_group_broadcast;
     const int split_id = blockIdx.y;
     const int r        = threadIdx.x; // 0..127
+
+    // Read position from idxs's actual VALUE at execution time, not from
+    // op_params/host-computed args - see ggml_kvarn_store's doc comment for
+    // why this matters under graph reuse. Every block redundantly
+    // recomputes this (cheap, avoids a separate prologue kernel/shared
+    // state), matching k_kvarn_store_seal/_tail's existing pattern.
+    const int64_t n_total    = idxs[idxs_n - 1] + 1;
+    const int64_t tail_count = n_total % KVARN_N;
+    const int64_t n_sealed   = (n_total - tail_count) / KVARN_N;
 
     __shared__ float q_sh[KVARN_N];
     __shared__ float s_col_k[KVARN_N];
@@ -75,12 +90,11 @@ __global__ void k_kvarn_attn_decode_partial(
     const size_t tile_bytes = layout.tile_bytes;
     const uint8_t * sealed_kv = sealed + (size_t) kv_head * (size_t) n_groups_max * tile_bytes;
 
-    if (split_id < n_splits_sealed) {
-        const int n_sealed = (n_total - tail_count) / KVARN_N;
-        const int g_begin = split_id * KVARN_GROUPS_PER_SPLIT;
-        const int g_end   = min(n_sealed, g_begin + KVARN_GROUPS_PER_SPLIT);
+    if (split_id < n_splits_sealed_max) {
+        const int64_t g_begin = (int64_t) split_id * KVARN_GROUPS_PER_SPLIT;
+        const int64_t g_end   = min(n_sealed, g_begin + KVARN_GROUPS_PER_SPLIT);
 
-        for (int g = g_begin; g < g_end; g++) {
+        for (int64_t g = g_begin; g < g_end; g++) {
             const uint8_t * record = sealed_kv + (size_t) g * tile_bytes;
 
             half h;
@@ -171,9 +185,9 @@ __global__ void k_kvarn_attn_decode_partial(
             __syncthreads();
         }
     } else {
-        // Dedicated tail split: exact rows, no dequant needed.
-        const int n_sealed  = (n_total - tail_count) / KVARN_N;
-        const int from_tail = n_total - n_sealed * KVARN_N;
+        // Dedicated tail split: exact rows, no dequant needed. n_total/
+        // n_sealed already computed on-device at function scope above.
+        const int64_t from_tail = n_total - n_sealed * KVARN_N;
         const float * k_tail_h = k_tail + (size_t) kv_head * KVARN_N * KVARN_N;
         const float * v_tail_h = v_tail + (size_t) kv_head * KVARN_N * KVARN_N;
 
@@ -279,29 +293,30 @@ void ggml_cuda_op_kvarn_attn_decode(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * sealed = dst->src[1];
     const ggml_tensor * k_tail = dst->src[2];
     const ggml_tensor * v_tail = dst->src[3];
+    const ggml_tensor * idxs   = dst->src[4];
 
-    int32_t key_bits, value_bits, n_head_kv, n_group_broadcast, n_total, tail_count;
+    int32_t key_bits, value_bits, n_head_kv, n_group_broadcast;
     float   kq_scale;
     memcpy(&key_bits,          dst->op_params + 0, sizeof(int32_t));
     memcpy(&value_bits,        dst->op_params + 1, sizeof(int32_t));
     memcpy(&n_head_kv,         dst->op_params + 2, sizeof(int32_t));
     memcpy(&n_group_broadcast, dst->op_params + 3, sizeof(int32_t));
-    memcpy(&n_total,           dst->op_params + 4, sizeof(int32_t));
-    memcpy(&tail_count,        dst->op_params + 5, sizeof(int32_t));
-    memcpy(&kq_scale,          dst->op_params + 6, sizeof(float));
+    memcpy(&kq_scale,          dst->op_params + 4, sizeof(float));
 
     const int n_head_q = n_head_kv * n_group_broadcast;
     const int n_groups_max = (int) sealed->ne[1]; // sealed is [tile_bytes, n_groups_max, n_head_kv]
     const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
 
-    const int n_sealed = (n_total - tail_count) / KVARN_N;
-    const int n_splits_sealed = (n_sealed + KVARN_GROUPS_PER_SPLIT - 1) / KVARN_GROUPS_PER_SPLIT;
-    const int n_splits_total  = n_splits_sealed + 1; // +1 dedicated tail split, always launched
-                                                      // (harmless no-op when tail_count == 0: from_tail
-                                                      // computes to 0 and the block just contributes
-                                                      // running_max=-1e30/running_sum=0/out_acc=0, which
-                                                      // the combine kernel's exp(-1e30-global_max)=0
-                                                      // weighting makes a no-op).
+    // FIXED upper bound on sealed splits, derived from the layer's
+    // allocated group CAPACITY (a per-layer construction-time constant,
+    // never varies per call) rather than the real n_sealed - reading the
+    // real value would need a host sync on `idxs` (CUDA-resident), which
+    // this hot per-layer-per-token dispatch path deliberately avoids (see
+    // the graph-reuse plan doc). Blocks whose range is past the real
+    // n_sealed (computed on-device inside the kernel) naturally contribute
+    // a harmless zero partial - see k_kvarn_attn_decode_partial.
+    const int n_splits_sealed_max = (n_groups_max + KVARN_GROUPS_PER_SPLIT - 1) / KVARN_GROUPS_PER_SPLIT;
+    const int n_splits_total      = n_splits_sealed_max + 1; // +1 dedicated tail split, always launched
 
     cudaStream_t stream = ctx.stream();
 
@@ -314,9 +329,10 @@ void ggml_cuda_op_kvarn_attn_decode(ggml_backend_cuda_context & ctx, ggml_tensor
     k_kvarn_attn_decode_partial<<<grid_partial, block_partial, 0, stream>>>(
             (const float *) q->data, (const uint8_t *) sealed->data,
             (const float *) k_tail->data, (const float *) v_tail->data,
+            (const int64_t *) idxs->data, idxs->ne[0],
             partial_out.get(), partial_max.get(), partial_sum.get(),
             key_bits, value_bits, n_head_kv, n_group_broadcast,
-            n_groups_max, n_total, tail_count, n_splits_sealed, kq_scale, layout);
+            n_groups_max, n_splits_sealed_max, kq_scale, layout);
 
     dim3 grid_combine(n_head_q);
     dim3 block_combine(KVARN_N);

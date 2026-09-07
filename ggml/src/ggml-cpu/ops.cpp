@@ -11462,6 +11462,15 @@ void ggml_compute_forward_kvarn_seal(
 // Mirrors llama_kvarn_layer_store::read() (src/llama-kvarn-store.cpp),
 // which was validated standalone first: dequantize whichever sealed groups
 // fall within [0, n_total), then copy the still-exact tail rows.
+//
+// Output shape is fixed at [128, n_kv] (n_kv = dst->ne[1], the padded,
+// reuse-stable bucket - see ggml_kvarn_materialize's doc comment). The real
+// content length (n_total) and tail/sealed split come from `idxs`'s actual
+// VALUE here, at execution time, rather than from op_params - this is what
+// keeps the op correct under graph reuse (see ggml_kvarn_store's doc
+// comment for the general pattern). Rows at or past n_total are written as
+// zero, never left uninitialized (a masked-to-zero softmax weight times an
+// uninitialized/NaN value would still poison the sum).
 
 void ggml_compute_forward_kvarn_materialize(
         const ggml_compute_params * params,
@@ -11472,44 +11481,51 @@ void ggml_compute_forward_kvarn_materialize(
 
     const ggml_tensor * sealed = dst->src[0];
     const ggml_tensor * tail   = dst->src[1];
+    const ggml_tensor * idxs   = dst->src[2];
 
-    int32_t key_bits, value_bits, is_v, n_total, tail_count;
+    int32_t key_bits, value_bits, is_v;
     memcpy(&key_bits,   dst->op_params + 0, sizeof(int32_t));
     memcpy(&value_bits, dst->op_params + 1, sizeof(int32_t));
     memcpy(&is_v,       dst->op_params + 2, sizeof(int32_t));
-    memcpy(&n_total,    dst->op_params + 3, sizeof(int32_t));
-    memcpy(&tail_count, dst->op_params + 4, sizeof(int32_t));
+
+    const int64_t n_kv = dst->ne[1];
+    const int64_t * idxs_data = (const int64_t *) idxs->data;
+    const int64_t pos_end = idxs_data[idxs->ne[0] - 1] + 1;
+    const int64_t n_total = std::min<int64_t>(pos_end, n_kv);
+
+    float * out = (float *) dst->data;
 
     if (n_total <= 0) {
+        memset(out, 0, (size_t) n_kv * 128 * sizeof(float));
         return;
     }
 
     const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
     const int bits = is_v ? value_bits : key_bits;
-    const int n_sealed = (n_total - tail_count) / 128;
+    const int64_t tail_count = n_total % 128;
+    const int64_t n_sealed   = n_total / 128;
 
     const uint8_t * sealed_data = (const uint8_t *) sealed->data;
     const float   * tail_data   = (const float *)   tail->data;
-    float * out = (float *) dst->data;
 
     float tile[128 * 128];
 
-    for (int g = 0; g < n_sealed; g++) {
+    for (int64_t g = 0; g < n_sealed; g++) {
         const uint8_t * record = sealed_data + (size_t) g * layout.tile_bytes;
         if (is_v) {
             kvarn_dequantize_v_tile(record, bits, &layout, tile);
         } else {
             kvarn_dequantize_k_tile(record, bits, &layout, tile);
         }
-
-        const int base = g * 128;
-        const int take = (128 < n_total - base) ? 128 : (n_total - base);
-        memcpy(out + (size_t) base * 128, tile, (size_t) take * 128 * sizeof(float));
+        memcpy(out + (size_t) g * 128 * 128, tile, (size_t) 128 * 128 * sizeof(float));
     }
 
-    const int from_tail = n_total - n_sealed * 128;
-    if (from_tail > 0) {
-        memcpy(out + (size_t) n_sealed * 128 * 128, tail_data, (size_t) from_tail * 128 * sizeof(float));
+    if (tail_count > 0) {
+        memcpy(out + (size_t) n_sealed * 128 * 128, tail_data, (size_t) tail_count * 128 * sizeof(float));
+    }
+
+    if (n_total < n_kv) {
+        memset(out + (size_t) n_total * 128, 0, (size_t) (n_kv - n_total) * 128 * sizeof(float));
     }
 }
 
@@ -11532,20 +11548,26 @@ void ggml_compute_forward_kvarn_attn_decode(
     const ggml_tensor * sealed = dst->src[1];
     const ggml_tensor * k_tail = dst->src[2];
     const ggml_tensor * v_tail = dst->src[3];
+    const ggml_tensor * idxs   = dst->src[4];
 
-    int32_t key_bits, value_bits, n_head_kv, n_group_broadcast, n_total, tail_count;
+    int32_t key_bits, value_bits, n_head_kv, n_group_broadcast;
     float   kq_scale;
     memcpy(&key_bits,          dst->op_params + 0, sizeof(int32_t));
     memcpy(&value_bits,        dst->op_params + 1, sizeof(int32_t));
     memcpy(&n_head_kv,         dst->op_params + 2, sizeof(int32_t));
     memcpy(&n_group_broadcast, dst->op_params + 3, sizeof(int32_t));
-    memcpy(&n_total,           dst->op_params + 4, sizeof(int32_t));
-    memcpy(&tail_count,        dst->op_params + 5, sizeof(int32_t));
-    memcpy(&kq_scale,          dst->op_params + 6, sizeof(float));
+    memcpy(&kq_scale,          dst->op_params + 4, sizeof(float));
+
+    // Position read from idxs's actual VALUE at execution time, not from
+    // op_params - see ggml_kvarn_store's doc comment for why this matters
+    // under graph reuse.
+    const int64_t * idxs_data = (const int64_t *) idxs->data;
+    const int64_t   n_total    = idxs_data[idxs->ne[0] - 1] + 1;
+    const int64_t   tail_count = n_total % 128;
 
     const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
-    const int n_sealed     = (n_total - tail_count) / 128;
-    const int n_groups_max = (int) sealed->ne[1];
+    const int64_t n_sealed     = (n_total - tail_count) / 128;
+    const int     n_groups_max = (int) sealed->ne[1];
 
     const float   * q_data      = (const float *)   q->data;
     const uint8_t * sealed_data = (const uint8_t *) sealed->data;

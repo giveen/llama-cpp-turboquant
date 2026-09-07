@@ -285,10 +285,22 @@ private:
         uint32_t kvarn_value_bits = 0;
         uint32_t kvarn_n_head_kv  = 0;
 
-        // mutable: cpy_k/cpy_v are const (see llama_kv_cache::cpy_k), but need
-        // to advance this host-side bookkeeping as ubatches are processed.
-        mutable std::vector<uint32_t> kvarn_tail_count; // per head, tokens currently in the tail (0..127)
-        mutable std::vector<uint32_t> kvarn_n_sealed;   // per head, sealed groups so far
+        // Graph-reuse-safety plumbing: get_k/get_v are part of the generic
+        // llama_memory_context_i-style virtual interface (many non-kvarn
+        // implementers, 15+ unrelated call sites), so get_kvarn/
+        // build_attn_decode_kvarn cannot receive k_idxs/v_idxs as a new
+        // parameter without a large, pointless blast radius. Instead,
+        // cpy_kvarn stashes the SAME idxs tensor object it already receives
+        // here; get_kvarn/build_attn_decode_kvarn - always called later in
+        // the SAME build_attn/build_graph() call, per build_attn's fixed
+        // structure - read it back. This works because build_graph() (and
+        // everything it calls, including cpy_kvarn) never runs on a reused
+        // graph; only registered "input" tensors' VALUES get re-patched on
+        // reuse (set_input_k_idxs/v_idxs, which keeps refreshing THIS SAME
+        // tensor object regardless of reuse) - so capturing the object
+        // reference once, on the first real build, is sufficient forever.
+        mutable ggml_tensor * kvarn_last_k_idxs = nullptr;
+        mutable ggml_tensor * kvarn_last_v_idxs = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed

@@ -224,16 +224,32 @@ __global__ void k_kvarn_seal(
 __global__ void k_kvarn_materialize(
         const uint8_t * __restrict__ sealed,
         const float   * __restrict__ tail,
+        const int64_t * __restrict__ idxs,
+        int64_t idxs_n,
         float * __restrict__ out,
-        int bits, int n_sealed, int n_total,
+        int64_t n_kv,
+        int bits,
         struct kvarn_tile_layout layout, int is_v) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_total) return;
+    const int64_t row = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_kv) return;
 
-    const int group = row / KVARN_N;
-    const int r      = row % KVARN_N;
+    // Read position from idxs's actual VALUE at execution time, not from
+    // op_params - see ggml_kvarn_materialize's doc comment. Every thread
+    // redundantly recomputes this (cheap, avoids any shared-memory/sync
+    // overhead for a single scalar).
+    const int64_t pos_end = idxs[idxs_n - 1] + 1;
+    const int64_t n_total = pos_end < n_kv ? pos_end : n_kv;
 
     float * out_row = out + (size_t) row * KVARN_N;
+
+    if (row >= n_total) {
+        for (int c = 0; c < KVARN_N; c++) out_row[c] = 0.0f;
+        return;
+    }
+
+    const int64_t n_sealed = n_total / KVARN_N;
+    const int64_t group    = row / KVARN_N;
+    const int     r        = (int) (row % KVARN_N);
 
     if (group < n_sealed) {
         const uint8_t * record = sealed + (size_t) group * layout.tile_bytes;
@@ -542,32 +558,29 @@ void ggml_cuda_op_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * sealed = dst->src[0];
     const ggml_tensor * tail   = dst->src[1];
+    const ggml_tensor * idxs   = dst->src[2];
 
     GGML_ASSERT(sealed->type == GGML_TYPE_I8);
     GGML_ASSERT(tail->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->type == GGML_TYPE_I64);
 
-    int32_t key_bits, value_bits, is_v, n_total, tail_count;
+    int32_t key_bits, value_bits, is_v;
     memcpy(&key_bits,   dst->op_params + 0, sizeof(int32_t));
     memcpy(&value_bits, dst->op_params + 1, sizeof(int32_t));
     memcpy(&is_v,       dst->op_params + 2, sizeof(int32_t));
-    memcpy(&n_total,    dst->op_params + 3, sizeof(int32_t));
-    memcpy(&tail_count, dst->op_params + 4, sizeof(int32_t));
 
-    if (n_total <= 0) {
-        return;
-    }
-
+    const int64_t n_kv = dst->ne[1];
     const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
-    const int bits     = is_v ? value_bits : key_bits;
-    const int n_sealed = (n_total - tail_count) / KVARN_N;
+    const int bits = is_v ? value_bits : key_bits;
 
     cudaStream_t stream = ctx.stream();
 
-    const int block = 128;
-    const int grid  = (n_total + block - 1) / block;
-    k_kvarn_materialize<<<grid, block, 0, stream>>>(
-            (const uint8_t *) sealed->data, (const float *) tail->data, (float *) dst->data,
-            bits, n_sealed, n_total, layout, is_v);
+    const int64_t block = 128;
+    const int64_t grid  = (n_kv + block - 1) / block;
+    k_kvarn_materialize<<<(unsigned) grid, (unsigned) block, 0, stream>>>(
+            (const uint8_t *) sealed->data, (const float *) tail->data,
+            (const int64_t *) idxs->data, idxs->ne[0],
+            (float *) dst->data, n_kv, bits, layout, is_v);
 }
 
 void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

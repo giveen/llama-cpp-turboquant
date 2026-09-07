@@ -87,10 +87,11 @@ int main() {
         struct ggml_tensor * v_tail0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, 128);
         struct ggml_tensor * k_tail  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, 128);
         struct ggml_tensor * v_tail  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, 128);
+        struct ggml_tensor * idxs    = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1); // element [0]+1 must equal n_total
 
         struct ggml_tensor * sealed = ggml_kvarn_seal(ctx, k_tail0, v_tail0, bits, bits, 16);
-        struct ggml_tensor * mat_k  = ggml_kvarn_materialize(ctx, sealed, k_tail, bits, bits, /*is_v=*/0, n_total, tail_count);
-        struct ggml_tensor * mat_v  = ggml_kvarn_materialize(ctx, sealed, v_tail, bits, bits, /*is_v=*/1, n_total, tail_count);
+        struct ggml_tensor * mat_k  = ggml_kvarn_materialize(ctx, sealed, k_tail, idxs, bits, bits, /*is_v=*/0, n_total);
+        struct ggml_tensor * mat_v  = ggml_kvarn_materialize(ctx, sealed, v_tail, idxs, bits, bits, /*is_v=*/1, n_total);
 
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         if (!buf) {
@@ -135,6 +136,8 @@ int main() {
         ggml_backend_tensor_set(v_tail0, v_tail0_data.data(), 0, ggml_nbytes(v_tail0));
         ggml_backend_tensor_set(k_tail,  k_tail_data.data(),  0, ggml_nbytes(k_tail));
         ggml_backend_tensor_set(v_tail,  v_tail_data.data(),  0, ggml_nbytes(v_tail));
+        const int64_t idxs_val = n_total - 1;
+        ggml_backend_tensor_set(idxs, &idxs_val, 0, sizeof(idxs_val));
 
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, sealed);

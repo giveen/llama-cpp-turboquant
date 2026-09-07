@@ -80,6 +80,7 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
     struct ggml_tensor * k_tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
     struct ggml_tensor * v_tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
     struct ggml_tensor * q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head_q, 1);
+    struct ggml_tensor * idxs    = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1); // element [0]+1 must equal n_total
 
     struct ggml_tensor * sealed = ggml_kvarn_seal(ctx, k_tail0, v_tail0, bits, bits, 16);
     // seal only handles one head at a time (its own kernel loops per-block
@@ -99,7 +100,7 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
 
     const float kq_scale = 1.0f / sqrtf((float) head_dim);
     struct ggml_tensor * attn_out = ggml_kvarn_attn_decode(
-            ctx, q, combined_sealed, k_tail, v_tail, bits, bits, n_head_kv, n_total, tail_count, kq_scale);
+            ctx, q, combined_sealed, k_tail, v_tail, idxs, bits, bits, n_head_kv, kq_scale);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) { fprintf(stderr, "alloc failed\n"); ggml_free(ctx); return false; }
@@ -150,6 +151,8 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
     ggml_backend_tensor_set(k_tail,  k_tail_data.data(),  0, ggml_nbytes(k_tail));
     ggml_backend_tensor_set(v_tail,  v_tail_data.data(),  0, ggml_nbytes(v_tail));
     ggml_backend_tensor_set(q,       q_rot.data(),        0, ggml_nbytes(q));
+    const int64_t idxs_val = n_total - 1;
+    ggml_backend_tensor_set(idxs, &idxs_val, 0, sizeof(idxs_val));
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, attn_out);

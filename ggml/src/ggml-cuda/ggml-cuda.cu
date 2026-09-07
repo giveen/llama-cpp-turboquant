@@ -5445,11 +5445,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->ne[0] == 128 && op->src[0]->ne[1] == 128;
         case GGML_OP_KVARN_MATERIALIZE:
             return op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32;
+                   op->src[2]->type == GGML_TYPE_I64 && op->type == GGML_TYPE_F32;
         case GGML_OP_KVARN_ATTN_DECODE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I8 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32;
+                   op->src[4]->type == GGML_TYPE_I64 && op->type == GGML_TYPE_F32;
         case GGML_OP_KVARN_STORE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I64 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_I8 &&

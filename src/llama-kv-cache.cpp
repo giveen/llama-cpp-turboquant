@@ -453,7 +453,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, nullptr, nullptr, nullptr, 0, 0, 0, {}, {} });
+        layers.push_back({ il, k, v, k_stream, v_stream, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr });
 
         if (kvarn_active) {
             GGML_ASSERT(n_embd_head_k == 128 && n_embd_head_v == 128 && "KVarN v1 requires head_dim == 128");
@@ -468,8 +468,6 @@ llama_kv_cache::llama_kv_cache(
             layer.kvarn_key_bits   = (uint32_t) kvarn_key_bits;
             layer.kvarn_value_bits = (uint32_t) kvarn_value_bits;
             layer.kvarn_n_head_kv  = n_head_kv;
-            layer.kvarn_tail_count.assign(n_head_kv, 0u);
-            layer.kvarn_n_sealed.assign(n_head_kv, 0u);
 
             layer.kvarn_k_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_head_kv);
             layer.kvarn_v_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_head_kv);
@@ -1638,25 +1636,16 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
     ggml_tensor * result = ggml_kvarn_store(ctx, cur_rot, idxs, tail_base, layer.kvarn_sealed,
             key_bits, value_bits, /*sinkhorn_iters=*/16, is_v ? 1 : 0, max_groups_per_call);
 
-    // Host-side bookkeeping: still derived from pos0 (not accumulated),
-    // for the same reserve-safety reason as before (llama_context::
-    // sched_reserve's speculative dry-run graphs at hypothetical ubatch
-    // sizes must not corrupt real state) - kept only for get_kvarn's/
-    // build_attn_decode_kvarn's op_params sizing on the immediately
-    // -following read within this same (non-reused) build. Phase 2 of the
-    // graph-reuse plan replaces this read-side usage with the same
-    // on-device derivation used above; until then these fields are not
-    // meaningful across a *reused* graph, which is exactly why reuse stays
-    // disabled for kvarn-active contexts for now.
-    const uint32_t tail_count0    = pos0 % 128;
-    const uint32_t n_sealed0      = pos0 / 128;
-    const int64_t  total_rows     = (int64_t) tail_count0 + n_tokens;
-    const int64_t  n_complete     = total_rows / 128;
-    const uint32_t tail_count_end = (uint32_t) (total_rows % 128);
-
-    for (int64_t h = 0; h < n_head_kv; h++) {
-        layer.kvarn_tail_count[h] = tail_count_end;
-        layer.kvarn_n_sealed[h]   = n_sealed0 + (uint32_t) n_complete;
+    // Stash the SAME idxs tensor object for get_kvarn/build_attn_decode_kvarn
+    // (called later in this same build_attn/build_graph() call) to read
+    // position from on-device, the same way this function's own STORE op
+    // does - see kv_layer::kvarn_last_k_idxs's doc comment (llama-kv-cache.h)
+    // for why this, rather than a new get_k/get_v parameter, is the reuse
+    // -safe plumbing for the read side.
+    if (is_v) {
+        layer.kvarn_last_v_idxs = idxs;
+    } else {
+        layer.kvarn_last_k_idxs = idxs;
     }
 
     return result;
@@ -1678,46 +1667,41 @@ ggml_tensor * llama_kv_cache::get_kvarn(ggml_context * ctx, int32_t il, uint32_t
 
     ggml_tensor * tail_base = is_v ? layer.kvarn_v_tail : layer.kvarn_k_tail;
 
+    // Position source for the on-device content-length derivation inside
+    // ggml_kvarn_materialize (see its doc comment, ggml.h) - the SAME idxs
+    // tensor object cpy_kvarn (called earlier in this same build_attn call)
+    // already received, stashed via kv_layer::kvarn_last_k_idxs/v_idxs. This
+    // is what makes the op safe under graph reuse without get_k/get_v
+    // needing a new parameter - see that field's doc comment for why.
+    ggml_tensor * idxs = is_v ? layer.kvarn_last_v_idxs : layer.kvarn_last_k_idxs;
+    GGML_ASSERT(idxs != nullptr && "KVarN: get_kvarn called before cpy_kvarn populated idxs for this build - "
+            "build_attn is expected to always call cpy_k/cpy_v before get_k/get_v");
+
     const size_t tail_row_bytes  = 128 * sizeof(float);
     const size_t tail_head_bytes = 128 * tail_row_bytes;
-    const size_t sealed_tile_bytes = layer.kvarn_sealed->nb[1];
+    const int64_t n_groups_max = layer.kvarn_sealed->ne[1];
 
     std::vector<ggml_tensor *> per_head(n_head_kv);
 
     for (uint32_t h = 0; h < n_head_kv; h++) {
-        const uint32_t tail_count = layer.kvarn_tail_count[h];
-        const uint32_t n_this     = std::min<uint32_t>(n_kv, layer.kvarn_n_sealed[h] * 128 + tail_count);
-
         ggml_tensor * tail_h = ggml_view_2d(ctx, tail_base, 128, 128, tail_row_bytes, (size_t) h * tail_head_bytes);
-        ggml_tensor * sealed_h = ggml_view_2d(ctx, layer.kvarn_sealed, (int64_t) sealed_tile_bytes, layer.kvarn_n_sealed[h],
-                layer.kvarn_sealed->nb[1], (size_t) h * layer.kvarn_sealed->nb[2]);
 
         ggml_tensor * mat;
-        if (n_this == 0) {
-            // Nothing written yet for this head (e.g. the graph-reserve pass
-            // before any real decoding, or n_kv == 0). tail_h is guaranteed
-            // zero at this point (cleared at cache construction, untouched
-            // since) - broadcast one zero row of it to [128, n_kv] rather
-            // than calling ggml_kvarn_materialize, whose kernel leaves its
-            // output uninitialized when n_total <= 0.
+        if (n_kv == 0) {
+            // Degenerate case (shouldn't happen for a real, initialized
+            // cache - get_n_kv always returns at least min(cells.size(),
+            // 256) - kept defensively, matching the old code's guard).
             ggml_tensor * zero_row = ggml_view_2d(ctx, tail_h, 128, 1, tail_h->nb[1], 0);
-            mat = n_kv > 0 ? ggml_repeat_4d(ctx, zero_row, 128, n_kv, 1, 1) : zero_row;
+            mat = zero_row;
         } else {
-            mat = ggml_kvarn_materialize(ctx, sealed_h, tail_h, key_bits, value_bits, is_v ? 1 : 0,
-                    (int) n_this, (int) tail_count);
-            mat = ggml_turbo_wht(ctx, mat, /*direction=*/1, 128, nullptr);
+            ggml_tensor * sealed_h = ggml_view_2d(ctx, layer.kvarn_sealed, layer.kvarn_sealed->ne[0], n_groups_max,
+                    layer.kvarn_sealed->nb[1], (size_t) h * layer.kvarn_sealed->nb[2]);
 
-            // pad up to n_kv with zeros if the cache holds fewer than n_kv
-            // tokens so far (matches get_n_kv's padding convention for other
-            // types). mat is [128 (ne[0]), n_this (ne[1])]; ggml_pad's args
-            // are per-dimension amounts (p0->ne[0], p1->ne[1], ...), so pad
-            // ne[1] (tokens) directly - no transpose needed.
-            if (n_this < n_kv) {
-                mat = ggml_pad(ctx, mat, 0, (int) (n_kv - n_this), 0, 0);
-            }
+            mat = ggml_kvarn_materialize(ctx, sealed_h, tail_h, idxs, key_bits, value_bits, is_v ? 1 : 0, (int) n_kv);
+            mat = ggml_turbo_wht(ctx, mat, /*direction=*/1, 128, nullptr);
         }
 
-        per_head[h] = ggml_reshape_3d(ctx, mat, 128, 1, n_kv);
+        per_head[h] = ggml_reshape_3d(ctx, mat, 128, 1, n_kv > 0 ? n_kv : 1);
     }
 
     ggml_tensor * result = per_head[0];
@@ -1750,15 +1734,17 @@ ggml_tensor * llama_kv_cache::build_attn_decode_kvarn(ggml_context * ctx, ggml_t
     }
     q = ggml_turbo_wht(ctx, q, /*direction=*/0, 128, nullptr);
 
-    // All heads advance together for a single sequence (cpy_kvarn derives
-    // every head's starting state from the same pos0 each call), so head 0's
-    // counters describe the whole layer.
-    const uint32_t tail_count = layer.kvarn_tail_count[0];
-    const uint32_t n_total    = layer.kvarn_n_sealed[0] * 128 + tail_count;
+    // Position source for the on-device content-length derivation inside
+    // ggml_kvarn_attn_decode (see its doc comment, ggml.h) - same stash
+    // mechanism get_kvarn uses (see kv_layer::kvarn_last_k_idxs's doc
+    // comment). k_idxs and v_idxs carry the same position values for
+    // kvarn's restricted (single-seq, append-only) scope, so either works;
+    // use k_idxs for both K and V's contribution here.
+    ggml_tensor * idxs = layer.kvarn_last_k_idxs;
+    GGML_ASSERT(idxs != nullptr && "KVarN: build_attn_decode_kvarn called before cpy_kvarn populated idxs for this build");
 
-    ggml_tensor * out = ggml_kvarn_attn_decode(ctx, q, layer.kvarn_sealed, layer.kvarn_k_tail, layer.kvarn_v_tail,
-            (int) layer.kvarn_key_bits, (int) layer.kvarn_value_bits, (int) layer.kvarn_n_head_kv,
-            (int) n_total, (int) tail_count, kq_scale);
+    ggml_tensor * out = ggml_kvarn_attn_decode(ctx, q, layer.kvarn_sealed, layer.kvarn_k_tail, layer.kvarn_v_tail, idxs,
+            (int) layer.kvarn_key_bits, (int) layer.kvarn_value_bits, (int) layer.kvarn_n_head_kv, kq_scale);
 
     out = ggml_turbo_wht(ctx, out, /*direction=*/1, 128, nullptr);
 

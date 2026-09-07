@@ -6468,37 +6468,43 @@ struct ggml_tensor * ggml_kvarn_seal(
 
 // ggml_kvarn_materialize
 //
-// Reconstructs `n_total` tokens of one side (K or V, per `is_v`) into a
-// dense F32 tensor, mixing dequantized sealed groups with the still-exact
-// live tail. Called once per side per layer whenever attention needs to
-// read a kvarn-backed cache. Output stays in the rotated domain, same
-// convention as this fork's existing turbo dequantize functions.
+// Reconstructs `n_kv` tokens of one side (K or V, per `is_v`) into a dense
+// F32 tensor, mixing dequantized sealed groups with the still-exact live
+// tail. Called once per side per layer whenever attention needs to read a
+// kvarn-backed cache. Output stays in the rotated domain, same convention
+// as this fork's existing turbo dequantize functions.
+//
+// `n_kv` fixes the output SHAPE (must be the padded, reuse-stable bucket -
+// see the doc comment on the declaration, ggml.h). The real content length
+// and tail/sealed split are derived from `idxs` at kernel execution time,
+// not from op_params - see ggml_kvarn_store's doc comment for why this
+// matters under graph reuse.
 
 struct ggml_tensor * ggml_kvarn_materialize(
         struct ggml_context * ctx,
-        struct ggml_tensor  * sealed, // [tile_bytes, n_groups] I8 (n_groups may be 0)
-        struct ggml_tensor  * tail,   // [128, 128] F32, only the first tail_count rows are valid
+        struct ggml_tensor  * sealed, // [tile_bytes, n_groups_max] I8 (n_groups_max may be 0)
+        struct ggml_tensor  * tail,   // [128, 128] F32
+        struct ggml_tensor  * idxs,   // [n_tokens] I64 - element [n_tokens-1]+1 gives the real content length
         int                   key_bits,
         int                   value_bits,
         int                   is_v,
-        int                   n_total,
-        int                   tail_count) {
+        int                   n_kv) {
     GGML_ASSERT(sealed->type == GGML_TYPE_I8);
     GGML_ASSERT(tail->type == GGML_TYPE_F32 && tail->ne[0] == 128);
+    GGML_ASSERT(idxs->type == GGML_TYPE_I64 && idxs->ne[0] >= 1);
     GGML_ASSERT(ggml_is_contiguous(sealed) && ggml_is_contiguous(tail));
-    GGML_ASSERT(n_total >= 0 && tail_count >= 0 && tail_count <= 128);
+    GGML_ASSERT(n_kv >= 0);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, n_total > 0 ? n_total : 1);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, n_kv > 0 ? n_kv : 1);
 
     result->op     = GGML_OP_KVARN_MATERIALIZE;
     result->src[0] = sealed;
     result->src[1] = tail;
+    result->src[2] = idxs;
 
-    memcpy(result->op_params + 0, &key_bits,   sizeof(int32_t));
-    memcpy(result->op_params + 1, &value_bits, sizeof(int32_t));
-    memcpy(result->op_params + 2, &is_v,       sizeof(int32_t));
-    memcpy(result->op_params + 3, &n_total,    sizeof(int32_t));
-    memcpy(result->op_params + 4, &tail_count, sizeof(int32_t));
+    ggml_set_op_params_i32(result, 0, key_bits);
+    ggml_set_op_params_i32(result, 1, value_bits);
+    ggml_set_op_params_i32(result, 2, is_v);
 
     return result;
 }
@@ -6515,15 +6521,15 @@ struct ggml_tensor * ggml_kvarn_attn_decode(
         struct ggml_tensor  * sealed, // [tile_bytes, n_groups_max, n_head_kv] I8
         struct ggml_tensor  * k_tail, // [128, 128, n_head_kv] F32
         struct ggml_tensor  * v_tail, // [128, 128, n_head_kv] F32
+        struct ggml_tensor  * idxs,   // [n_tokens] I64 - element [n_tokens-1]+1 gives the real content length
         int                   key_bits,
         int                   value_bits,
         int                   n_head_kv,
-        int                   n_total,
-        int                   tail_count,
         float                 kq_scale) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
     GGML_ASSERT(sealed->type == GGML_TYPE_I8);
     GGML_ASSERT(k_tail->type == GGML_TYPE_F32 && v_tail->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->type == GGML_TYPE_I64 && idxs->ne[0] >= 1);
     GGML_ASSERT(q->ne[1] % n_head_kv == 0 && "n_head_q must be an exact multiple of n_head_kv");
     GGML_ASSERT(ggml_is_contiguous(q));
 
@@ -6534,15 +6540,14 @@ struct ggml_tensor * ggml_kvarn_attn_decode(
     result->src[1] = sealed;
     result->src[2] = k_tail;
     result->src[3] = v_tail;
+    result->src[4] = idxs;
 
     const int32_t n_group_broadcast = (int32_t) (q->ne[1] / n_head_kv);
-    memcpy(result->op_params + 0, &key_bits,          sizeof(int32_t));
-    memcpy(result->op_params + 1, &value_bits,        sizeof(int32_t));
-    memcpy(result->op_params + 2, &n_head_kv,         sizeof(int32_t));
-    memcpy(result->op_params + 3, &n_group_broadcast, sizeof(int32_t));
-    memcpy(result->op_params + 4, &n_total,           sizeof(int32_t));
-    memcpy(result->op_params + 5, &tail_count,        sizeof(int32_t));
-    memcpy(result->op_params + 6, &kq_scale,          sizeof(float));
+    ggml_set_op_params_i32(result, 0, key_bits);
+    ggml_set_op_params_i32(result, 1, value_bits);
+    ggml_set_op_params_i32(result, 2, n_head_kv);
+    ggml_set_op_params_i32(result, 3, n_group_broadcast);
+    memcpy(result->op_params + 4, &kq_scale, sizeof(float));
 
     return result;
 }

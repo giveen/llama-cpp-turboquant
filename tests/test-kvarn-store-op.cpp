@@ -167,8 +167,8 @@ int main() {
             struct ggml_tensor * k_tail_h = ggml_view_2d(ctx, k_tail, head_dim, 128, k_tail->nb[1], (size_t) h * k_tail->nb[2]);
             struct ggml_tensor * v_tail_h = ggml_view_2d(ctx, v_tail, head_dim, 128, v_tail->nb[1], (size_t) h * v_tail->nb[2]);
 
-            struct ggml_tensor * mat_k = ggml_kvarn_materialize(ctx, sealed_h, k_tail_h, bits, bits, 0, n_total, tail_count_end);
-            struct ggml_tensor * mat_v = ggml_kvarn_materialize(ctx, sealed_h, v_tail_h, bits, bits, 1, n_total, tail_count_end);
+            struct ggml_tensor * mat_k = ggml_kvarn_materialize(ctx, sealed_h, k_tail_h, idxs, bits, bits, 0, n_total);
+            struct ggml_tensor * mat_v = ggml_kvarn_materialize(ctx, sealed_h, v_tail_h, idxs, bits, bits, 1, n_total);
 
             struct ggml_cgraph * gf2 = ggml_new_graph(ctx);
             ggml_build_forward_expand(gf2, mat_k);
