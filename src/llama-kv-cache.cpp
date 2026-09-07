@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kvarn-store.h" // kvarn_make_layout / kvarn_tile_layout declarations
 
 #include <algorithm>
 #include <cassert>
@@ -118,12 +119,23 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                 int32_t    kvarn_key_bits,
+                 int32_t    kvarn_value_bits) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    const bool kvarn_active = kvarn_key_bits > 0 && kvarn_value_bits > 0;
+    if (kvarn_active) {
+        GGML_ASSERT(n_seq_max == 1 && "KVarN v1 supports a single sequence only");
+        GGML_ASSERT(unified && "KVarN v1 requires a unified (single-stream) cache");
+        GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_NONE && n_swa == 0 && "KVarN v1 does not support SWA");
+        GGML_ASSERT(!hparams.is_mla() && "KVarN is not supported for MLA models (K/V cache types must match)");
+        GGML_ASSERT(!mem_other && "KVarN v1 does not support shared/other cache layers");
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -191,10 +203,11 @@ llama_kv_cache::llama_kv_cache(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
+                // +3 per layer for KVarN (kvarn_k_tail, kvarn_v_tail, kvarn_sealed), when active
                 // Size this for the actual layer loop below. Some models expose extra
                 // KV-bearing layers through n_layer_all, and under-reserving tensor
                 // metadata corrupts later KV/checkpoint operations.
-                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + 3 + (kvarn_active ? 3u*n_layer : 0u))*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -411,8 +424,21 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
+        // KVarN layers don't use k/v at all (see cpy_kvarn/get_kvarn) - real
+        // storage is kvarn_k_tail/kvarn_v_tail/kvarn_sealed below, sized for
+        // the actual context. Still allocate k/v as valid (non-null), tiny
+        // (kv_size=1) placeholders rather than skipping them: every other
+        // piece of generic bookkeeping (size_k_bytes/size_v_bytes, type_k/
+        // type_v, memory_breakdown, defrag) already assumes layers[ikv].k/v
+        // are non-null tensors, and this avoids adding a null-check at each
+        // of those sites for a marginal one-row allocation. Using the real
+        // kv_size here would silently defeat KVarN's whole point: the exact
+        // same wasted-memory footprint as f16 would remain, on top of the
+        // real compressed storage, instead of the intended savings.
+        const uint32_t kv_size_kv_alloc = kvarn_active ? 1u : kv_size;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size_kv_alloc, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size_kv_alloc, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
@@ -421,13 +447,40 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa_eff, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_size_kv_alloc, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa_eff, kv_size_kv_alloc, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream });
+        layers.push_back({ il, k, v, k_stream, v_stream, nullptr, nullptr, nullptr, 0, 0, 0, {}, {}, {} });
+
+        if (kvarn_active) {
+            GGML_ASSERT(n_embd_head_k == 128 && n_embd_head_v == 128 && "KVarN v1 requires head_dim == 128");
+            GGML_ASSERT(kv_size % 128 == 0 && "KVarN v1 requires kv_size to be a multiple of 128");
+
+            const uint32_t n_head_kv     = hparams.n_head_kv(il);
+            const uint32_t n_groups_max  = kv_size / 128;
+            const kvarn_tile_layout layout = kvarn_make_layout(kvarn_key_bits, kvarn_value_bits);
+
+            kv_layer & layer = layers.back();
+
+            layer.kvarn_key_bits   = (uint32_t) kvarn_key_bits;
+            layer.kvarn_value_bits = (uint32_t) kvarn_value_bits;
+            layer.kvarn_n_head_kv  = n_head_kv;
+            layer.kvarn_tail_count.assign(n_head_kv, 0u);
+            layer.kvarn_n_sealed.assign(n_head_kv, 0u);
+
+            layer.kvarn_k_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_head_kv);
+            layer.kvarn_v_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_head_kv);
+            layer.kvarn_sealed = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, (int64_t) layout.tile_bytes, n_groups_max, n_head_kv);
+
+            ggml_format_name(layer.kvarn_k_tail, "cache_%skvarn_k_tail_l%d", name_tag, il);
+            ggml_format_name(layer.kvarn_v_tail, "cache_%skvarn_v_tail_l%d", name_tag, il);
+            ggml_format_name(layer.kvarn_sealed, "cache_%skvarn_sealed_l%d", name_tag, il);
+
+            layer.kvarn_k_seal_ready.resize(n_head_kv);
+        }
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
@@ -1448,6 +1501,16 @@ bool llama_kv_cache::get_can_shift() const {
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+    // build_graph_shift() views layers[ikv].k as [.., get_size()*n_stream] -
+    // for a KVarN layer that tensor is a 1-row placeholder (see the
+    // constructor; real storage is kvarn_k_tail/kvarn_sealed), so that view
+    // would read out of bounds. Not implemented yet - fail closed rather
+    // than corrupt memory if a long enough kvarn session ever triggers it.
+    for (const auto & layer : layers) {
+        if (layer.kvarn_key_bits > 0) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1518,8 +1581,294 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+// KVarN: writes `cur` ([128, n_head_kv, n_tokens], F32, post-RoPE but NOT yet
+// rotated - matches how build_attn calls cpy_k/cpy_v with plain k_cur/v_cur;
+// turbo's own rotation happens inside its SET_ROWS backend kernel, invisible
+// at this level) into this layer's tail, sealing any group that completes.
+// Applies the per-token Hadamard rotation itself, reusing ggml_turbo_wht
+// (direction=0, group=128) rather than adding a third custom op - SEAL's
+// Sinkhorn balancing only cares about the statistics of whatever floats are
+// in the tail, not which orthonormal rotation produced them, so sharing
+// turbo's (sign-randomized) transform instead of kvarn_hadamard_128's plain
+// one changes nothing about correctness, only which valid rotation is used.
+// Called once for K then once for V per ubatch, always in that order (matches
+// build_attn) - the V call's seal depends on that order to see K's freshly
+// -written tail node from the same graph.
+ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v, uint32_t pos0) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    const kv_layer & clayer = layers[ikv];
+    kv_layer & layer = const_cast<kv_layer &>(clayer); // only the mutable bookkeeping fields are touched
+
+    const int64_t n_head_kv = cur->ne[1];
+    const int64_t n_tokens  = cur->ne[2];
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && "KVarN cpy expects F32 input (post-rotation)");
+    GGML_ASSERT(cur->ne[0] == 128 && "KVarN requires head_dim == 128");
+    GGML_ASSERT((uint32_t) n_head_kv == layer.kvarn_n_head_kv);
+
+    ggml_tensor * tail_base  = is_v ? layer.kvarn_v_tail : layer.kvarn_k_tail;
+    const int32_t key_bits   = (int32_t) layer.kvarn_key_bits;
+    const int32_t value_bits = (int32_t) layer.kvarn_value_bits;
+
+    const size_t tail_row_bytes  = 128 * sizeof(float);
+    const size_t tail_head_bytes = 128 * tail_row_bytes;
+
+    // Derive starting state from the absolute position (sinfo.idxs[0][0] at
+    // the call site), NOT from layer.kvarn_tail_count/n_sealed directly:
+    // llama_context::sched_reserve() builds several speculative graphs with
+    // hypothetical (non-monotonic, often large) ubatch sizes purely to size
+    // compute buffers, calling this function repeatedly outside any real
+    // decode sequence. An accumulating counter overflows kvarn_sealed's fixed
+    // capacity after a couple of those dry runs; deriving from pos0 instead
+    // makes repeated calls at the same position idempotent (matches how
+    // find_slot/v_cells are already reserve-safe), while still advancing
+    // correctly across genuine sequential decode, since pos0 there strictly
+    // increases exactly as the old counter would have.
+    const uint32_t tail_count0 = pos0 % 128;
+    const uint32_t n_sealed0   = pos0 / 128;
+
+    ggml_tensor * result   = nullptr;
+    ggml_tensor * chain    = nullptr; // see `link` below
+    ggml_tensor * fallback = nullptr;
+
+    // ggml_build_forward_expand only walks ANCESTORS of the single tensor it
+    // is given - anything produced here that isn't reachable that way is
+    // silently never scheduled or executed (confirmed against ggml.c's
+    // implementation), not merely "dropped from an optimization". The
+    // original version of this function reassigned a single `result`
+    // variable inside nested per-head/per-group loops with no dependency
+    // edge between successive iterations' writes, so only the LAST group of
+    // the LAST head ever actually ran - every earlier head's tail write and
+    // every earlier group's seal were quietly no-ops. `link` threads every
+    // write that has no other downstream consumer in this graph (tail
+    // writes always; seal writes, which nothing else reads afterward) onto
+    // one chain via an unused src slot, so the single tensor this function
+    // returns transitively reaches all of them.
+    auto link = [&](ggml_tensor * node) {
+        if (chain) {
+            node->src[GGML_MAX_SRC - 2] = chain;
+        }
+        chain  = node;
+        result = node;
+    };
+
+    for (int64_t h = 0; h < n_head_kv; h++) {
+        // fresh view rooted at the persistent base tensor - a node from the
+        // previous ubatch's (now freed) graph would be dangling.
+        ggml_tensor * tail_view = ggml_view_2d(ctx, tail_base, 128, 128, tail_row_bytes, (size_t) h * tail_head_bytes);
+
+        ggml_tensor * cur_h = ggml_cont(ctx, ggml_view_2d(ctx, cur, 128, n_tokens, cur->nb[2], (size_t) h * cur->nb[1]));
+        cur_h = ggml_turbo_wht(ctx, cur_h, /*direction=*/0, 128, nullptr);
+
+        // Assemble every row this call will touch - the still-live old tail
+        // (if any) followed by the new tokens - into one contiguous, freshly
+        // allocated buffer. A single call can complete more than one group
+        // (e.g. a 2048-token prefill crosses 16 group boundaries): writing
+        // each completed group into the single recycled tail_base, as the
+        // original code did, means group 2's write overwrites group 1's
+        // data in-place before cpy_v's seal (a separate call, running after
+        // ALL of cpy_k's groups have already been written) ever reads it -
+        // "node_track[h]" for group 1 and group 2 are different ggml_tensor
+        // objects but the SAME underlying memory. Building a per-call
+        // scratch stream instead means each completed group keeps its own,
+        // never-overwritten byte range for cpy_v to read from later.
+        const int64_t total_rows     = (int64_t) tail_count0 + n_tokens;
+        const int64_t n_complete     = total_rows / 128;
+        const uint32_t tail_count_end = (uint32_t) (total_rows % 128);
+
+        ggml_tensor * stream = cur_h;
+        if (tail_count0 > 0) {
+            ggml_tensor * old_tail = ggml_cont(ctx, ggml_view_2d(ctx, tail_view, 128, tail_count0, tail_view->nb[1], 0));
+            stream = ggml_concat(ctx, old_tail, cur_h, 1);
+        }
+        fallback = stream;
+
+        // K side: start this call's list of per-group completed-tail
+        // snapshots fresh (views into THIS call's own `stream`, so unlike
+        // the old node_track-based approach they are never overwritten by a
+        // later group in the same call). V side: walk it in the same
+        // completion order - guaranteed to line up 1:1 since K and V share
+        // the same (tail_count0, n_tokens) for a given ubatch.
+        if (!is_v) {
+            layer.kvarn_k_seal_ready[h].clear();
+        }
+
+        for (int64_t g = 0; g < n_complete; g++) {
+            ggml_tensor * group_view = ggml_view_2d(ctx, stream, 128, 128, stream->nb[1], (size_t) g * 128 * stream->nb[1]);
+
+            if (!is_v) {
+                layer.kvarn_k_seal_ready[h].push_back(group_view);
+                // Not linked here: nothing else in cpy_k's own call reads
+                // tail_base for this group again, but cpy_v's seal below
+                // (in the SEPARATE call that follows) holds a direct pointer
+                // to `group_view` as its k_node input, which transitively
+                // pulls in `stream`/`cur_h` when THAT call's own expansion
+                // runs - a second, independent ggml_build_forward_expand,
+                // not a re-walk of this one.
+            } else {
+                auto & k_ready = layer.kvarn_k_seal_ready[h];
+                GGML_ASSERT((size_t) g < k_ready.size() &&
+                        "KVarN: cpy_v sealed more groups than cpy_k completed for this head in the same call");
+                ggml_tensor * k_node = k_ready[g];
+
+                ggml_tensor * record = ggml_kvarn_seal(ctx, k_node, group_view, key_bits, value_bits, 16);
+
+                const size_t tile_bytes = layer.kvarn_sealed->nb[1];
+                const uint32_t group_idx = n_sealed0 + (uint32_t) g;
+                ggml_tensor * dst_slot = ggml_view_1d(ctx, layer.kvarn_sealed, (int64_t) tile_bytes,
+                        (size_t) h * layer.kvarn_sealed->nb[2] + (size_t) group_idx * tile_bytes);
+
+                link(ggml_cpy(ctx, record, dst_slot));
+            }
+        }
+
+        if (tail_count_end > 0) {
+            ggml_tensor * leftover = ggml_view_2d(ctx, stream, 128, tail_count_end, stream->nb[1], (size_t) n_complete * 128 * stream->nb[1]);
+            ggml_tensor * leftover_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, leftover), 128 * (int64_t) tail_count_end);
+            link(ggml_set_1d_inplace(ctx, tail_view, leftover_flat, 0));
+        }
+
+        layer.kvarn_tail_count[h] = tail_count_end;
+        layer.kvarn_n_sealed[h]   = n_sealed0 + (uint32_t) n_complete;
+    }
+
+    // Every real call produces at least one linked write for is_v (a seal or
+    // a leftover-tail write always happens - total_rows can't simultaneously
+    // have leftover groups AND no remainder). is_v==false CAN legitimately
+    // link nothing (a perfectly group-aligned call, no leftover tail) since
+    // its group data has no consumer of its own within this call; fall back
+    // to the last head's `stream` so this function still returns a valid,
+    // non-null node to build_forward_expand in that case.
+    if (!chain) {
+        result = fallback;
+    }
+    GGML_ASSERT(result != nullptr);
+
+    // `idxs` (k_idxs/v_idxs) is built generically by build_attn for every KV
+    // layer and is unconditionally written by set_input_k_idxs/set_input_v_idxs
+    // regardless of whether this layer's cpy actually consumes it - kvarn's
+    // write path decides destination purely from host-side tail/seal state,
+    // so idxs's *value* is never read here. But leaving it fully disconnected
+    // from the graph means the scheduler treats it as unreachable and never
+    // gives it a real backend buffer, so that later write aborts. Attach it as
+    // an unused extra source (last slot, guaranteed free - ggml_set_1d_inplace
+    // and ggml_cpy each only populate src[0]/src[1]) purely to keep it live
+    // and allocated, the same idiom ggml_turbo_wht uses for its optional scale
+    // tensor in src[1].
+    result->src[GGML_MAX_SRC - 1] = idxs;
+
+    return result;
+}
+
+// KVarN: reconstructs `n_kv` tokens of one side (K or V) for this layer, per
+// head, into a [128, n_head_kv, n_kv] F32 tensor. Applies the inverse
+// rotation itself (unlike turbo, which leaves output rotated and rotates Q
+// to match instead) so build_attn needs no kvarn-specific handling at all -
+// there is no ggml_type tag to gate on here the way turbo's k->type check
+// works, since kvarn's cache tensors are plain F32/I8, not a dedicated type.
+ggml_tensor * llama_kv_cache::get_kvarn(ggml_context * ctx, int32_t il, uint32_t n_kv, bool is_v) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    const kv_layer & layer = layers[ikv];
+
+    const int32_t key_bits   = (int32_t) layer.kvarn_key_bits;
+    const int32_t value_bits = (int32_t) layer.kvarn_value_bits;
+    const uint32_t n_head_kv = layer.kvarn_n_head_kv;
+
+    ggml_tensor * tail_base = is_v ? layer.kvarn_v_tail : layer.kvarn_k_tail;
+
+    const size_t tail_row_bytes  = 128 * sizeof(float);
+    const size_t tail_head_bytes = 128 * tail_row_bytes;
+    const size_t sealed_tile_bytes = layer.kvarn_sealed->nb[1];
+
+    std::vector<ggml_tensor *> per_head(n_head_kv);
+
+    for (uint32_t h = 0; h < n_head_kv; h++) {
+        const uint32_t tail_count = layer.kvarn_tail_count[h];
+        const uint32_t n_this     = std::min<uint32_t>(n_kv, layer.kvarn_n_sealed[h] * 128 + tail_count);
+
+        ggml_tensor * tail_h = ggml_view_2d(ctx, tail_base, 128, 128, tail_row_bytes, (size_t) h * tail_head_bytes);
+        ggml_tensor * sealed_h = ggml_view_2d(ctx, layer.kvarn_sealed, (int64_t) sealed_tile_bytes, layer.kvarn_n_sealed[h],
+                layer.kvarn_sealed->nb[1], (size_t) h * layer.kvarn_sealed->nb[2]);
+
+        ggml_tensor * mat;
+        if (n_this == 0) {
+            // Nothing written yet for this head (e.g. the graph-reserve pass
+            // before any real decoding, or n_kv == 0). tail_h is guaranteed
+            // zero at this point (cleared at cache construction, untouched
+            // since) - broadcast one zero row of it to [128, n_kv] rather
+            // than calling ggml_kvarn_materialize, whose kernel leaves its
+            // output uninitialized when n_total <= 0.
+            ggml_tensor * zero_row = ggml_view_2d(ctx, tail_h, 128, 1, tail_h->nb[1], 0);
+            mat = n_kv > 0 ? ggml_repeat_4d(ctx, zero_row, 128, n_kv, 1, 1) : zero_row;
+        } else {
+            mat = ggml_kvarn_materialize(ctx, sealed_h, tail_h, key_bits, value_bits, is_v ? 1 : 0,
+                    (int) n_this, (int) tail_count);
+            mat = ggml_turbo_wht(ctx, mat, /*direction=*/1, 128, nullptr);
+
+            // pad up to n_kv with zeros if the cache holds fewer than n_kv
+            // tokens so far (matches get_n_kv's padding convention for other
+            // types). mat is [128 (ne[0]), n_this (ne[1])]; ggml_pad's args
+            // are per-dimension amounts (p0->ne[0], p1->ne[1], ...), so pad
+            // ne[1] (tokens) directly - no transpose needed.
+            if (n_this < n_kv) {
+                mat = ggml_pad(ctx, mat, 0, (int) (n_kv - n_this), 0, 0);
+            }
+        }
+
+        per_head[h] = ggml_reshape_3d(ctx, mat, 128, 1, n_kv);
+    }
+
+    ggml_tensor * result = per_head[0];
+    for (uint32_t h = 1; h < n_head_kv; h++) {
+        result = ggml_concat(ctx, result, per_head[h], 1);
+    }
+
+    return result;
+}
+
+bool llama_kv_cache::is_kvarn(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    return layers[ikv].kvarn_key_bits > 0;
+}
+
+// Fused decode-attention path: rotates q the same way cpy_kvarn rotates K/V
+// (ggml_turbo_wht, direction 0, group 128), runs ggml_kvarn_attn_decode
+// directly against this layer's sealed/tail tensors (no dense materialize),
+// then inverse-rotates the (still-rotated) output - mirroring the two
+// turbo_wht calls get_kvarn makes around ggml_kvarn_materialize.
+ggml_tensor * llama_kv_cache::build_attn_decode_kvarn(ggml_context * ctx, ggml_tensor * q, int32_t il, float kq_scale) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    const kv_layer & layer = layers[ikv];
+
+    GGML_ASSERT(layer.kvarn_key_bits > 0 && layer.kvarn_value_bits > 0);
+    GGML_ASSERT(q->ne[0] == 128 && q->ne[2] == 1);
+
+    if (!ggml_is_contiguous(q)) {
+        q = ggml_cont(ctx, q);
+    }
+    q = ggml_turbo_wht(ctx, q, /*direction=*/0, 128, nullptr);
+
+    // All heads advance together for a single sequence (cpy_kvarn derives
+    // every head's starting state from the same pos0 each call), so head 0's
+    // counters describe the whole layer.
+    const uint32_t tail_count = layer.kvarn_tail_count[0];
+    const uint32_t n_total    = layer.kvarn_n_sealed[0] * 128 + tail_count;
+
+    ggml_tensor * out = ggml_kvarn_attn_decode(ctx, q, layer.kvarn_sealed, layer.kvarn_k_tail, layer.kvarn_v_tail,
+            (int) layer.kvarn_key_bits, (int) layer.kvarn_value_bits, (int) layer.kvarn_n_head_kv,
+            (int) n_total, (int) tail_count, kq_scale);
+
+    out = ggml_turbo_wht(ctx, out, /*direction=*/1, 128, nullptr);
+
+    return ggml_reshape_2d(ctx, out, out->ne[0] * out->ne[1], out->ne[2]);
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
+
+    if (layers[ikv].kvarn_key_bits > 0) {
+        return get_kvarn(ctx, il, n_kv, /*is_v=*/false);
+    }
 
     auto * k = layers[ikv].k;
 
@@ -1551,6 +1900,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
+
+    if (layers[ikv].kvarn_value_bits > 0) {
+        return get_kvarn(ctx, il, n_kv, /*is_v=*/true);
+    }
 
     auto * v = layers[ikv].v;
 
@@ -1588,9 +1941,14 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
-
     const int32_t ikv = map_layer_ids.at(il);
+
+    if (layers[ikv].kvarn_key_bits > 0) {
+        GGML_ASSERT(sinfo.n_stream() == 1 && "KVarN v1 requires a single stream");
+        return cpy_kvarn(ctx, k_cur, k_idxs, il, /*is_v=*/false, sinfo.idxs[0][0]);
+    }
+
+    GGML_UNUSED(sinfo);
 
     ggml_tensor * k = layers[ikv].k;
 
@@ -1643,9 +2001,14 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
-
     const int32_t ikv = map_layer_ids.at(il);
+
+    if (layers[ikv].kvarn_value_bits > 0) {
+        GGML_ASSERT(sinfo.n_stream() == 1 && "KVarN v1 requires a single stream");
+        return cpy_kvarn(ctx, v_cur, v_idxs, il, /*is_v=*/true, sinfo.idxs[0][0]);
+    }
+
+    GGML_UNUSED(sinfo);
 
     auto * v = layers[ikv].v;
 
@@ -2155,7 +2518,21 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += layer.k ? ggml_nbytes(layer.k) : 0;
+        if (layer.kvarn_key_bits > 0) {
+            // layer.k above is just a 1-row placeholder (see the constructor) -
+            // the real K storage is kvarn_k_tail (fixed-size live tail) plus
+            // this layer's share of kvarn_sealed (K's payload/metadata region
+            // only - kvarn_sealed holds both K and V per record, so charge
+            // K's fraction of each record rather than the whole tensor here;
+            // size_v_bytes below charges the remaining fraction).
+            size_k_bytes += ggml_nbytes(layer.kvarn_k_tail);
+            if (layer.kvarn_sealed) {
+                const kvarn_tile_layout layout = kvarn_make_layout(layer.kvarn_key_bits, layer.kvarn_value_bits);
+                const size_t k_share_per_record = layout.k_payload_bytes + 3 * 128 * sizeof(uint16_t);
+                size_k_bytes += (size_t) ggml_nelements(layer.kvarn_sealed) / layout.tile_bytes * k_share_per_record;
+            }
+        }
     }
 
     return size_k_bytes;
@@ -2166,6 +2543,14 @@ size_t llama_kv_cache::size_v_bytes() const {
 
     for (const auto & layer : layers) {
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        if (layer.kvarn_value_bits > 0) {
+            size_v_bytes += ggml_nbytes(layer.kvarn_v_tail);
+            if (layer.kvarn_sealed) {
+                const kvarn_tile_layout layout = kvarn_make_layout(layer.kvarn_key_bits, layer.kvarn_value_bits);
+                const size_t v_share_per_record = layout.v_payload_bytes + 3 * 128 * sizeof(uint16_t);
+                size_v_bytes += (size_t) ggml_nelements(layer.kvarn_sealed) / layout.tile_bytes * v_share_per_record;
+            }
+        }
     }
 
     return size_v_bytes;
@@ -2304,6 +2689,23 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
+    // state_write_data below reads each layer's K/V tensor by a flat byte
+    // offset into cell-position order - meaningless for a kvarn-active layer,
+    // whose actual content lives in kvarn_k_tail/kvarn_v_tail/kvarn_sealed
+    // (and their tail/seal bookkeeping counters), not in layers[ikv].k/v.
+    // Saving state this way would silently write stale/empty placeholder
+    // tensors, not the real compressed history - refuse rather than produce
+    // a state file that looks valid and isn't. Mirrors how this codebase
+    // already refuses state save/load for other storage layouts state_write
+    // /state_read's flat-offset assumption doesn't hold for.
+    for (const auto & layer : layers) {
+        if (layer.kvarn_key_bits > 0 || layer.kvarn_value_bits > 0) {
+            throw std::runtime_error(
+                "llama_state_*: saving KV cache state is not supported for a KVarN-active "
+                "cache (--kvarn-key-bits/--kvarn-value-bits)");
+        }
+    }
+
     GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2381,6 +2783,18 @@ const slot_info_vec_t *   sinfos_in) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+
+    // See the matching check in state_write() - state_read_data below writes
+    // each layer's K/V tensor by the same flat cell-position byte offset,
+    // which doesn't correspond to anything meaningful for a kvarn-active
+    // layer's actual storage.
+    for (const auto & layer : layers) {
+        if (layer.kvarn_key_bits > 0 || layer.kvarn_value_bits > 0) {
+            throw std::runtime_error(
+                "llama_state_*: loading KV cache state is not supported for a KVarN-active "
+                "cache (--kvarn-key-bits/--kvarn-value-bits)");
+        }
     }
 
     GGML_UNUSED(flags);
@@ -3007,6 +3421,14 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+bool llama_kv_cache_context::is_kvarn(int32_t il) const {
+    return kv->is_kvarn(il);
+}
+
+ggml_tensor * llama_kv_cache_context::build_attn_decode_kvarn(ggml_context * ctx, ggml_tensor * q, int32_t il, float kq_scale) const {
+    return kv->build_attn_decode_kvarn(ctx, q, il, kq_scale);
 }
 
 ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {

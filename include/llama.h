@@ -401,6 +401,12 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        // KVarN: variance-normalized KV cache compression (4/5/6-bit only).
+        // 0 = disabled. Requires n_seq_max == 1, kv_unified == true, no SWA,
+        // no MLA, and head_dim == 128 for every KV-bearing layer. [EXPERIMENTAL]
+        int32_t kvarn_key_bits;
+        int32_t kvarn_value_bits;
+
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
 

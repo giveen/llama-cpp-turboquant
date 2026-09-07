@@ -58,6 +58,12 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // Whether any layer's KV cache uses KVarN compression. cpy_kvarn emits
+    // graph nodes proportional to ubatch_size/128 per layer (unlike every
+    // other cache type's fixed one ggml_set_rows node), so graph_max_nodes()
+    // needs this to size the graph-building arena large enough - see there.
+    bool kvarn_active;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

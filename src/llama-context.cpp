@@ -262,6 +262,7 @@ llama_context::llama_context(
     }
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.kvarn_active = params.kvarn_key_bits > 0 && params.kvarn_value_bits > 0;
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -412,11 +413,13 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k           =*/ params.type_k,
+            /*.type_v           =*/ params.type_v,
+            /*.kvarn_key_bits   =*/ params.kvarn_key_bits,
+            /*.kvarn_value_bits =*/ params.kvarn_value_bits,
+            /*.swa_full         =*/ params.swa_full,
+            /*.ctx_type         =*/ cparams.ctx_type,
+            /*.mem_other        =*/ llama_get_memory(cparams.ctx_other),
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1623,7 +1626,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // KVarN's graph topology (how many set_1d_inplace/seal/cpy nodes cpy_k/
+    // cpy_v emit, and the destination byte offsets baked into them) depends
+    // on host-side position state (tail_count0/n_sealed0, derived from
+    // sinfo.idxs[0][0]) that llm_graph_params/can_reuse know nothing about -
+    // two ubatches with identical shape but different positions produce
+    // graphs that look reusable but write to different places. Reusing the
+    // previous graph would skip rebuilding those nodes entirely, silently
+    // replaying stale destination offsets against new input data. Force a
+    // rebuild on every call for kvarn-active contexts instead.
+    if (!graph_reuse_disable && !cparams.kvarn_active && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2658,6 +2670,23 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+
+    if (cparams.kvarn_active) {
+        // Unlike every other KV cache type (one ggml_set_rows node per
+        // cpy_k/cpy_v call regardless of ubatch size), cpy_kvarn emits a
+        // fresh view/cont/reshape/set_1d_inplace chain per 128-token group
+        // crossed within the call, per head, plus a seal+cpy pair whenever a
+        // group completes - proportional to ubatch size, not accounted for
+        // by the tensor-count-based estimate above. Without this, a large
+        // ubatch (e.g. llama-perplexity's default batch_size == n_ctx) blows
+        // through the graph-building context's fixed object arena during
+        // sched_reserve's speculative large-ubatch pass (GGML_ASSERT(obj_new)
+        // in ggml_new_tensor_impl). 128 nodes/group/layer is a generous
+        // upper bound - real cost is roughly 8 * n_head_kv.
+        const uint32_t groups_per_ubatch = n_tokens / 128 + 2;
+        res += model.hparams.n_layer() * groups_per_ubatch * 128u;
+    }
+
     return res;
 }
 
@@ -3803,6 +3832,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kvarn_key_bits              =*/ 0,
+        /*.kvarn_value_bits            =*/ 0,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.abort_callback              =*/ nullptr,

@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-kvarn-quant.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11426,6 +11427,178 @@ void ggml_compute_forward_turbo_wht(
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
         default: GGML_ABORT("fatal error");
+    }
+}
+
+// ggml_compute_forward_kvarn_seal
+//
+// Single-threaded: one call quantizes one 128-token group, a small,
+// already-fast operation (see ggml-kvarn-quant.c); not worth splitting
+// across threads for a first correctness-focused implementation.
+
+void ggml_compute_forward_kvarn_seal(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * k_tail = dst->src[0];
+    const ggml_tensor * v_tail = dst->src[1];
+
+    int32_t key_bits, value_bits, sinkhorn_iters;
+    memcpy(&key_bits,       dst->op_params + 0, sizeof(int32_t));
+    memcpy(&value_bits,     dst->op_params + 1, sizeof(int32_t));
+    memcpy(&sinkhorn_iters, dst->op_params + 2, sizeof(int32_t));
+
+    const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
+
+    kvarn_quantize_k_tile((const float *) k_tail->data, sinkhorn_iters, key_bits,   &layout, (uint8_t *) dst->data);
+    kvarn_quantize_v_tile((const float *) v_tail->data, sinkhorn_iters, value_bits, &layout, (uint8_t *) dst->data);
+}
+
+// ggml_compute_forward_kvarn_materialize
+//
+// Mirrors llama_kvarn_layer_store::read() (src/llama-kvarn-store.cpp),
+// which was validated standalone first: dequantize whichever sealed groups
+// fall within [0, n_total), then copy the still-exact tail rows.
+
+void ggml_compute_forward_kvarn_materialize(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * sealed = dst->src[0];
+    const ggml_tensor * tail   = dst->src[1];
+
+    int32_t key_bits, value_bits, is_v, n_total, tail_count;
+    memcpy(&key_bits,   dst->op_params + 0, sizeof(int32_t));
+    memcpy(&value_bits, dst->op_params + 1, sizeof(int32_t));
+    memcpy(&is_v,       dst->op_params + 2, sizeof(int32_t));
+    memcpy(&n_total,    dst->op_params + 3, sizeof(int32_t));
+    memcpy(&tail_count, dst->op_params + 4, sizeof(int32_t));
+
+    if (n_total <= 0) {
+        return;
+    }
+
+    const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
+    const int bits = is_v ? value_bits : key_bits;
+    const int n_sealed = (n_total - tail_count) / 128;
+
+    const uint8_t * sealed_data = (const uint8_t *) sealed->data;
+    const float   * tail_data   = (const float *)   tail->data;
+    float * out = (float *) dst->data;
+
+    float tile[128 * 128];
+
+    for (int g = 0; g < n_sealed; g++) {
+        const uint8_t * record = sealed_data + (size_t) g * layout.tile_bytes;
+        if (is_v) {
+            kvarn_dequantize_v_tile(record, bits, &layout, tile);
+        } else {
+            kvarn_dequantize_k_tile(record, bits, &layout, tile);
+        }
+
+        const int base = g * 128;
+        const int take = (128 < n_total - base) ? 128 : (n_total - base);
+        memcpy(out + (size_t) base * 128, tile, (size_t) take * 128 * sizeof(float));
+    }
+
+    const int from_tail = n_total - n_sealed * 128;
+    if (from_tail > 0) {
+        memcpy(out + (size_t) n_sealed * 128 * 128, tail_data, (size_t) from_tail * 128 * sizeof(float));
+    }
+}
+
+// ggml_compute_forward_kvarn_attn_decode
+//
+// CPU reference: dequantizes each sealed tile via the same functions
+// ggml_compute_forward_kvarn_materialize uses (correctness over speed here -
+// this is the fallback/reference path, not the optimized one), then does a
+// plain online-softmax accumulation. See ggml-cuda/kvarn-attn-decode.cu for
+// the rotation-commutes-with-attention argument and the parallel version.
+
+void ggml_compute_forward_kvarn_attn_decode(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * q      = dst->src[0];
+    const ggml_tensor * sealed = dst->src[1];
+    const ggml_tensor * k_tail = dst->src[2];
+    const ggml_tensor * v_tail = dst->src[3];
+
+    int32_t key_bits, value_bits, n_head_kv, n_group_broadcast, n_total, tail_count;
+    float   kq_scale;
+    memcpy(&key_bits,          dst->op_params + 0, sizeof(int32_t));
+    memcpy(&value_bits,        dst->op_params + 1, sizeof(int32_t));
+    memcpy(&n_head_kv,         dst->op_params + 2, sizeof(int32_t));
+    memcpy(&n_group_broadcast, dst->op_params + 3, sizeof(int32_t));
+    memcpy(&n_total,           dst->op_params + 4, sizeof(int32_t));
+    memcpy(&tail_count,        dst->op_params + 5, sizeof(int32_t));
+    memcpy(&kq_scale,          dst->op_params + 6, sizeof(float));
+
+    const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
+    const int n_sealed     = (n_total - tail_count) / 128;
+    const int n_groups_max = (int) sealed->ne[1];
+
+    const float   * q_data      = (const float *)   q->data;
+    const uint8_t * sealed_data = (const uint8_t *) sealed->data;
+    const float   * k_tail_data = (const float *)   k_tail->data;
+    const float   * v_tail_data = (const float *)   v_tail->data;
+    float * out = (float *) dst->data;
+
+    float k_tile[128 * 128];
+    float v_tile[128 * 128];
+
+    for (int64_t q_head = 0; q_head < q->ne[1]; q_head++) {
+        const int64_t kv_head = q_head / n_group_broadcast;
+        const float * qv = q_data + q_head * 128;
+        const uint8_t * sealed_kv = sealed_data + (size_t) kv_head * (size_t) n_groups_max * layout.tile_bytes;
+        const float * k_tail_h = k_tail_data + (size_t) kv_head * 128 * 128;
+        const float * v_tail_h = v_tail_data + (size_t) kv_head * 128 * 128;
+
+        double running_max = -1e30;
+        double running_sum = 0.0;
+        std::vector<double> acc(128, 0.0);
+
+        auto process_row = [&](const float * k_row, const float * v_row) {
+            double dot = 0.0;
+            for (int c = 0; c < 128; c++) dot += (double) qv[c] * k_row[c];
+            const double score = dot * kq_scale;
+
+            const double new_max = std::max(running_max, score);
+            const double rescale = exp(running_max - new_max);
+            const double w = exp(score - new_max);
+            for (int c = 0; c < 128; c++) acc[c] = acc[c] * rescale + w * v_row[c];
+            running_sum = running_sum * rescale + w;
+            running_max = new_max;
+        };
+
+        for (int g = 0; g < n_sealed; g++) {
+            const uint8_t * record = sealed_kv + (size_t) g * layout.tile_bytes;
+            kvarn_dequantize_k_tile(record, key_bits,   &layout, k_tile);
+            kvarn_dequantize_v_tile(record, value_bits, &layout, v_tile);
+            for (int r = 0; r < 128; r++) {
+                process_row(k_tile + (size_t) r * 128, v_tile + (size_t) r * 128);
+            }
+        }
+
+        const int from_tail = n_total - n_sealed * 128;
+        for (int r = 0; r < from_tail; r++) {
+            process_row(k_tail_h + (size_t) r * 128, v_tail_h + (size_t) r * 128);
+        }
+
+        float * out_row = out + q_head * 128;
+        const double denom = running_sum > 1e-20 ? running_sum : 1e-20;
+        for (int c = 0; c < 128; c++) {
+            out_row[c] = (float) (acc[c] / denom);
+        }
     }
 }
 
