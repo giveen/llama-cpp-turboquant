@@ -11,3 +11,7 @@
 void ggml_cuda_op_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_kvarn_cpy(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// Shared-memory sizing for KVarN store kernels.
+size_t ggml_cuda_kvarn_required_shared_bytes();
+size_t ggml_cuda_kvarn_low_shared_bytes();

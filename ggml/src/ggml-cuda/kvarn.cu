@@ -3,6 +3,24 @@
 #include "ggml-kvarn-quant.h"
 
 #include <cuda_fp16.h>
+#include <cstdlib>
+
+// Shared-memory sizing for KVarN store kernels.
+// KVAR_N_LOWSHMEM_BYTES is the minimum dynamic shared memory needed
+// for the low-memory variant of the KVarN store kernel (only sinkhorn
+// scratch, no full tile buffer). Used by ggml-cuda.cu to select the
+// correct kernel variant when GPU shared memory is constrained.
+static constexpr int KVAR_N_DIM = 128;
+static constexpr int KVAR_N_LOWSHMEM_FLOATS = 6 * KVAR_N_DIM + 2;
+static constexpr int KVAR_N_LOWSHMEM_BYTES = KVAR_N_LOWSHMEM_FLOATS * sizeof(float);
+
+size_t ggml_cuda_kvarn_required_shared_bytes() {
+    return (size_t) KVAR_N_DIM * (KVAR_N_DIM + 1) * sizeof(float);
+}
+
+size_t ggml_cuda_kvarn_low_shared_bytes() {
+    return KVAR_N_LOWSHMEM_BYTES;
+}
 
 // KVarN CUDA kernels. Mirrors the CPU reference in ggml-kvarn-quant.c
 // exactly (same clamp constants, same iteration order) - see that file for

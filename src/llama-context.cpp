@@ -4279,6 +4279,38 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_rm_plan(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1,
+             llama_pos * planned_p0,
+             llama_pos * planned_p1) {
+    if (!mem) {
+        if (planned_p0) *planned_p0 = p0;
+        if (planned_p1) *planned_p1 = p1;
+        return true;
+    }
+
+    return mem->seq_rm_plan(seq_id, p0, p1, planned_p0, planned_p1);
+}
+
+bool llama_memory_state_seq_can_save(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->state_seq_can_save(seq_id);
+}
+
+bool llama_memory_state_seq_can_restore(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->state_seq_can_restore(seq_id);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
