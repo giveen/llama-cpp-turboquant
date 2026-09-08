@@ -66,13 +66,8 @@ ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int
         turing_mma_available(device_info.cc) &&
         !(force_portable_capability != nullptr && atoi(force_portable_capability) != 0);
 #endif
-#if defined(GGML_CUDA_KVARN)
     constexpr bool kvarn_instances = true;
     const uint64_t minimum_dynamic_shared_bytes = ggml_cuda_kvarn_low_shared_bytes();
-#else
-    constexpr bool kvarn_instances = false;
-    constexpr uint64_t minimum_dynamic_shared_bytes = 0;
-#endif
     return ggml_cuda_fattn_kvarn_select_capabilities({
         backend,
         device_info.warp_size,
@@ -242,41 +237,6 @@ void ggml_cuda_kv_memory_transient_stats_record_tail(
     ggml_cuda_atomic_max(g_kv_mem_tail_total, total_bytes);
 }
 
-#if !defined(GGML_CUDA_KVARN)
-
-bool ggml_cuda_flash_attn_ext_kvarn_uses_views(const ggml_tensor * dst) {
-    return ggml_cuda_fattn_kvarn_uses_views(dst);
-}
-
-bool ggml_cuda_flash_attn_ext_kvarn_supported(int device, const ggml_tensor * dst) {
-    GGML_UNUSED(device);
-    GGML_UNUSED(dst);
-    return false;
-}
-
-bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(int device, const ggml_tensor * dst) {
-    GGML_UNUSED(device);
-    GGML_UNUSED(dst);
-    return false;
-}
-
-bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(int device, const ggml_tensor * dst) {
-    GGML_UNUSED(device);
-    GGML_UNUSED(dst);
-    return false;
-}
-
-bool ggml_cuda_flash_attn_ext_kvarn(
-        ggml_backend_cuda_context & ctx,
-        ggml_tensor * dst,
-        ggml_cuda_fattn_kvarn_entry_path entry_path) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_UNUSED(entry_path);
-    return false;
-}
-
-#else
 
 // Ширина блока редукции. Раньше здесь стояло GGML_CUDA_FATTN_KVARN_DIM (128),
 // то есть один блок из 128 нитей перебирал весь массив индексов — при n_kv 130304
@@ -1269,4 +1229,3 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
 }
 
-#endif // GGML_CUDA_KVARN
