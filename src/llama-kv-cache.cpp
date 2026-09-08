@@ -464,30 +464,41 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_stream, v_stream, nullptr, nullptr, nullptr, 0, 0, 0, {}, {}, {} });
 
         if (kvarn_active) {
-            GGML_ASSERT(n_embd_head_k == 128 && n_embd_head_v == 128 && "KVarN v1 requires head_dim == 128");
+            GGML_ASSERT((n_embd_head_k == 128 || n_embd_head_k == 256) &&
+                        (n_embd_head_v == 128 || n_embd_head_v == 256) &&
+                        n_embd_head_k == n_embd_head_v &&
+                        "KVarN requires head_dim 128 or 256");
             GGML_ASSERT(kv_size % 128 == 0 && "KVarN v1 requires kv_size to be a multiple of 128");
 
-            const uint32_t n_head_kv     = hparams.n_head_kv(il);
-            const uint32_t n_groups_max  = kv_size / 128;
+            const uint32_t n_head_kv       = hparams.n_head_kv(il);
+            const uint32_t head_dim_sub    = n_embd_head_k / 128;
+            const uint32_t n_tiles_kv      = n_head_kv * head_dim_sub;
+            const uint32_t n_groups_max    = kv_size / 128;
             const kvarn_tile_layout layout = kvarn_make_layout(kvarn_key_bits, kvarn_value_bits);
 
             kv_layer & layer = layers.back();
 
             layer.kvarn_key_bits   = (uint32_t) kvarn_key_bits;
             layer.kvarn_value_bits = (uint32_t) kvarn_value_bits;
-            layer.kvarn_n_head_kv  = n_head_kv;
-            layer.kvarn_tail_count.assign(n_head_kv, 0u);
-            layer.kvarn_n_sealed.assign(n_head_kv, 0u);
+            layer.kvarn_n_head_kv  = n_tiles_kv;
+            layer.kvarn_tail_count.assign(n_tiles_kv, 0u);
+            layer.kvarn_n_sealed.assign(n_tiles_kv, 0u);
 
-            layer.kvarn_k_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_head_kv);
-            layer.kvarn_v_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_head_kv);
-            layer.kvarn_sealed = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, (int64_t) layout.tile_bytes, n_groups_max, n_head_kv);
+            const char * env_tail          = getenv("LLAMA_KVARN_TAIL_TOKENS");
+            uint32_t     kvarn_tail_tokens = env_tail ? (uint32_t) atoi(env_tail) : 128u;
+            if (kvarn_tail_tokens < 128 || kvarn_tail_tokens % 128 != 0) {
+                kvarn_tail_tokens = 128u;
+            }
+
+            layer.kvarn_k_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, kvarn_tail_tokens, n_tiles_kv);
+            layer.kvarn_v_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, kvarn_tail_tokens, n_tiles_kv);
+            layer.kvarn_sealed = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, (int64_t) layout.tile_bytes, n_groups_max, n_tiles_kv);
 
             ggml_format_name(layer.kvarn_k_tail, "cache_%skvarn_k_tail_l%d", name_tag, il);
             ggml_format_name(layer.kvarn_v_tail, "cache_%skvarn_v_tail_l%d", name_tag, il);
             ggml_format_name(layer.kvarn_sealed, "cache_%skvarn_sealed_l%d", name_tag, il);
 
-            layer.kvarn_k_seal_ready.resize(n_head_kv);
+            layer.kvarn_k_seal_ready.resize(n_tiles_kv);
         }
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
@@ -1612,10 +1623,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 // Called once for K then once for V per ubatch, always in that order (matches
 // build_attn) - the V call's seal depends on that order to see K's freshly
 // -written tail node from the same graph.
-ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v, uint32_t pos0) const {
-    const int32_t ikv = map_layer_ids.at(il);
+ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx,
+                                        ggml_tensor *  cur,
+                                        ggml_tensor *  idxs,
+                                        int32_t        il,
+                                        bool           is_v,
+                                        uint32_t       pos0) const {
+    const int32_t    ikv    = map_layer_ids.at(il);
     const kv_layer & clayer = layers[ikv];
-    kv_layer & layer = const_cast<kv_layer &>(clayer); // only the mutable bookkeeping fields are touched
+    kv_layer &       layer  = const_cast<kv_layer &>(clayer);  // only the mutable bookkeeping fields are touched
 
     const int64_t n_head_kv = cur->ne[1];
     const int64_t n_tokens  = cur->ne[2];
@@ -1646,7 +1662,7 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
     const uint32_t n_sealed0   = pos0 / 128;
 
     ggml_tensor * result   = nullptr;
-    ggml_tensor * chain    = nullptr; // see `link` below
+    ggml_tensor * chain    = nullptr;  // see `link` below
     ggml_tensor * fallback = nullptr;
 
     // ggml_build_forward_expand only walks ANCESTORS of the single tensor it
@@ -1675,7 +1691,8 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
         // previous ubatch's (now freed) graph would be dangling.
         ggml_tensor * tail_view = ggml_view_2d(ctx, tail_base, 128, 128, tail_row_bytes, (size_t) h * tail_head_bytes);
 
-        ggml_tensor * cur_h = ggml_cont(ctx, ggml_view_2d(ctx, cur, 128, n_tokens, cur->nb[2], (size_t) h * cur->nb[1]));
+        ggml_tensor * cur_h =
+            ggml_cont(ctx, ggml_view_2d(ctx, cur, 128, n_tokens, cur->nb[2], (size_t) h * cur->nb[1]));
         cur_h = ggml_turbo_wht(ctx, cur_h, /*direction=*/0, 128, nullptr);
 
         // Assemble every row this call will touch - the still-live old tail
@@ -1690,13 +1707,14 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
         // objects but the SAME underlying memory. Building a per-call
         // scratch stream instead means each completed group keeps its own,
         // never-overwritten byte range for cpy_v to read from later.
-        const int64_t total_rows     = (int64_t) tail_count0 + n_tokens;
-        const int64_t n_complete     = total_rows / 128;
+        const int64_t  total_rows     = (int64_t) tail_count0 + n_tokens;
+        const int64_t  n_complete     = total_rows / 128;
         const uint32_t tail_count_end = (uint32_t) (total_rows % 128);
 
         ggml_tensor * stream = cur_h;
         if (tail_count0 > 0) {
-            ggml_tensor * old_tail = ggml_cont(ctx, ggml_view_2d(ctx, tail_view, 128, tail_count0, tail_view->nb[1], 0));
+            ggml_tensor * old_tail =
+                ggml_cont(ctx, ggml_view_2d(ctx, tail_view, 128, tail_count0, tail_view->nb[1], 0));
             stream = ggml_concat(ctx, old_tail, cur_h, 1);
         }
         fallback = stream;
@@ -1712,7 +1730,8 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
         }
 
         for (int64_t g = 0; g < n_complete; g++) {
-            ggml_tensor * group_view = ggml_view_2d(ctx, stream, 128, 128, stream->nb[1], (size_t) g * 128 * stream->nb[1]);
+            ggml_tensor * group_view =
+                ggml_view_2d(ctx, stream, 128, 128, stream->nb[1], (size_t) g * 128 * stream->nb[1]);
 
             if (!is_v) {
                 layer.kvarn_k_seal_ready[h].push_back(group_view);
@@ -1726,23 +1745,26 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
             } else {
                 auto & k_ready = layer.kvarn_k_seal_ready[h];
                 GGML_ASSERT((size_t) g < k_ready.size() &&
-                        "KVarN: cpy_v sealed more groups than cpy_k completed for this head in the same call");
+                            "KVarN: cpy_v sealed more groups than cpy_k completed for this head in the same call");
                 ggml_tensor * k_node = k_ready[g];
 
                 ggml_tensor * record = ggml_kvarn_seal(ctx, k_node, group_view, key_bits, value_bits, 16);
 
-                const size_t tile_bytes = layer.kvarn_sealed->nb[1];
-                const uint32_t group_idx = n_sealed0 + (uint32_t) g;
-                ggml_tensor * dst_slot = ggml_view_1d(ctx, layer.kvarn_sealed, (int64_t) tile_bytes,
-                        (size_t) h * layer.kvarn_sealed->nb[2] + (size_t) group_idx * tile_bytes);
+                const size_t   tile_bytes = layer.kvarn_sealed->nb[1];
+                const uint32_t group_idx  = n_sealed0 + (uint32_t) g;
+                ggml_tensor *  dst_slot =
+                    ggml_view_1d(ctx, layer.kvarn_sealed, (int64_t) tile_bytes,
+                                 (size_t) h * layer.kvarn_sealed->nb[2] + (size_t) group_idx * tile_bytes);
 
                 link(ggml_cpy(ctx, record, dst_slot));
             }
         }
 
         if (tail_count_end > 0) {
-            ggml_tensor * leftover = ggml_view_2d(ctx, stream, 128, tail_count_end, stream->nb[1], (size_t) n_complete * 128 * stream->nb[1]);
-            ggml_tensor * leftover_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, leftover), 128 * (int64_t) tail_count_end);
+            ggml_tensor * leftover = ggml_view_2d(ctx, stream, 128, tail_count_end, stream->nb[1],
+                                                  (size_t) n_complete * 128 * stream->nb[1]);
+            ggml_tensor * leftover_flat =
+                ggml_reshape_1d(ctx, ggml_cont(ctx, leftover), 128 * (int64_t) tail_count_end);
             link(ggml_set_1d_inplace(ctx, tail_view, leftover_flat, 0));
         }
 
@@ -1785,17 +1807,17 @@ ggml_tensor * llama_kv_cache::cpy_kvarn(ggml_context * ctx, ggml_tensor * cur, g
 // there is no ggml_type tag to gate on here the way turbo's k->type check
 // works, since kvarn's cache tensors are plain F32/I8, not a dedicated type.
 ggml_tensor * llama_kv_cache::get_kvarn(ggml_context * ctx, int32_t il, uint32_t n_kv, bool is_v) const {
-    const int32_t ikv = map_layer_ids.at(il);
+    const int32_t    ikv   = map_layer_ids.at(il);
     const kv_layer & layer = layers[ikv];
 
-    const int32_t key_bits   = (int32_t) layer.kvarn_key_bits;
-    const int32_t value_bits = (int32_t) layer.kvarn_value_bits;
-    const uint32_t n_head_kv = layer.kvarn_n_head_kv;
+    const int32_t  key_bits   = (int32_t) layer.kvarn_key_bits;
+    const int32_t  value_bits = (int32_t) layer.kvarn_value_bits;
+    const uint32_t n_head_kv  = layer.kvarn_n_head_kv;
 
     ggml_tensor * tail_base = is_v ? layer.kvarn_v_tail : layer.kvarn_k_tail;
 
-    const size_t tail_row_bytes  = 128 * sizeof(float);
-    const size_t tail_head_bytes = 128 * tail_row_bytes;
+    const size_t tail_row_bytes    = 128 * sizeof(float);
+    const size_t tail_head_bytes   = 128 * tail_row_bytes;
     const size_t sealed_tile_bytes = layer.kvarn_sealed->nb[1];
 
     std::vector<ggml_tensor *> per_head(n_head_kv);
@@ -1805,8 +1827,9 @@ ggml_tensor * llama_kv_cache::get_kvarn(ggml_context * ctx, int32_t il, uint32_t
         const uint32_t n_this     = std::min<uint32_t>(n_kv, layer.kvarn_n_sealed[h] * 128 + tail_count);
 
         ggml_tensor * tail_h = ggml_view_2d(ctx, tail_base, 128, 128, tail_row_bytes, (size_t) h * tail_head_bytes);
-        ggml_tensor * sealed_h = ggml_view_2d(ctx, layer.kvarn_sealed, (int64_t) sealed_tile_bytes, layer.kvarn_n_sealed[h],
-                layer.kvarn_sealed->nb[1], (size_t) h * layer.kvarn_sealed->nb[2]);
+        ggml_tensor * sealed_h =
+            ggml_view_2d(ctx, layer.kvarn_sealed, (int64_t) sealed_tile_bytes, layer.kvarn_n_sealed[h],
+                         layer.kvarn_sealed->nb[1], (size_t) h * layer.kvarn_sealed->nb[2]);
 
         ggml_tensor * mat;
         if (n_this == 0) {
@@ -1817,10 +1840,10 @@ ggml_tensor * llama_kv_cache::get_kvarn(ggml_context * ctx, int32_t il, uint32_t
             // than calling ggml_kvarn_materialize, whose kernel leaves its
             // output uninitialized when n_total <= 0.
             ggml_tensor * zero_row = ggml_view_2d(ctx, tail_h, 128, 1, tail_h->nb[1], 0);
-            mat = n_kv > 0 ? ggml_repeat_4d(ctx, zero_row, 128, n_kv, 1, 1) : zero_row;
+            mat                    = n_kv > 0 ? ggml_repeat_4d(ctx, zero_row, 128, n_kv, 1, 1) : zero_row;
         } else {
-            mat = ggml_kvarn_materialize(ctx, sealed_h, tail_h, key_bits, value_bits, is_v ? 1 : 0,
-                    (int) n_this, (int) tail_count);
+            mat = ggml_kvarn_materialize(ctx, sealed_h, tail_h, key_bits, value_bits, is_v ? 1 : 0, (int) n_this,
+                                         (int) tail_count);
             mat = ggml_turbo_wht(ctx, mat, /*direction=*/1, 128, nullptr);
 
             // pad up to n_kv with zeros if the cache holds fewer than n_kv

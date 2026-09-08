@@ -2283,6 +2283,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_kvarn_attn_decode(params, tensor);
             } break;
+        case GGML_OP_KVARN_CPY:
+            {
+                ggml_compute_forward_kvarn_cpy(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2476,6 +2480,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_KVARN_SEAL:
         case GGML_OP_KVARN_MATERIALIZE:
         case GGML_OP_KVARN_ATTN_DECODE:
+        case GGML_OP_KVARN_CPY:
             {
                 n_tasks = 1;
             } break;
@@ -3224,6 +3229,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_KVARN_SEAL:
                 case GGML_OP_KVARN_MATERIALIZE:
                 case GGML_OP_KVARN_ATTN_DECODE:
+                case GGML_OP_KVARN_CPY:
                     {
                         cur = 0;  // no extra workspace needed (fixed-size on-stack buffers)
                     } break;

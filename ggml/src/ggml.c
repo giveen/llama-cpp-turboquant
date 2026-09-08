@@ -1152,6 +1152,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KVARN_SEAL",
     "KVARN_MATERIALIZE",
     "KVARN_ATTN_DECODE",
+        "KVARN_CPY",
 
     "UNARY",
 
@@ -1169,7 +1170,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1271,6 +1272,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kvarn_seal(k_tail, v_tail)",
     "kvarn_materialize(sealed, tail)",
     "kvarn_attn_decode(q, sealed, k_tail, v_tail)",
+        "kvarn_cpy(cur, tail, sealed)",
 
     "unary(x)",
 
@@ -1288,7 +1290,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6454,13 +6456,15 @@ struct ggml_tensor * ggml_kvarn_seal(
         int                   value_bits,
         int                   sinkhorn_iters) {
     GGML_ASSERT(k_tail->type == GGML_TYPE_F32 && v_tail->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_tail->ne[0] == 128 && k_tail->ne[1] == 128);
-    GGML_ASSERT(v_tail->ne[0] == 128 && v_tail->ne[1] == 128);
+    GGML_ASSERT(k_tail->ne[0] == 128 && k_tail->ne[1] % 128 == 0);
+    GGML_ASSERT(v_tail->ne[0] == 128 && v_tail->ne[1] % 128 == 0);
     GGML_ASSERT(ggml_is_contiguous(k_tail) && ggml_is_contiguous(v_tail));
 
     const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) layout.tile_bytes);
+    int64_t n_complete = k_tail->ne[1] / 128;
+    int64_t n_head_kv = k_tail->ne[2];
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, (int64_t) layout.tile_bytes, n_complete, n_head_kv);
 
     result->op     = GGML_OP_KVARN_SEAL;
     result->src[0] = k_tail;
@@ -6495,7 +6499,7 @@ struct ggml_tensor * ggml_kvarn_materialize(
     GGML_ASSERT(ggml_is_contiguous(sealed) && ggml_is_contiguous(tail));
     GGML_ASSERT(n_total >= 0 && tail_count >= 0 && tail_count <= 128);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, n_total > 0 ? n_total : 1);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, tail->ne[2], n_total > 0 ? n_total : 1);
 
     result->op     = GGML_OP_KVARN_MATERIALIZE;
     result->src[0] = sealed;
@@ -6550,6 +6554,53 @@ struct ggml_tensor * ggml_kvarn_attn_decode(
     memcpy(result->op_params + 4, &n_total,           sizeof(int32_t));
     memcpy(result->op_params + 5, &tail_count,        sizeof(int32_t));
     memcpy(result->op_params + 6, &kq_scale,          sizeof(float));
+
+    return result;
+}
+
+// ggml_kvarn_cpy
+//
+// Fused KV write: applies the WHT rotation, appends new tokens to the
+// persistent tail, and seals any completed 128-token groups into sealed_base.
+// Replaces the chain of view+concat+cpy+seal nodes that cpy_kvarn used to
+// emit, so the graph topology is constant across decode steps and graph
+// allocation overhead is eliminated.
+//
+// src[0] = cur         [128, n_head_kv, n_tokens]  F32 rotated input tokens
+// src[1] = tail_base   [128, 128, n_head_kv]      F32 persistent tail buffer
+// src[2] = sealed_base [tile_bytes, n_groups_max, n_head_kv] I8 persistent sealed buffer
+// result: dummy 1-element F32; inplace writes go directly to tail/sealed.
+
+struct ggml_tensor * ggml_kvarn_cpy(struct ggml_context * ctx,
+                                    struct ggml_tensor *  cur,
+                                    struct ggml_tensor *  tail_base,
+                                    struct ggml_tensor *  sealed_base,
+                                    int                   is_v,
+                                    int                   key_bits,
+                                    int                   value_bits,
+                                    int                   sinkhorn_iters,
+                                    int                   tail_count0,
+                                    int                   n_sealed0,
+                                    int                   n_tokens) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && cur->ne[0] == 128);
+    GGML_ASSERT(tail_base->type == GGML_TYPE_F32);
+    GGML_ASSERT(sealed_base->type == GGML_TYPE_I8);
+    GGML_ASSERT(ggml_is_contiguous(cur));
+
+    // Dummy 1-element result; actual output is written inplace to tail/sealed.
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op                  = GGML_OP_KVARN_CPY;
+    result->src[0]              = cur;
+    result->src[1]              = tail_base;
+    result->src[2]              = sealed_base;
+
+    memcpy(result->op_params + 0, &is_v, sizeof(int32_t));
+    memcpy(result->op_params + 1, &key_bits, sizeof(int32_t));
+    memcpy(result->op_params + 2, &value_bits, sizeof(int32_t));
+    memcpy(result->op_params + 3, &sinkhorn_iters, sizeof(int32_t));
+    memcpy(result->op_params + 4, &tail_count0, sizeof(int32_t));
+    memcpy(result->op_params + 5, &n_sealed0, sizeof(int32_t));
+    memcpy(result->op_params + 6, &n_tokens, sizeof(int32_t));
 
     return result;
 }

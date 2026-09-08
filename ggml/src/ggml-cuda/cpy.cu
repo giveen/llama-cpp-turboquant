@@ -388,7 +388,7 @@ static void ggml_cpy_f32_iq4_nl_cuda(
 
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
-static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
+bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
         size_t & width, size_t & height, size_t & spitch, size_t & dpitch) {
     // require matching shape: a reshaped copy maps elements by flat order, which the
     // prefix walk below does not handle

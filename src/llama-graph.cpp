@@ -2901,7 +2901,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * cur;
 
-    if (mctx_cur->is_kvarn(il) && q_cur->ne[2] == 1) {
+    if (mctx_cur->is_kvarn(il) && q_cur->ne[2] == 1 && hparams.n_embd_head_k(il) == 128) {
         cur = mctx_cur->build_attn_decode_kvarn(ctx0, q, il, kq_scale);
         cb(cur, "kqv_out", il);
     } else {

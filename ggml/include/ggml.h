@@ -589,6 +589,7 @@ extern "C" {
         GGML_OP_KVARN_SEAL,
         GGML_OP_KVARN_MATERIALIZE,
         GGML_OP_KVARN_ATTN_DECODE,
+        GGML_OP_KVARN_CPY,
 
         GGML_OP_UNARY,
 
@@ -2675,6 +2676,31 @@ extern "C" {
             int                   n_total,
             int                   tail_count,
             float                 kq_scale);
+
+    // ggml_kvarn_cpy
+    //
+    // Fused KV write: applies the WHT rotation, appends new tokens to the
+    // persistent tail, and seals any completed 128-token groups into sealed_base.
+    // Replaces the chain of view+concat+cpy+seal nodes that cpy_kvarn used to
+    // emit, so the graph topology is constant across decode steps and graph
+    // reuse is safe.
+    //
+    // src[0] = cur         [128, n_head_kv, n_tokens] F32 (unrotated K or V)
+    // src[1] = tail_base   [128, 128, n_head_kv]      F32 persistent tail buffer
+    // src[2] = sealed_base [tile_bytes, n_groups_max, n_head_kv] I8 persistent sealed buffer
+    // result: dummy 1-element F32 (inplace writes go to tail/sealed)
+    GGML_API struct ggml_tensor * ggml_kvarn_cpy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * tail_base,
+            struct ggml_tensor  * sealed_base,
+            int                   is_v,
+            int                   key_bits,
+            int                   value_bits,
+            int                   sinkhorn_iters,
+            int                   tail_count0,
+            int                   n_sealed0,
+            int                   n_tokens);
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

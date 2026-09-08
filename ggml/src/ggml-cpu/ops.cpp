@@ -12375,3 +12375,129 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+
+// ggml_compute_forward_kvarn_cpy
+//
+// CPU reference, mirrors ggml_cuda_op_kvarn_cpy exactly (see kvarn.cu for the
+// design rationale): if the incoming n_tokens fit in the existing tail
+// capacity, WHT-rotate and append them directly. Otherwise WHT-rotate into a
+// scratch buffer, seal every completed 128-token group from a virtual stream
+// (old tail rows, then scratch), then restart the tail from the trailing
+// remainder. K and V calls are fully independent - kvarn_quantize_k_tile/
+// kvarn_quantize_v_tile write disjoint byte ranges of the same record, so
+// sealing needs only this call's own side. Single-threaded like the other
+// KVarN CPU fallbacks (correctness reference, not the optimized path).
+
+static void kvarn_cpy_rotate_row(const float * row, float * out) {
+    float x[128];
+    for (int c = 0; c < 128; c++) {
+        x[c] = row[c] * turbo_wht_s1[c];
+    }
+    for (int hh = 1; hh < 128; hh *= 2) {
+        for (int i = 0; i < 128; i += hh * 2) {
+            for (int j = i; j < i + hh; j++) {
+                float a = x[j], b = x[j + hh];
+                x[j]      = a + b;
+                x[j + hh] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt = 0.08838834764831845f;  // 1/sqrt(128)
+    for (int c = 0; c < 128; c++) {
+        out[c] = x[c] * inv_sqrt * turbo_wht_s2[c];
+    }
+}
+
+void ggml_compute_forward_kvarn_cpy(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * cur         = dst->src[0];  // [128, n_head_kv, n_tokens] F32
+    const ggml_tensor * tail_base   = dst->src[1];  // [128, 128, n_head_kv] F32
+    const ggml_tensor * sealed_base = dst->src[2];  // [tile_bytes, n_groups_max, n_head_kv] I8
+
+    int32_t is_v, key_bits, value_bits, sinkhorn_iters, tail_count0, n_sealed0, n_tokens;
+    memcpy(&is_v, dst->op_params + 0, sizeof(int32_t));
+    memcpy(&key_bits, dst->op_params + 1, sizeof(int32_t));
+    memcpy(&value_bits, dst->op_params + 2, sizeof(int32_t));
+    memcpy(&sinkhorn_iters, dst->op_params + 3, sizeof(int32_t));
+    memcpy(&tail_count0, dst->op_params + 4, sizeof(int32_t));
+    memcpy(&n_sealed0, dst->op_params + 5, sizeof(int32_t));
+    memcpy(&n_tokens, dst->op_params + 6, sizeof(int32_t));
+
+    const int     n_head_kv        = (int) cur->ne[1];
+    const int     tail_capacity    = (int) tail_base->ne[1];
+    const size_t  tail_head_stride = (size_t) tail_capacity * 128;
+    const float * cur_data         = (const float *) cur->data;
+    float *       tail_data        = (float *) tail_base->data;
+
+    const int64_t total_rows     = (int64_t) tail_count0 + n_tokens;
+    const int64_t n_complete     = total_rows > tail_capacity ? (total_rows - (tail_capacity - 128)) / 128 : 0;
+    const int     tail_count_end = (int) (total_rows - n_complete * 128);
+
+    if (n_complete == 0) {
+        // Case A: everything fits in the existing tail capacity - append directly.
+        for (int tok = 0; tok < n_tokens; tok++) {
+            for (int h = 0; h < n_head_kv; h++) {
+                const float * row      = cur_data + ((size_t) tok * n_head_kv + h) * 128;
+                const int     tail_row = tail_count0 + tok;
+                float *       dst_row  = tail_data + (size_t) h * tail_head_stride + (size_t) tail_row * 128;
+                kvarn_cpy_rotate_row(row, dst_row);
+            }
+        }
+        return;
+    }
+
+    // Case B: at least one group completes - rotate into scratch, seal, restart the tail.
+    std::vector<float> rotated((size_t) n_tokens * n_head_kv * 128);
+    for (int tok = 0; tok < n_tokens; tok++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            const float * row = cur_data + ((size_t) tok * n_head_kv + h) * 128;
+            float *       out = rotated.data() + ((size_t) h * n_tokens + tok) * 128;
+            kvarn_cpy_rotate_row(row, out);
+        }
+    }
+
+    const struct kvarn_tile_layout layout       = kvarn_make_layout(key_bits, value_bits);
+    const int                      n_groups_max = (int) sealed_base->ne[1];
+    const int                      bits         = is_v ? value_bits : key_bits;
+    uint8_t *                      sealed_data  = (uint8_t *) sealed_base->data;
+
+    for (int h = 0; h < n_head_kv; h++) {
+        for (int g = 0; g < n_complete; g++) {
+            float tile[128 * 128];
+            for (int t = 0; t < 128; t++) {
+                const int64_t abs_row = (int64_t) g * 128 + t;
+                const float * src_row;
+                if (abs_row < tail_count0) {
+                    src_row = tail_data + (size_t) h * tail_head_stride + (size_t) abs_row * 128;
+                } else {
+                    src_row = rotated.data() + ((size_t) h * n_tokens + (abs_row - tail_count0)) * 128;
+                }
+                memcpy(tile + (size_t) t * 128, src_row, 128 * sizeof(float));
+            }
+
+            uint8_t * record = sealed_data + (size_t) h * n_groups_max * layout.tile_bytes +
+                               (size_t) (n_sealed0 + g) * layout.tile_bytes;
+            if (is_v) {
+                kvarn_quantize_v_tile(tile, sinkhorn_iters, bits, &layout, record);
+            } else {
+                kvarn_quantize_k_tile(tile, sinkhorn_iters, bits, &layout, record);
+            }
+        }
+    }
+
+    // Restart the tail from the trailing remainder (already rotated, in `rotated`).
+    for (int r = 0; r < tail_count_end; r++) {
+        const int src_virtual = (int) (n_complete * 128 + r);
+        for (int h = 0; h < n_head_kv; h++) {
+            const float * src_row = (src_virtual < tail_count0) ?
+                                        (tail_data + (size_t) h * tail_head_stride + (size_t) src_virtual * 128) :
+                                        (rotated.data() + ((size_t) h * n_tokens + (src_virtual - tail_count0)) * 128);
+            float *       dst_row = tail_data + (size_t) h * tail_head_stride + (size_t) r * 128;
+            memcpy(dst_row, src_row, 128 * sizeof(float));
+        }
+    }
+}

@@ -2422,6 +2422,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_KVARN_ATTN_DECODE:
             ggml_cuda_op_kvarn_attn_decode(ctx, dst);
             break;
+        case GGML_OP_KVARN_CPY:
+            ggml_cuda_op_kvarn_cpy(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -5622,8 +5625,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_I32) {
                     return true;
                 }
-                if (src0_type == src1_type && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
-                    return true;
+                if (src0_type == src1_type) {
+                    if (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
+                        return true;
+                    }
+                    size_t width, height, spitch, dpitch;
+                    if (ggml_cuda_cpy_as_memcpy_2d(op->src[0], op->src[1], width, height, spitch, dpitch)) {
+                        return true;
+                    }
                 }
                 return false;
             } break;
@@ -5727,7 +5736,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->ne[0] % 32 == 0;  // supports 32, 64, and 128 WHT groups
         case GGML_OP_KVARN_SEAL:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   op->src[0]->ne[0] == 128 && op->src[0]->ne[1] == 128;
+                   op->src[0]->ne[0] == 128 && (op->src[0]->ne[1] % 128 == 0) &&
+                   op->src[1]->ne[0] == 128 && (op->src[1]->ne[1] % 128 == 0);
         case GGML_OP_KVARN_MATERIALIZE:
             return op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32;
@@ -5754,6 +5764,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->op_params[5] < 128 &&
                    (op->op_params[4] - op->op_params[5]) % 128 == 0 &&
                    (op->op_params[4] - op->op_params[5]) / 128 <= op->src[1]->ne[1];
+        case GGML_OP_KVARN_CPY:
+            // src[0]=cur F32, src[1]=tail_base F32, src[2]=sealed_base I8, src[3]=k_tail or null
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I8 &&
+                   op->src[0]->ne[0] == 128;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:

@@ -1454,6 +1454,10 @@ struct cmd_params_instance {
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
+        cparams.kv_unified      = true;
+        cparams.n_seq_max       = 1;
+        cparams.kvarn_key_bits   = getenv("LLAMA_ARG_KVARN_KEY_BITS") ? atoi(getenv("LLAMA_ARG_KVARN_KEY_BITS")) : 0;
+        cparams.kvarn_value_bits = getenv("LLAMA_ARG_KVARN_VALUE_BITS") ? atoi(getenv("LLAMA_ARG_KVARN_VALUE_BITS")) : 0;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
