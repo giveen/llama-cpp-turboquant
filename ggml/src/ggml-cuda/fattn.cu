@@ -1,3 +1,4 @@
+#include "fattn-kvarn-dispatch.cuh"
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -887,6 +888,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+        // Descriptor-native KVarN does not need materialized F16 K/V buffers,
+        // but the upstream MMA kernels still use the fixup workspace placed
+        // after the output tensor when attention spans multiple KV batches.
+        // Allocation planning can run before backend route selection, so it
+        // must be structural and must not assert execution eligibility.
+        const ggml_tensor * V = dst->src[2];
+        if (V->ne[1] <= 65535) {
+            return 0; // standard FA route
+        }
+        const int64_t n_head_q = dst->src[0]->ne[2];
+        const int64_t n_q      = dst->src[0]->ne[1];
+        return n_head_q * n_q * sizeof(float); // fixup buffer
+    }
+
     GGML_UNUSED(device);
 
     const ggml_tensor * K = dst->src[1];
@@ -921,6 +938,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+        if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
+            GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
+        }
+        return;
+    }
     ggml_cuda_set_device(ctx.device);
 
     // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
@@ -978,5 +1001,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
+        return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
