@@ -848,8 +848,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // turbo4 KV is dequantized synchronously into SRAM in the load tile; the cp.async
     // multi-stage pipeline (nstages>1) would copy raw turbo bytes as half2 => garbage.
     // Force single-stage synchronous loading for the turbo path.
-    constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-    constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
+    constexpr bool is_turbo_kv     = (type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0);
+    constexpr bool is_kvarn_kv     = (type_K > GGML_TYPE_COUNT || type_V > GGML_TYPE_COUNT);
+    constexpr int  nstages         = (is_turbo_kv || is_kvarn_kv) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     // swizzle the tile stride for K and V based on the batch size.
     constexpr int stride_tile_K = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2);
@@ -1489,8 +1490,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     // Force single-stage synchronous loading for the turbo path (see iter for rationale).
-    constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-    constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
+    constexpr bool is_turbo_kv     = (type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0);
+    constexpr bool is_kvarn_kv     = (type_K > GGML_TYPE_COUNT || type_V > GGML_TYPE_COUNT);
+    constexpr int  nstages         = (is_turbo_kv || is_kvarn_kv) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -2142,7 +2144,7 @@ static __global__ void flash_attn_ext_f16(
     // launcher), so stride_K/stride_V must be the true byte pitch nb11/nb21 — the turbo
     // load tile does sizeof(block_turbo4_0)-driven pointer math off these byte strides.
     // For f16/q8 (the default), keep the existing half2-element pitch byte-identical.
-    constexpr bool is_turbo_kv = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr bool is_turbo_kv = (type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0);
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_K    = is_turbo_kv ? nb11 : nb11 / sizeof(half2);
