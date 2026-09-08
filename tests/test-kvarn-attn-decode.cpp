@@ -64,10 +64,9 @@ static void reference_attention(
     for (int c = 0; c < 128; c++) out[c] = (float) (acc[c] / std::max(running_sum, 1e-20));
 }
 
-static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
+static bool run_on_backend(ggml_backend_t backend, int bits, int n_group_bc, int n_q, double * cos_out) {
     const int head_dim   = 128;
     const int n_head_kv  = 2;
-    const int n_group_bc = 4;
     const int n_head_q   = n_head_kv * n_group_bc;
     const int n_sealed_g = 9;
     const int tail_count = 44;
@@ -78,7 +77,7 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
 
     struct ggml_tensor * k_tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
     struct ggml_tensor * v_tail  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, 128, n_head_kv);
-    struct ggml_tensor * q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head_q, 1);
+    struct ggml_tensor * q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head_q, n_q);
 
     std::vector<struct ggml_tensor *> sealed_k_inputs;
     std::vector<struct ggml_tensor *> sealed_v_inputs;
@@ -153,13 +152,16 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
                 sealed_v_data.data() + group_head * 128 * head_dim, 0, ggml_nbytes(sealed_v_inputs[i]));
     }
 
-    for (int qh = 0; qh < n_head_q; qh++) {
+    q_rot.resize((size_t) head_dim * n_head_q * n_q);
+    for (int qi = 0; qi < n_q; qi++) {
+      for (int qh = 0; qh < n_head_q; qh++) {
         float q_raw[128];
-        make_token_vec(q_raw, head_dim, 999u, (unsigned) (qh * 777));
+        make_token_vec(q_raw, head_dim, 999u + (unsigned) qi, (unsigned) (qh * 777));
         float q_r[128];
         memcpy(q_r, q_raw, sizeof(q_r));
         hadamard_128(q_r);
-        memcpy(q_rot.data() + (size_t) qh * head_dim, q_r, head_dim * sizeof(float));
+        memcpy(q_rot.data() + ((size_t) qi * n_head_q + qh) * head_dim, q_r, head_dim * sizeof(float));
+      }
     }
 
     ggml_backend_tensor_set(k_tail,  k_tail_data.data(),  0, ggml_nbytes(k_tail));
@@ -175,23 +177,27 @@ static bool run_on_backend(ggml_backend_t backend, int bits, double * cos_out) {
         return false;
     }
 
-    std::vector<float> out((size_t) head_dim * n_head_q);
+    std::vector<float> out((size_t) head_dim * n_head_q * n_q);
     ggml_backend_tensor_get(attn_out, out.data(), 0, out.size() * sizeof(float));
 
-    // Un-rotate output, compare against dense reference per Q head.
+    // Un-rotate output, compare against dense reference per Q head and row.
+    // Row qi sees keys 0..pos_begin+qi with pos_begin = n_total - n_q.
     double min_cos = 1.0;
-    for (int qh = 0; qh < n_head_q; qh++) {
+    for (int qi = 0; qi < n_q; qi++) {
+      const int key_lim = n_total - n_q + 1 + qi;
+      for (int qh = 0; qh < n_head_q; qh++) {
         const int kv_h = qh / n_group_bc;
-        float * out_h = out.data() + (size_t) qh * head_dim;
+        float * out_h = out.data() + ((size_t) qi * n_head_q + qh) * head_dim;
         hadamard_128(out_h);
 
         float q_raw[128];
-        make_token_vec(q_raw, head_dim, 999u, (unsigned) (qh * 777));
+        make_token_vec(q_raw, head_dim, 999u + (unsigned) qi, (unsigned) (qh * 777));
         float ref[128];
-        reference_attention(q_raw, Kh[kv_h], Vh[kv_h], n_total, kq_scale, ref);
+        reference_attention(q_raw, Kh[kv_h], Vh[kv_h], key_lim, kq_scale, ref);
 
         const double c = cosine(ref, out_h, head_dim);
         min_cos = std::min(min_cos, c);
+      }
     }
 
     *cos_out = min_cos;
@@ -207,10 +213,12 @@ int main() {
     // CPU
     {
         ggml_backend_t cpu = ggml_backend_cpu_init();
+      for (int n_group_bc : {4, 6}) {
+      for (int n_q : {1, 5}) {
         for (int bits : {2, 3, 4, 5, 6}) {
             double cos_val = 0.0;
-            if (!run_on_backend(cpu, bits, &cos_val)) { failures++; continue; }
-            printf("CPU  kvarn%d: min cosine across heads = %.6f\n", bits, cos_val);
+            if (!run_on_backend(cpu, bits, n_group_bc, n_q, &cos_val)) { failures++; continue; }
+            printf("CPU  kvarn%d gqa%d nq%d: min cosine across heads/rows = %.6f\n", bits, n_group_bc, n_q, cos_val);
             // bits=2's floor is much lower than the plain tile round-trip
             // tests use: softmax amplifies the extra quantization noise in
             // the QK scores, so attention-level fidelity degrades faster
@@ -223,6 +231,8 @@ int main() {
                 bits >= 3 ? 0.95 : 0.7;
             if (cos_val < floor) { printf("  FAIL below floor %.2f\n", floor); failures++; }
         }
+      }
+      }
         ggml_backend_free(cpu);
     }
 
@@ -237,10 +247,12 @@ int main() {
         }
     }
     if (gpu) {
+      for (int n_group_bc : {4, 6}) {
+      for (int n_q : {1, 5}) {
         for (int bits : {2, 3, 4, 5, 6}) {
             double cos_val = 0.0;
-            if (!run_on_backend(gpu, bits, &cos_val)) { failures++; continue; }
-            printf("GPU  kvarn%d: min cosine across heads = %.6f\n", bits, cos_val);
+            if (!run_on_backend(gpu, bits, n_group_bc, n_q, &cos_val)) { failures++; continue; }
+            printf("GPU  kvarn%d gqa%d nq%d: min cosine across heads/rows = %.6f\n", bits, n_group_bc, n_q, cos_val);
             // bits=2's floor is much lower than the plain tile round-trip
             // tests use: softmax amplifies the extra quantization noise in
             // the QK scores, so attention-level fidelity degrades faster
@@ -253,6 +265,8 @@ int main() {
                 bits >= 3 ? 0.95 : 0.7;
             if (cos_val < floor) { printf("  FAIL below floor %.2f\n", floor); failures++; }
         }
+      }
+      }
         ggml_backend_free(gpu);
     } else {
         printf("\nno GPU backend available - skipping GPU check\n");

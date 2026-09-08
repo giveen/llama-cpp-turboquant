@@ -277,15 +277,15 @@ private:
         // k/v above still get allocated as normal (currently unused, kept so
         // every other code path that assumes non-null layer tensors - defrag,
         // memory_breakdown, state I/O - needs no changes for this first pass).
-        // Restricted to n_seq_max==1, n_stream==1, no SWA, no MLA, head_dim==128
-        // - see the asserts at construction time.
-        ggml_tensor * kvarn_k_tail = nullptr; // [128, 128, n_head_kv] F32
-        ggml_tensor * kvarn_v_tail = nullptr; // [128, 128, n_head_kv] F32
-        ggml_tensor * kvarn_sealed = nullptr; // [tile_bytes, n_groups_max, n_head_kv] I8
+        // Restricted to n_seq_max==1, n_stream==1, no SWA, no MLA, head_dim%128==0.
+        ggml_tensor * kvarn_k_tail = nullptr; // [128, 128, n_tiles_kv] F32
+        ggml_tensor * kvarn_v_tail = nullptr; // [128, 128, n_tiles_kv] F32
+        ggml_tensor * kvarn_sealed = nullptr; // [tile_bytes, n_groups_max, n_tiles_kv] I8
 
         uint32_t kvarn_key_bits   = 0; // 0 = kvarn disabled for this layer
         uint32_t kvarn_value_bits = 0;
-        uint32_t kvarn_n_head_kv  = 0;
+        uint32_t kvarn_n_head_kv  = 0; // n_head_kv_phys * head_dim_sub (tile-heads)
+        uint32_t kvarn_head_dim   = 0; // physical head dimension (128 or 256)
 
         // mutable: cpy_k/cpy_v are const (see llama_kv_cache::cpy_k), but need
         // to advance this host-side bookkeeping as ubatches are processed.
@@ -400,10 +400,15 @@ private:
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+    // KVarN payload: whole-tensor positional dump (sealed/tail) + per-tile
+    // counters. Cell ranges are still carried by state_write_meta above, but
+    // the data itself is positional, not cell-scattered.
+    void state_write_kvarn_data(llama_io_write_i & io) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+    bool state_read_kvarn_data(llama_io_read_i & io);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

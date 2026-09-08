@@ -11546,6 +11546,10 @@ void ggml_compute_forward_kvarn_attn_decode(
     const struct kvarn_tile_layout layout = kvarn_make_layout(key_bits, value_bits);
     const int n_sealed     = (n_total - tail_count) / 128;
     const int n_groups_max = (int) sealed->ne[1];
+    const int64_t n_q      = q->ne[2];
+    // ubatch start position: the ubatch's own rows were folded into
+    // sealed/tail by cpy first, so history ends at n_total - 1
+    const int pos_begin = n_total - (int) n_q;
 
     const float   * q_data      = (const float *)   q->data;
     const uint8_t * sealed_data = (const uint8_t *) sealed->data;
@@ -11556,9 +11560,13 @@ void ggml_compute_forward_kvarn_attn_decode(
     float k_tile[128 * 128];
     float v_tile[128 * 128];
 
-    for (int64_t q_head = 0; q_head < q->ne[1]; q_head++) {
+    for (int64_t qi = 0; qi < n_q; qi++) {
+      for (int64_t q_head = 0; q_head < q->ne[1]; q_head++) {
         const int64_t kv_head = q_head / n_group_broadcast;
-        const float * qv = q_data + q_head * 128;
+        // causal limit: row qi (absolute position pos_begin + qi) sees keys
+        // 0..pos_begin + qi, i.e. key_lim keys
+        const int key_lim = pos_begin + (int) qi + 1;
+        const float * qv = q_data + ((size_t) qi * (size_t) q->ne[1] + (size_t) q_head) * 128;
         const uint8_t * sealed_kv = sealed_data + (size_t) kv_head * (size_t) n_groups_max * layout.tile_bytes;
         const float * k_tail_h = k_tail_data + (size_t) kv_head * 128 * 128;
         const float * v_tail_h = v_tail_data + (size_t) kv_head * 128 * 128;
@@ -11581,24 +11589,30 @@ void ggml_compute_forward_kvarn_attn_decode(
         };
 
         for (int g = 0; g < n_sealed; g++) {
+            const int g_keys = std::min(128, std::max(0, key_lim - g * 128));
+            if (g_keys <= 0) {
+                continue;
+            }
             const uint8_t * record = sealed_kv + (size_t) g * layout.tile_bytes;
             kvarn_dequantize_k_tile(record, key_bits,   &layout, k_tile);
             kvarn_dequantize_v_tile(record, value_bits, &layout, v_tile);
-            for (int r = 0; r < 128; r++) {
+            for (int r = 0; r < g_keys; r++) {
                 process_row(k_tile + (size_t) r * 128, v_tile + (size_t) r * 128);
             }
         }
 
         const int from_tail = n_total - n_sealed * 128;
-        for (int r = 0; r < from_tail; r++) {
+        const int tail_keys = std::min(from_tail, std::max(0, key_lim - n_sealed * 128));
+        for (int r = 0; r < tail_keys; r++) {
             process_row(k_tail_h + (size_t) r * 128, v_tail_h + (size_t) r * 128);
         }
 
-        float * out_row = out + q_head * 128;
+        float * out_row = out + ((size_t) qi * (size_t) q->ne[1] + (size_t) q_head) * 128;
         const double denom = running_sum > 1e-20 ? running_sum : 1e-20;
         for (int c = 0; c < 128; c++) {
             out_row[c] = (float) (acc[c] / denom);
         }
+      }
     }
 }
 

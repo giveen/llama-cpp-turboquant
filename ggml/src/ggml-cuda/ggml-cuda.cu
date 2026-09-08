@@ -5745,7 +5745,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I8 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
-                   op->src[0]->ne[0] == 128 && op->src[0]->ne[2] == 1 &&
+                   op->src[0]->ne[0] == 128 && op->src[0]->ne[2] >= 1 &&
                    op->src[0]->ne[3] == 1 && ggml_is_contiguous(op->src[0]) &&
                    op->src[1]->ne[2] == op->src[2]->ne[2] &&
                    op->src[1]->ne[2] == op->src[3]->ne[2] &&

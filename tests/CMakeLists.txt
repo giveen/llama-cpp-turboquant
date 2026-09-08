@@ -320,6 +320,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-kvarn-ops.cpp LABEL "turbo")
     llama_build_and_test(test-kvarn-ops-cuda.cpp LABEL "turbo")
     llama_build_and_test(test-kvarn-attn-decode.cpp LABEL "turbo")
+    llama_build_and_test(test-kvarn-state.cpp LABEL "turbo")
 endif()
 
 # libmtmd

@@ -400,6 +400,25 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
     return result;
 }
 
+static int kvarn_bits_from_name(const std::string & s) {
+    if (s == "kvarn2") {
+        return 2;
+    }
+    if (s == "kvarn3") {
+        return 3;
+    }
+    if (s == "kvarn4") {
+        return 4;
+    }
+    if (s == "kvarn5") {
+        return 5;
+    }
+    if (s == "kvarn6") {
+        return 6;
+    }
+    return 0;
+}
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -415,6 +434,9 @@ struct cmd_params {
     std::vector<int>                 n_ubatch;
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
+    // KVarN bit widths per type_k/type_v entry (0 = plain type). Lockstep.
+    std::vector<int>                 kvarn_k;
+    std::vector<int>                 kvarn_v;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -465,6 +487,8 @@ static const cmd_params cmd_params_defaults = {
     /* n_ubatch             */ { 512 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
+    /* kvarn_k              */ { 0 },
+    /* kvarn_v              */ { 0 },
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -540,8 +564,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
-    printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
-    printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  -ctk, --cache-type-k <t>                          (default: %s; kvarn2..kvarn6 select KVarN at N bits)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
+    printf("  -ctv, --cache-type-v <t>                          (default: %s; kvarn2..kvarn6 select KVarN at N bits)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -749,18 +773,28 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 auto p = string_split<std::string>(argv[i], split_delim);
 
                 std::vector<ggml_type> types;
+                std::vector<int> kbits;
                 for (const auto & t : p) {
+                    const int kb = kvarn_bits_from_name(t);
+                    if (kb != 0) {
+                        // placeholder K tensors are inert under KVarN
+                        types.push_back(GGML_TYPE_F16);
+                        kbits.push_back(kb);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
                         break;
                     }
                     types.push_back(gt);
+                    kbits.push_back(0);
                 }
                 if (invalid_param) {
                     break;
                 }
                 params.type_k.insert(params.type_k.end(), types.begin(), types.end());
+                params.kvarn_k.insert(params.kvarn_k.end(), kbits.begin(), kbits.end());
             } else if (arg == "-ctv" || arg == "--cache-type-v") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -769,18 +803,28 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 auto p = string_split<std::string>(argv[i], split_delim);
 
                 std::vector<ggml_type> types;
+                std::vector<int> vbits;
                 for (const auto & t : p) {
+                    const int vb = kvarn_bits_from_name(t);
+                    if (vb != 0) {
+                        // placeholder V tensors are inert under KVarN
+                        types.push_back(GGML_TYPE_F16);
+                        vbits.push_back(vb);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
                         break;
                     }
                     types.push_back(gt);
+                    vbits.push_back(0);
                 }
                 if (invalid_param) {
                     break;
                 }
                 params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+                params.kvarn_v.insert(params.kvarn_v.end(), vbits.begin(), vbits.end());
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1273,6 +1317,26 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.type_v.empty()) {
         params.type_v = cmd_params_defaults.type_v;
     }
+    // lockstep bits default to plain (0) when the side was never mentioned
+    while (params.kvarn_k.size() < params.type_k.size()) {
+        params.kvarn_k.push_back(0);
+    }
+    while (params.kvarn_v.size() < params.type_v.size()) {
+        params.kvarn_v.push_back(0);
+    }
+    // KVarN seals K and V together: any kvarn token requires every row on
+    // both sides to be kvarn, otherwise some cartesian rows would silently
+    // run the fallback type under a kvarn label
+    const bool any_kvarn =
+        std::any_of(params.kvarn_k.begin(), params.kvarn_k.end(), [](int b) { return b > 0; }) ||
+        std::any_of(params.kvarn_v.begin(), params.kvarn_v.end(), [](int b) { return b > 0; });
+    const bool all_kvarn =
+        std::all_of(params.kvarn_k.begin(), params.kvarn_k.end(), [](int b) { return b > 0; }) &&
+        std::all_of(params.kvarn_v.begin(), params.kvarn_v.end(), [](int b) { return b > 0; });
+    if (any_kvarn && !all_kvarn) {
+        fprintf(stderr, "error: kvarn cache types require every -ctk and -ctv value to be kvarn (e.g. -ctk kvarn4 -ctv kvarn4)\n");
+        exit(1);
+    }
     if (params.n_gpu_layers.empty()) {
         params.n_gpu_layers = cmd_params_defaults.n_gpu_layers;
     }
@@ -1363,6 +1427,8 @@ struct cmd_params_instance {
     int                n_ubatch;
     ggml_type          type_k;
     ggml_type          type_v;
+    int                kvarn_key_bits = 0;
+    int                kvarn_value_bits = 0;
     int                n_threads;
     std::string        cpu_mask;
     bool               cpu_strict;
@@ -1456,8 +1522,8 @@ struct cmd_params_instance {
         cparams.type_k          = type_k;
         cparams.kv_unified      = true;
         cparams.n_seq_max       = 1;
-        cparams.kvarn_key_bits   = getenv("LLAMA_ARG_KVARN_KEY_BITS") ? atoi(getenv("LLAMA_ARG_KVARN_KEY_BITS")) : 0;
-        cparams.kvarn_value_bits = getenv("LLAMA_ARG_KVARN_VALUE_BITS") ? atoi(getenv("LLAMA_ARG_KVARN_VALUE_BITS")) : 0;
+        cparams.kvarn_key_bits   = kvarn_key_bits;
+        cparams.kvarn_value_bits = kvarn_value_bits;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
@@ -1491,8 +1557,12 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nopo : params.no_op_offload)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
-    for (const auto & tk : params.type_k)
-    for (const auto & tv : params.type_v)
+    for (size_t ik = 0; ik < params.type_k.size(); ik++)
+    for (size_t iv = 0; iv < params.type_v.size(); iv++) {
+        const ggml_type tk = params.type_k[ik];
+        const ggml_type tv = params.type_v[iv];
+        const int tk_bits = params.kvarn_k[ik];
+        const int tv_bits = params.kvarn_v[iv];
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
@@ -1514,6 +1584,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch              = */ nub,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
+                /* .kvarn_key_bits        = */ tk_bits,
+                /* .kvarn_value_bits      = */ tv_bits,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1553,6 +1625,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch              = */ nub,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
+                /* .kvarn_key_bits        = */ tk_bits,
+                /* .kvarn_value_bits      = */ tv_bits,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1592,6 +1666,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch              = */ nub,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
+                /* .kvarn_key_bits        = */ tk_bits,
+                /* .kvarn_value_bits      = */ tv_bits,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1617,6 +1693,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             instances.push_back(instance);
         }
     }
+    }
     // clang-format on
 
     return instances;
@@ -1639,6 +1716,8 @@ struct test {
     int                      poll;
     ggml_type                type_k;
     ggml_type                type_v;
+    std::string              label_k;
+    std::string              label_v;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     std::string              moe_cache;
@@ -1691,6 +1770,11 @@ struct test {
         const ggml_type eff_type_v = llama_get_kv_cache_type_v(ctx);
         type_k         = eff_type_k != GGML_TYPE_COUNT ? eff_type_k : inst.type_k;
         type_v         = eff_type_v != GGML_TYPE_COUNT ? eff_type_v : inst.type_v;
+        char kbuf[16], vbuf[16];
+        snprintf(kbuf, sizeof(kbuf), "kvarn%d", inst.kvarn_key_bits);
+        snprintf(vbuf, sizeof(vbuf), "kvarn%d", inst.kvarn_value_bits);
+        label_k        = inst.kvarn_key_bits   > 0 ? kbuf : ggml_type_name(type_k);
+        label_v        = inst.kvarn_value_bits > 0 ? vbuf : ggml_type_name(type_v);
         n_gpu_layers   = mparams.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         moe_cache      = inst.moe_cache;
@@ -1864,8 +1948,8 @@ struct test {
                                             cpu_mask,
                                             std::to_string(cpu_strict),
                                             std::to_string(poll),
-                                            ggml_type_name(type_k),
-                                            ggml_type_name(type_v),
+                                            label_k,
+                                            label_v,
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             moe_cache,
@@ -2207,10 +2291,14 @@ struct markdown_printer : public printer {
         if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
             fields.emplace_back("n_ubatch");
         }
-        if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
+        // a kvarn run must show its label even though the placeholder ggml
+        // type still reads as the f16 default
+        const bool kvarn_k = std::any_of(params.kvarn_k.begin(), params.kvarn_k.end(), [](int b) { return b > 0; });
+        const bool kvarn_v = std::any_of(params.kvarn_v.begin(), params.kvarn_v.end(), [](int b) { return b > 0; });
+        if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k || kvarn_k) {
             fields.emplace_back("type_k");
         }
-        if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
+        if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v || kvarn_v) {
             fields.emplace_back("type_v");
         }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {

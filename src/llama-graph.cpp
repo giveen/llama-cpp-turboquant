@@ -1110,7 +1110,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1168,7 +1170,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -2901,7 +2905,21 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * cur;
 
-    if (mctx_cur->is_kvarn(il) && q_cur->ne[2] == 1 && hparams.n_embd_head_k(il) == 128) {
+    // Fused kvarn attention (single-token decode and multi-row prefill via
+    // the kernel's Q-tile loop) is correct for 128 and 256-dim heads (256 via
+    // the (kh,t,j) tile permutation in build_attn_decode_kvarn), but at 256
+    // dim the single-row GQA=6 geometry (768-thread blocks, 8-block grid)
+    // underfeeds the GPU ~10x vs materialize+dense at short context - keep
+    // decode on the 128-dim path only until the kernel gets a small-case
+    // launch. Prefill has ample Q-tile parallelism, so 256-dim prefill stays
+    // fused. Overrides (debug/perf work): LLAMA_KVARN_NO_FUSED_DECODE=1 forces
+    // materialize everywhere; LLAMA_KVARN_FUSED_DECODE_DIM=256 forces fused
+    // decode on 256-dim heads too.
+    static const int kvarn_fused_dim = getenv("LLAMA_KVARN_FUSED_DECODE_DIM") ? atoi(getenv("LLAMA_KVARN_FUSED_DECODE_DIM")) : 128;
+    static const bool kvarn_no_fused = getenv("LLAMA_KVARN_NO_FUSED_DECODE") && atoi(getenv("LLAMA_KVARN_NO_FUSED_DECODE"));
+    const bool kvarn_fused_ok = kvarn_no_fused == false && mctx_cur->is_kvarn(il) &&
+        (hparams.n_embd_head_k(il) == 128 || q_cur->ne[2] > 1 || hparams.n_embd_head_k(il) == (uint32_t) kvarn_fused_dim);
+    if (kvarn_fused_ok) {
         cur = mctx_cur->build_attn_decode_kvarn(ctx0, q, il, kq_scale);
         cb(cur, "kqv_out", il);
     } else {

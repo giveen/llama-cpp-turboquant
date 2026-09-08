@@ -301,6 +301,12 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // KVarN requires a unified cache; auto-enable with a warning
+    if (cparams.kvarn_active && !cparams.kv_unified) {
+        LLAMA_LOG_WARN("%s: KVarN requires a unified cache; auto-enabling kv_unified\n", __func__);
+        cparams.kv_unified = true;
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 

@@ -6516,13 +6516,17 @@ struct ggml_tensor * ggml_kvarn_materialize(
 
 // ggml_kvarn_attn_decode
 //
-// Fused single-token decode attention: reads sealed + tail storage directly
+// Fused decode/prefill attention: reads sealed + tail storage directly
 // instead of materializing the full history first. See the doc comment on
 // the declaration (ggml.h) for the rotation convention this relies on.
-
+//
+// Multi-row (n_q > 1, prefill/chunked): query row i attends keys 0..P+i
+// where P = n_total - n_q is the ubatch start position (the ubatch's own
+// rows were folded into sealed/tail by cpy before this runs). n_q == 1 is
+// single-token decode; every row then sees the full history (no masking).
 struct ggml_tensor * ggml_kvarn_attn_decode(
         struct ggml_context * ctx,
-        struct ggml_tensor  * q,      // [128, n_head_q, 1] F32, rotated
+        struct ggml_tensor  * q,      // [128, n_head_q, n_q] F32, rotated
         struct ggml_tensor  * sealed, // [tile_bytes, n_groups_max, n_head_kv] I8
         struct ggml_tensor  * k_tail, // [128, 128, n_head_kv] F32
         struct ggml_tensor  * v_tail, // [128, 128, n_head_kv] F32
@@ -6536,9 +6540,10 @@ struct ggml_tensor * ggml_kvarn_attn_decode(
     GGML_ASSERT(sealed->type == GGML_TYPE_I8);
     GGML_ASSERT(k_tail->type == GGML_TYPE_F32 && v_tail->type == GGML_TYPE_F32);
     GGML_ASSERT(q->ne[1] % n_head_kv == 0 && "n_head_q must be an exact multiple of n_head_kv");
+    GGML_ASSERT(n_total >= q->ne[2] && "history must cover the whole ubatch");
     GGML_ASSERT(ggml_is_contiguous(q));
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, q->ne[1], 1);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, q->ne[1], q->ne[2]);
 
     result->op     = GGML_OP_KVARN_ATTN_DECODE;
     result->src[0] = q;

@@ -2657,13 +2657,15 @@ extern "C" {
             int                   n_total,
             int                   tail_count);
 
-    // KVarN: fused single-token decode attention against sealed + tail
-    // storage directly (avoids materializing the full dequantized history to
-    // a separate buffer first). q must be [128, n_head_q, 1], already
-    // rotated (ggml_turbo_wht direction=0); result is [128, n_head_q, 1],
-    // still rotated (apply ggml_turbo_wht direction=1 to un-rotate) - same
+    // KVarN: fused decode/prefill attention against sealed + tail storage
+    // directly (avoids materializing the full dequantized history to a
+    // separate buffer first). q must be [128, n_head_q, n_q], already rotated
+    // (ggml_turbo_wht direction=0); result is [128, n_head_q, n_q], still
+    // rotated (apply ggml_turbo_wht direction=1 to un-rotate) - same
     // convention as the graph-level Q/output rotation turbo4 already uses.
-    // n_head_q must be an exact multiple of n_head_kv (GQA broadcast).
+    // n_head_q must be an exact multiple of n_head_kv (GQA broadcast). Row i
+    // attends keys 0..P+i with P = n_total - n_q (causal prefill); n_q == 1
+    // is single-token decode.
     GGML_API struct ggml_tensor * ggml_kvarn_attn_decode(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
