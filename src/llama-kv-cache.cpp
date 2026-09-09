@@ -321,6 +321,10 @@ llama_kv_cache::llama_kv_cache(
     // llama-bench sweeping --cache-type-v) must not have the first
     // construction's mode silently pin the strategy for every later one.
     const int kv_adaptive_mode = llama_kv_cache_turbo_layer_adaptive_mode(type_v, hparams.n_layer());
+    if (kv_adaptive_mode != 0 && kv_stream_stage_bytes != 0 && !hparams.no_alloc) {
+        throw std::runtime_error("block KV streaming (--kv-stream-arena-mib) requires uniform KV types across all layers; TURBO_LAYER_ADAPTIVE is not supported");
+    }
+
     if (kv_adaptive_mode > 0) {
         if (getenv("TURBO_LAYER_ADAPTIVE")) {
             LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", kv_adaptive_mode);
@@ -820,6 +824,9 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (kv_stream_runtime.runtime != nullptr) {
+        throw std::runtime_error("seq_rm is not supported while block KV streaming is active");
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -888,6 +895,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (kv_stream_runtime.runtime != nullptr) {
+        throw std::runtime_error("seq_cp is not supported while block KV streaming is active");
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1007,6 +1017,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (kv_stream_runtime.runtime != nullptr) {
+        throw std::runtime_error("seq_add (K-shift) is not supported while block KV streaming is active");
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1136,6 +1149,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     }
 
     return ret;
+}
+
+bool llama_kv_cache::has_kv_stream_targets() const {
+    return kv_stream_runtime.runtime != nullptr;
 }
 
 std::vector<llama_kv_stream_target> llama_kv_cache::get_kv_stream_targets() const {
@@ -3393,6 +3410,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::has_kv_stream_targets() const {
+    return kv->has_kv_stream_targets();
 }
 
 std::vector<llama_kv_stream_active_target> llama_kv_cache_context::get_kv_stream_active_targets() const {

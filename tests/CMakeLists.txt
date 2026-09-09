@@ -260,10 +260,12 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
-llama_build_and_test(test-kv-stream-plan.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-plan.cpp)
-target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build_and_test(test-kv-stream-config.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp)
-target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-kv-stream-plan.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-plan.cpp)
+    target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-kv-stream-config.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp)
+    target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp)
 if (GGML_CUDA)
     llama_build_and_test(

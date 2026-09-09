@@ -200,6 +200,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
     return mb;
 }
 
+bool llama_memory_hybrid_iswa::has_kv_stream_targets() const {
+    return mem_attn->has_kv_stream_targets();
+}
+
 std::vector<llama_kv_stream_target> llama_memory_hybrid_iswa::get_kv_stream_targets() const {
     return mem_attn->get_kv_stream_targets();
 }
@@ -286,6 +290,10 @@ llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+bool llama_memory_hybrid_iswa_context::has_kv_stream_targets() const {
+    return ctx_attn ? ctx_attn->has_kv_stream_targets() : false;
 }
 
 std::vector<llama_kv_stream_active_target> llama_memory_hybrid_iswa_context::get_kv_stream_active_targets() const {

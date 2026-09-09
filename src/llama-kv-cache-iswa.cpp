@@ -178,6 +178,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+bool llama_kv_cache_iswa::has_kv_stream_targets() const {
+    return kv_base->has_kv_stream_targets() || kv_swa->has_kv_stream_targets();
+}
+
 std::vector<llama_kv_stream_target> llama_kv_cache_iswa::get_kv_stream_targets() const {
     std::vector<llama_kv_stream_target> targets = kv_base->get_kv_stream_targets();
     for (auto & target : kv_swa->get_kv_stream_targets()) {
@@ -378,6 +382,10 @@ const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
+}
+
+bool llama_kv_cache_iswa_context::has_kv_stream_targets() const {
+    return ctx_base->has_kv_stream_targets() || ctx_swa->has_kv_stream_targets();
 }
 
 std::vector<llama_kv_stream_active_target> llama_kv_cache_iswa_context::get_kv_stream_active_targets() const {

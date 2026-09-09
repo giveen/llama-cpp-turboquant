@@ -196,6 +196,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+bool llama_memory_hybrid::has_kv_stream_targets() const {
+    return mem_attn->has_kv_stream_targets();
+}
+
 std::vector<llama_kv_stream_target> llama_memory_hybrid::get_kv_stream_targets() const {
     return mem_attn->get_kv_stream_targets();
 }
@@ -297,6 +301,10 @@ ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
 
 ggml_tensor * llama_memory_hybrid_context::get_turbo_innerq_scale_inv() const {
     return ctx_attn ? ctx_attn->get_turbo_innerq_scale_inv() : nullptr;
+}
+
+bool llama_memory_hybrid_context::has_kv_stream_targets() const {
+    return ctx_attn ? ctx_attn->has_kv_stream_targets() : false;
 }
 
 std::vector<llama_kv_stream_active_target> llama_memory_hybrid_context::get_kv_stream_active_targets() const {
