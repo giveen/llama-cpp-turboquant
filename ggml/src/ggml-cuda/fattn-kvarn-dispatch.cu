@@ -948,7 +948,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_c
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
-if (use_gqa_opt && gqa_ratio > 4) {
+    if (use_gqa_opt && gqa_ratio > 4) {
         return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 8>(ctx, dst);
     }
 
