@@ -1,4 +1,5 @@
 #include "kvarn.cuh"
+#include "kvarn-bits.cuh"
 #include "turbo-quant.cuh"
 #include "ggml-kvarn-quant.h"
 
@@ -196,15 +197,7 @@ __device__ __forceinline__ void kvarn_seal_balance_and_store(
         const uint32_t mask = (uint32_t) ((1u << bits) - 1u);
         for (int c = 0; c < KVARN_N; c++) {
             const uint32_t value = q[c] & mask;
-            const size_t bit_offset = (size_t) c * bits;
-
-            const int word_idx = bit_offset >> 5;
-            const int bit_shift = bit_offset & 31;
-
-            local_packed[word_idx] |= (value << bit_shift);
-            if (bit_shift + bits > 32) {
-                local_packed[word_idx + 1] |= (value >> (32 - bit_shift));
-            }
+            kvarn_pack_bits_fast((uint8_t *) local_packed, c, bits, value);
         }
         uint32_t * row_words = (uint32_t *)(record + payload_off + (size_t) t * (bits * KVARN_N / 8));
         if ((row_words_n % 4) == 0 && (((uintptr_t) row_words) % 16) == 0) {
