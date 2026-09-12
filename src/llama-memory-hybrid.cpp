@@ -156,6 +156,18 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid::seq_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos * planned_p0, llama_pos * planned_p1) const {
+    return llama_memory_seq_rm_plan_all(seq_id, p0, p1, { mem_attn.get(), mem_recr.get() }, planned_p0, planned_p1);
+}
+
+bool llama_memory_hybrid::state_seq_can_save(llama_seq_id seq_id) {
+    return mem_attn->state_seq_can_save(seq_id) && mem_recr->state_seq_can_save(seq_id);
+}
+
+bool llama_memory_hybrid::state_seq_can_restore(llama_seq_id seq_id) {
+    return mem_attn->state_seq_can_restore(seq_id) && mem_recr->state_seq_can_restore(seq_id);
+}
+
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);

@@ -290,6 +290,51 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     return true;
 }
 
+bool llama_memory_recurrent::seq_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos * planned_p0, llama_pos * planned_p1) const {
+    // side-effect-free mirror of the acceptance checks in seq_rm above
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (seq_id >= (int64_t) size) {
+        return false;
+    }
+    if (seq_id < 0) {
+        // a negative seq_id accepts only a full range or an empty one
+        if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
+            return false;
+        }
+    } else if (0 < p0) {
+        const int32_t tail_id = cells[seq_id].tail;
+        if (tail_id >= 0) {
+            const llama_pos cell_pos = cells[tail_id].pos;
+            if (p0 <= cell_pos && p1 > cell_pos) {
+                const llama_pos rollback = cell_pos - (p0 - 1);
+                if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (planned_p0) *planned_p0 = p0;
+    if (planned_p1) *planned_p1 = p1;
+    return true;
+}
+
+bool llama_memory_recurrent::state_seq_can_save(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);
+    return true;
+}
+
+bool llama_memory_recurrent::state_seq_can_restore(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);
+    return true;
+}
+
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (seq_id_src == seq_id_dst) {
         return;

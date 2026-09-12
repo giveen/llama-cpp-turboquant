@@ -119,6 +119,18 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return res;
 }
 
+bool llama_kv_cache_iswa::seq_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos * planned_p0, llama_pos * planned_p1) const {
+    return llama_memory_seq_rm_plan_all(seq_id, p0, p1, { kv_base.get(), kv_swa.get() }, planned_p0, planned_p1);
+}
+
+bool llama_kv_cache_iswa::state_seq_can_save(llama_seq_id seq_id) {
+    return kv_base->state_seq_can_save(seq_id) && kv_swa->state_seq_can_save(seq_id);
+}
+
+bool llama_kv_cache_iswa::state_seq_can_restore(llama_seq_id seq_id) {
+    return kv_base->state_seq_can_restore(seq_id) && kv_swa->state_seq_can_restore(seq_id);
+}
+
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);

@@ -805,6 +805,24 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+bool llama_kv_cache::seq_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos * planned_p0, llama_pos * planned_p1) const {
+    GGML_UNUSED(seq_id);
+    // this cache accepts the requested range as-is (see seq_rm)
+    if (planned_p0) *planned_p0 = p0;
+    if (planned_p1) *planned_p1 = p1;
+    return true;
+}
+
+bool llama_kv_cache::state_seq_can_save(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);
+    return true;
+}
+
+bool llama_kv_cache::state_seq_can_restore(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);
+    return true;
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

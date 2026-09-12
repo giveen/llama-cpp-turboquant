@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <initializer_list>
 
 struct llama_ubatch;
 
@@ -122,7 +123,14 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
-    virtual bool seq_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos * planned_p0, llama_pos * planned_p1) = 0;
+    // side-effect-free query: can [p0, p1) be removed, and if so over which range?
+    // the default accepts the requested range as-is; compact caches widen it (p1 < 0)
+    virtual bool seq_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos * planned_p0, llama_pos * planned_p1) const {
+        GGML_UNUSED(seq_id);
+        if (planned_p0) *planned_p0 = p0;
+        if (planned_p1) *planned_p1 = p1;
+        return true;
+    }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
@@ -137,10 +145,49 @@ struct llama_memory_i {
     // state write/read
     //
 
-    virtual bool state_seq_can_save  (llama_seq_id seq_id) = 0;
-    virtual bool state_seq_can_restore(llama_seq_id seq_id) = 0;
+    // per-sequence state ops must not touch another live sequence's data;
+    // composite memories forward both directions to every child
+    virtual bool state_seq_can_save  (llama_seq_id seq_id) { GGML_UNUSED(seq_id); return true; }
+    virtual bool state_seq_can_restore(llama_seq_id seq_id) { GGML_UNUSED(seq_id); return true; }
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 };
+
+// combine the seq_rm_plan of several child memories into one plan that every
+// child accepts. returns false if any child refuses, or the children widen the
+// request to different ranges.
+inline bool llama_memory_seq_rm_plan_all(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        std::initializer_list<const llama_memory_i *> children,
+        llama_pos * planned_p0, llama_pos * planned_p1) {
+    if (children.size() == 0) {
+        return false;
+    }
+
+    llama_pos common_p0 = p0;
+    llama_pos common_p1 = p1;
+    for (const llama_memory_i * child : children) {
+        llama_pos child_p0 = p0;
+        llama_pos child_p1 = p1;
+        if (child == nullptr || !child->seq_rm_plan(seq_id, p0, p1, &child_p0, &child_p1)) {
+            return false;
+        }
+        if (p1 < 0) {
+            // a widened suffix must stay a suffix, and cover as far back as the deepest child needs
+            if (child_p1 >= 0) {
+                return false;
+            }
+            if (child_p0 < common_p0) {
+                common_p0 = child_p0;
+            }
+        } else if (child_p0 != p0 || child_p1 != p1) {
+            return false;
+        }
+    }
+
+    if (planned_p0) *planned_p0 = common_p0;
+    if (planned_p1) *planned_p1 = common_p1;
+    return true;
+}
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
