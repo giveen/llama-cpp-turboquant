@@ -15,6 +15,7 @@
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-msa.h"
+#include "llama-kvarn.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"

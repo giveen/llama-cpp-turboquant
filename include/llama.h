@@ -450,6 +450,46 @@ extern "C" {
         size_t size;
     };
 
+    // KVarN: variance-normalized KV cache compression (4/5/6-bit only).
+    // 0 = disabled. Requires n_seq_max == 1, kv_unified == true, no SWA,
+    // no MLA, and head_dim == 128 for every KV-bearing layer. [EXPERIMENTAL]
+    enum llama_kvarn_type {
+        LLAMA_KVARN_TYPE_INVALID  = -1,
+        LLAMA_KVARN_TYPE_DISABLED = 0,
+
+        LLAMA_KVARN_K2V2_G128, LLAMA_KVARN_K2V3_G128, LLAMA_KVARN_K2V4_G128,
+        LLAMA_KVARN_K3V2_G128, LLAMA_KVARN_K3V3_G128, LLAMA_KVARN_K3V4_G128,
+        LLAMA_KVARN_K4V2_G128, LLAMA_KVARN_K4V3_G128, LLAMA_KVARN_K4V4_G128,
+        LLAMA_KVARN_K2V5_G128, LLAMA_KVARN_K2V6_G128, LLAMA_KVARN_K2V8_G128,
+        LLAMA_KVARN_K3V5_G128, LLAMA_KVARN_K3V6_G128, LLAMA_KVARN_K3V8_G128,
+        LLAMA_KVARN_K4V5_G128, LLAMA_KVARN_K4V6_G128, LLAMA_KVARN_K4V8_G128,
+        LLAMA_KVARN_K5V2_G128, LLAMA_KVARN_K5V3_G128, LLAMA_KVARN_K5V4_G128,
+        LLAMA_KVARN_K5V5_G128, LLAMA_KVARN_K5V6_G128, LLAMA_KVARN_K5V8_G128,
+        LLAMA_KVARN_K6V2_G128, LLAMA_KVARN_K6V3_G128, LLAMA_KVARN_K6V4_G128,
+        LLAMA_KVARN_K6V5_G128, LLAMA_KVARN_K6V6_G128, LLAMA_KVARN_K6V8_G128,
+        LLAMA_KVARN_K8V2_G128, LLAMA_KVARN_K8V3_G128, LLAMA_KVARN_K8V4_G128,
+        LLAMA_KVARN_K8V5_G128, LLAMA_KVARN_K8V6_G128, LLAMA_KVARN_K8V8_G128,
+
+        LLAMA_KVARN_TYPE_COUNT,
+    };
+
+    struct llama_kvarn_params {
+        enum llama_kvarn_type type;
+        int32_t key_bits;
+        int32_t value_bits;
+        int32_t swa_key_bits;
+        int32_t swa_value_bits;
+        int32_t group;
+        int32_t sinkhorn_iters;
+        int32_t sink_tokens;
+        bool    fail_if_unsupported;
+    };
+
+    LLAMA_API const char *              llama_kvarn_type_name       (enum llama_kvarn_type type);
+    LLAMA_API enum llama_kvarn_type     llama_kvarn_type_from_name  (const char * name);
+    LLAMA_API struct llama_kvarn_params llama_kvarn_default_params  (void);
+    LLAMA_API struct llama_kvarn_params llama_kvarn_params_for_type (enum llama_kvarn_type type);
+
     // model quantization parameters
     typedef struct llama_model_quantize_params {
         int32_t nthread;                                            // number of threads to use for quantizing, if <=0 will use std::thread::hardware_concurrency()
