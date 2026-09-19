@@ -116,6 +116,12 @@ static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch, const llama_h
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
             return false;
+        case LLM_ARCH_QWEN4EXP:
+            // without SWA this builds llama_memory_hybrid_idx (a per-token
+            // indexer cache next to the attention one), which the streaming
+            // pre-scan does not model. with SWA it takes the hybrid-iswa path
+            // like any other hybrid model, which does stream.
+            return hparams.swa_type != LLAMA_SWA_TYPE_NONE;
         case LLM_ARCH_DFLASH:
             // DSV4 DSpark stages (dsv4_hc_mult > 0) store a single MLA-style K
             // per position via llama_kv_cache_iswa with a custom filter - not a
@@ -157,6 +163,7 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    cparams.gdn_replay = params.gdn_replay;
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -832,14 +839,18 @@ static bool llama_model_has_cacheable_moe_weights(
         return false;
     }
 
+    size_t largest_expert_bytes = 0;
     for (const auto & entry : model.tensors_by_name) {
         const std::string & name = entry.first;
         const ggml_tensor * tensor = entry.second;
         if (!tensor || (name.find("_exps") == std::string::npos &&
                         name.find("_chexps") == std::string::npos) ||
             ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 ||
-            tensor->ne[1] <= 0 || tensor->ne[2] <= 0 ||
-            tensor->nb[2] < min_expert_bytes) {
+            tensor->ne[1] <= 0 || tensor->ne[2] <= 0) {
+            continue;
+        }
+        largest_expert_bytes = std::max(largest_expert_bytes, tensor->nb[2]);
+        if (tensor->nb[2] < min_expert_bytes) {
             continue;
         }
 
@@ -864,7 +875,8 @@ static bool llama_model_has_cacheable_moe_weights(
             return true;
         }
     }
-    LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found)\n", __func__);
+    LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found; largest expert slab=%zu KiB, minimum=%zu KiB)\n",
+            __func__, largest_expert_bytes >> 10, min_expert_bytes >> 10);
     return false;
 }
 
@@ -2812,15 +2824,21 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // DFlash2's convolutions and selector are shape work rather than matmuls,
+        // so they cost about 8.6 nodes per tensor against 5.9 for plain DFlash.
+        return std::max<uint32_t>(1024u, 12u * model.n_tensors());
+    }
+
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_DFLASH ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
@@ -3951,6 +3969,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.gdn_replay                  =*/ false,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -4249,6 +4268,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 bool llama_model_supports_mtp_chain(const llama_model * model) {
     return model != nullptr && model->arch == LLM_ARCH_QWEN35;
+}
+
+bool llama_model_uses_shared_position_draft(const llama_model * model) {
+    return model != nullptr && model->arch == LLM_ARCH_GEMMA4_ASSISTANT;
 }
 
 void llama_set_mtp_chain(llama_context * ctx, bool value) {

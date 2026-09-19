@@ -102,7 +102,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
-            kv_stream_stage_bytes);
+            "", kv_stream_stage_bytes);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 

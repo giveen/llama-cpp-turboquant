@@ -25,6 +25,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                     bool   gdn_replay_req,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -52,6 +53,7 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_attn,
         nullptr,
         nullptr,
+        "",
         kv_stream_stage_bytes
     )),
     mem_recr(new llama_memory_recurrent(
@@ -62,6 +64,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         rs_size,
         n_seq_max,
         n_rs_seq,
+        gdn_replay_req,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
