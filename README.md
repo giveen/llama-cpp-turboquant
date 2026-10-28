@@ -18,21 +18,25 @@ A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (upstream)
 
 **TurboQuant** compresses the attention KV cache far beyond the standard `q8_0`, and adds WHT-rotated and ConvRot model-weight types. The method is data-oblivious online vector quantization ([TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874)) applied with a fixed 128x128 Walsh-Hadamard rotation (`GGML_OP_TURBO_WHT`): cache vectors are rotated before quantization (which Gaussianizes their distribution) and inverse-rotated after dequantization. Head dims that are not multiples of 128 are zero-padded.
 
-Eight fork-only GGML types (registered in `ggml/include/ggml.h`):
+Ten fork-only GGML types (registered in `ggml/include/ggml.h`):
 
 | Type     | Enum                       | Purpose                     | Size                   | Backends            |
 |----------|----------------------------|-----------------------------|------------------------|---------------------|
 | `turbo2` | `GGML_TYPE_TURBO2_0` (43)  | KV cache only               | 2.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
 | `turbo3` | `GGML_TYPE_TURBO3_0` (44)  | KV cache only               | 3.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
 | `turbo4` | `GGML_TYPE_TURBO4_0` (47)  | KV cache only               | 4.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| `turbo5` | `GGML_TYPE_TURBO5_0` (51)  | KV cache only               | 5.125 bits/value       | CPU, CUDA/HIP       |
+| `turbo6` | `GGML_TYPE_TURBO6_0` (52)  | KV cache only               | 6.125 bits/value       | CPU, CUDA/HIP       |
 | `TQ3_1S` | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max | 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | `TQ4_1S` | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max | 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | `Q8_CR`  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot      | 8.5 bits, group 256    | CPU, CUDA/HIP, Metal |
 | `Q5_CR`  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot      | 5.5 bits, group 256    | CPU, CUDA/HIP, Metal |
 | `Q6_CR`  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot      | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
 
-The turbo KV cache blocks hold 128 values each: 34, 50 and 66 bytes, so the size
-above 2, 3 and 4 bits is the per-block norm. `Q8_CR` / `Q5_CR` / `Q6_CR` are
+The turbo KV cache blocks hold 128 values each: 34, 50, 66, 82 and 98 bytes for
+`turbo2` to `turbo6`, which is where the bits/value figures above come from
+(the `static_assert`s in `ggml/src/ggml-common.h` are the authority).
+`Q8_CR` / `Q5_CR` / `Q6_CR` are
 `Q8_0` / `Q5_0` / `Q6_K` blocks holding a group of 256 weights rotated with a
 normalized Kronecker-Hadamard matrix; `mul_mat` rotates the other operand the
 same way before the dot products. Vulkan and SYCL reject them.
@@ -90,23 +94,29 @@ llama-server -m model.gguf -c 32768 -ngl 99 --cache-type-k q8_0 --cache-type-v t
 | `turbo2`  | 2.125      | up to 7.5x smaller       |
 | `turbo3`  | 3.125      | up to 5.1x smaller       |
 | `turbo4`  | 4.125      | up to 3.9x smaller       |
+| `turbo5`  | 5.125      | up to 3.1x smaller       |
+| `turbo6`  | 6.125      | up to 2.6x smaller       |
 
-Any combination of `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` and `turbo2/3/4` for K and V is accepted by `llama-cli`, `llama-server`, `llama-bench` (`-ctk` / `-ctv`) and `llama-perplexity`. K `q8_0` + V `turbo3` is the common starting point: the KV cache drops to about 36% of f16 K/V size.
+Any combination of `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` and `turbo2/3/4/5/6` for K and V is accepted by the flag parser of `llama-cli`, `llama-server`, `llama-bench` (`-ctk` / `-ctv`) and `llama-perplexity`. Which combinations actually have backend kernels is narrower and backend-dependent; [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md) has the per-backend picture. K `q8_0` + V `turbo3` is the common starting point: the KV cache drops to about 36% of f16 K/V size.
 
 Notes:
 
 - Turbo types **require flash attention**. If FA is not enabled it is turned on automatically (a warning is printed). A quantized V cache with FA explicitly disabled is an error, but a turbo V cache never reaches that check because it turns FA on first.
-- **Metal**: flash attention only accepts a turbo or `q8_0` K cache with a turbo V cache. An `f16` K cache combined with a turbo V cache trips the mixed-type assert in `ggml_metal_op_flash_attn_ext` and aborts. This is the backend to keep in mind for the attention-sink note below.
+- **Metal**: flash attention accepts exactly three mixed pairs: turbo K + turbo V, `q8_0` K + turbo V, and turbo K + `q8_0` V (`turbo` is `turbo2/3/4` here; `turbo5/6` have no Metal kernels). Any other mixed pair, an `f16` K cache with a turbo V cache included, trips the assert in `ggml_metal_op_flash_attn_ext` and aborts. This is the backend to keep in mind for the attention-sink note below.
 - **MLA models (DeepSeek)**: there is no separate V cache (V is a view of K), so V rotation and padding are skipped, and the K and V cache types must be identical.
 - **Attention-sink models (GPT-OSS and similar)**: even `q8_0` K changes output distributions, and lower-bit K degrades them further. Use `f16` K for these models. Validate a quantized V cache against an `f16` baseline with `llama-perplexity --kl-divergence`: short samples can stay fluent while token probabilities move.
 
 Choosing a type:
 
-- `turbo4`: quality-first (highest fidelity, 3.9x smaller than f16).
+- `turbo6`: highest-fidelity turbo option (2.6x smaller than f16), CUDA/HIP and CPU only.
+- `turbo5`: between `turbo4` and `turbo6` (3.1x), CUDA/HIP and CPU only.
+- `turbo4`: quality-first for the widely supported set (3.9x smaller than f16).
 - `turbo3`: capacity sweet spot (5.1x).
 - `turbo2`: maximum context in minimum VRAM (7.5x), most quality loss.
 
-Full usage and model-specific quality notes: [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md). That doc's "Environment knobs" section is behind the table below and needs a refresh; until then use the table below or [AGENTS.md](AGENTS.md).
+`turbo2`/`turbo3`/`turbo4` are the portable choices; `turbo5`/`turbo6` currently run on CUDA/HIP and CPU only.
+
+Full usage, per-backend support and model-specific quality notes: [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md). That doc is the source of truth for the environment knobs summarized below.
 
 ## TQ weight types (TQ3_1S / TQ4_1S)
 
@@ -125,7 +135,9 @@ On CUDA, `TQ4_1S` weights are converted to `q8_0` at load time by default (best 
 | Feature                     | CUDA/HIP | Metal | Vulkan | SYCL | CPU | WebGPU |
 |-----------------------------|----------|-------|--------|------|-----|--------|
 | `turbo2/3/4` KV cache       | yes      | yes   | yes    | yes  | yes | no     |
-| Flash attention (turbo)     | yes      | yes   | yes    | yes  | yes | no     |
+| `turbo5/6` KV cache         | yes      | no    | no     | no   | yes | no     |
+| Flash attention (turbo2/3/4) | yes     | yes   | yes    | yes  | yes | no     |
+| Flash attention (turbo5/6)  | yes      | no    | no     | no   | yes | no     |
 | `TQ3_1S` / `TQ4_1S` weights | yes      | yes   | yes    | no   | yes | no     |
 | `Q8_CR` / `Q5_CR` / `Q6_CR` weights | yes | yes | no    | no   | yes | no     |
 | `GGML_TQ_NATIVE`            | yes      | n/a   | n/a    | n/a  | n/a | n/a    |
@@ -144,14 +156,14 @@ On CUDA, `TQ4_1S` weights are converted to `q8_0` at load time by default (best 
 | `LLAMA_ATTN_ROT_K_NROT`                   | `64`    | Rotation size for the optional upstream K path (`0` = upstream default) |
 | `LLAMA_ATTN_ROT_DISABLE`                  | `0`     | Hard lock-out: force rotation off on both sides (`1` disables) |
 
-This table is a summary for users, and the source of truth for the values is [AGENTS.md](AGENTS.md) and the code. `docs/KV-cache-quantization.md` carries an older, shorter copy of it.
+This is a summary for users. [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md) is the source of truth for these variables; if the doc and the code ever disagree, the code wins and both need fixing in the same PR.
 
 ## Common problems
 
 - `Unsupported cache type: turbo3`: you are running an upstream pre-built binary. Build this repository instead. The `ghcr.io/ggml-org/llama.cpp` images in [docs/docker.md](docs/docker.md) count as upstream binaries.
 - Crash or abort on the first turbo KV write (Metal NULL-pipeline deref, Vulkan SET_ROWS abort): stale binary; update to the latest fork build.
-- Abort in the Metal flash attention kernel with a turbo V cache: the K cache is not turbo or `q8_0`, which is the only mixed pair Metal accepts. Use a turbo or `q8_0` K cache, or an `f16` V cache.
-- NaN or garbage output with `TQ4_1S` weights on CUDA: this needs `GGML_TQ_NATIVE=1`, the only setting that enters the fused TQ kernels. Build a current fork revision and leave `GGML_TQ_NATIVE` unset; the default `q8_0` conversion path does not use them.
+- Abort in the Metal flash attention kernel with a turbo cache: the K/V pair is not one of turbo+turbo, `q8_0`+turbo or turbo+`q8_0` (turbo = `turbo2/3/4`). Use one of those, or an `f16` V cache with `f16` K.
+- NaN or garbage output with `TQ4_1S` weights on CUDA: the fused TQ kernels, which only `GGML_TQ_NATIVE=1` enters, had NaN bugs. Build a current fork revision and leave `GGML_TQ_NATIVE` unset; the default load-time `q8_0` conversion does not use them.
 - Output looks fluent but token probabilities changed: attention-sink model. Use `f16` K (not available with a turbo V cache on Metal) and compare with `llama-perplexity --kl-divergence` before blaming the codec.
 - `not supported [backend]` lines or `0/0 tests passed` in `test-backend-ops`: the cases for your change were skipped, not passed.
 
@@ -179,7 +191,7 @@ Plain C/C++ implementation on top of the [ggml](https://github.com/ggml-org/ggml
 - [How to build](docs/build.md)
 - [Running on Docker](docs/docker.md) (upstream images, no TurboQuant)
 - [KV cache quantization with TurboQuant](docs/KV-cache-quantization.md)
-- [SYCL backend](docs/backend/SYCL.md) (turbo KV cache only, no TQ weights)
+- [SYCL backend](docs/backend/SYCL.md) (`turbo2/3/4` KV cache only, no TQ weights)
 - [Multi-GPU usage](docs/multi-gpu.md)
 - [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
 - [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)

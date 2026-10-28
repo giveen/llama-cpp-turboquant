@@ -8,33 +8,35 @@ This repo is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (upstr
 
 TurboQuant compresses the KV cache far beyond the standard `q8_0` by applying a fixed 128x128 orthonormal Walsh-Hadamard rotation (`GGML_OP_TURBO_WHT`) to cache vectors before quantization, which Gaussianizes the distribution, and inverse-rotating after dequantization. Head dims that are not multiples of 128 are zero-padded. MLA models (DeepSeek) have no separate V cache, so V rotation/padding is skipped for them, and K/V cache types must be identical.
 
-The eight fork-only GGML types (registered in `ggml/include/ggml.h`):
+The ten fork-only GGML types (registered in `ggml/include/ggml.h`):
 
 | Type   | Enum                       | Purpose                             | Size         | Backends            |
 |--------|----------------------------|-------------------------------------|--------------|---------------------|
 | turbo2 | `GGML_TYPE_TURBO2_0` (43)  | KV cache only                       | 2.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
 | turbo3 | `GGML_TYPE_TURBO3_0` (44)  | KV cache only                       | 3.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
 | turbo4 | `GGML_TYPE_TURBO4_0` (47)  | KV cache only                       | 4.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo5 | `GGML_TYPE_TURBO5_0` (51)  | KV cache only                       | 5.125 bits   | CPU, CUDA/HIP       |
+| turbo6 | `GGML_TYPE_TURBO6_0` (52)  | KV cache only                       | 6.125 bits   | CPU, CUDA/HIP       |
 | TQ3_1S | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max| 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max| 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | Q8_CR  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot              | 8.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q5_CR  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot              | 5.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q6_CR  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot              | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
 
-The turbo blocks hold 128 values each (34, 50, 66 bytes); the `static_assert`s in `ggml/src/ggml-common.h` are the authority, not the struct comments. ggml-sycl has no TQ weight kernels, and its generic dequantize path leaves TQ weights in the WHT-rotated domain, so TQ models are unsupported there. Vulkan and SYCL reject the `*_CR` types in `supports_op`.
+The turbo blocks hold 128 values each (34, 50, 66, 82, 98 bytes for turbo2 to turbo6); the `static_assert`s in `ggml/src/ggml-common.h` are the authority, not the struct comments. ggml-sycl has no TQ weight kernels, and its generic dequantize path leaves TQ weights in the WHT-rotated domain, so TQ models are unsupported there. Vulkan and SYCL reject the `*_CR` types in `supports_op`.
 
 Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S and Q8_CR/Q5_CR/Q6_CR are `llama-quantize` targets.
 
 ### Key files
 
 - `ggml/src/ggml-turbo-quant.c` - the codec (keep byte-identical to fork tip)
-- `ggml/include/ggml.h` - type enum 43-50, `GGML_OP_TURBO_WHT`
+- `ggml/include/ggml.h` - type enum 43-52, `GGML_OP_TURBO_WHT`
 - `src/llama-kv-cache.cpp` - cache wiring, `get_k_idx`, layer-adaptive precision
 - `src/llama-graph.cpp` - inverse-WHT post-processing (FA and non-FA paths)
 - `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (only reached with `GGML_TQ_NATIVE=1`; by default `TQ4_1S` is converted to `q8_0` at load in `ggml-cuda.cu`)
 - `ggml/src/ggml-vulkan/` - turbo FA, SET_ROWS, dequant shaders
 - `ggml/src/ggml-metal/ggml-metal.metal` - TurboFlash kernels
-- `docs/KV-cache-quantization.md` - usage doc (read before touching cache types; its "Environment knobs" section is currently shorter than the table above and needs a refresh)
+- `docs/KV-cache-quantization.md` - usage doc (read before touching cache types; source of truth for the environment knobs)
 
 ### Usage
 
@@ -42,11 +44,11 @@ Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S and Q8_C
 llama-cli -m model.gguf -c 8192 -ngl 99 --cache-type-k q8_0 --cache-type-v turbo3
 ```
 
-Any combination of `f32`/`f16`/`bf16`/`q8_0`/`q4_0`/`q4_1`/`iq4_nl`/`q5_0`/`q5_1`/`turbo2`/`turbo3`/`turbo4` for K and V is supported. Turbo cache types require flash attention; it is auto-enabled with a warning before upstream's quantized-V check runs, so a turbo V cache never trips that error (it applies to the other quantized V types). On Metal, flash attention asserts unless the mixed K/V pair is turbo+turbo, turbo+q8_0 or q8_0+turbo. The same flags work in `llama-server`, `llama-bench`, `llama-perplexity`.
+Any combination of `f32`/`f16`/`bf16`/`q8_0`/`q4_0`/`q4_1`/`iq4_nl`/`q5_0`/`q5_1`/`turbo2`/`turbo3`/`turbo4`/`turbo5`/`turbo6` for K and V is accepted by the flag parser; which pairs have kernels is backend-dependent (see `docs/KV-cache-quantization.md`). `turbo5`/`turbo6` run on CPU and CUDA/HIP only. Turbo cache types require flash attention; it is auto-enabled with a warning before upstream's quantized-V check runs, so a turbo V cache never trips that error (it applies to the other quantized V types). On Metal, flash attention asserts unless the mixed K/V pair is turbo+turbo, turbo+q8_0 or q8_0+turbo (turbo2/3/4 only). The same flags work in `llama-server`, `llama-bench`, `llama-perplexity`.
 
 ### Environment knobs
 
-This table is the source of truth for variable names, defaults and semantics. `docs/KV-cache-quantization.md` carries a user-facing copy of it; if the two ever disagree, the code wins and both need fixing in the same PR. Do not document a knob only in a PR description.
+`docs/KV-cache-quantization.md` is the source of truth for variable names, defaults and semantics; the table below is the agent-facing summary. If the two ever disagree, the code wins and both need fixing in the same PR. Do not document a knob only in a PR description.
 
 | Variable                    | Default | Effect |
 |-----------------------------|---------|--------|
@@ -66,7 +68,7 @@ This table is the source of truth for variable names, defaults and semantics. `d
 
 - `test-turbo-quant` - turbo3 basis MSE=0/Cosine=1.0, turbo4 Cosine=0.9956
 - `test-quantize-fns` - includes TQ3_1S/TQ4_1S and rotated-domain buffer sizing
-- `test-backend-ops` - full sweep on the backend under test (23k+ cases on the RTX 5090 CUDA box; the same cases on the MI210 AMD box when CUDA/HIP kernels changed); CPU is the numeric reference and is skipped unless `-b CPU`; rejects 0/0 as FAIL
+- `test-backend-ops` - full sweep on the backend under test; CPU is the numeric reference and is skipped as a backend under test unless `-b CPU` is passed; rejects 0/0 as FAIL
 - `llama-bench` with `-ctk/-ctv turboN`; type parser accepts `tq3_1s`/`tq4_1s`
 
 ### Validation by change type
@@ -90,8 +92,8 @@ A change touching several backends requires the checks for all of them, not just
 
 What each suite does:
 
-- `test-turbo-quant` - CPU codec round-trip quality: quantize -> dequantize -> CPU inverse WHT, MSE/cosine on fixed vectors, plus a chunked-dequant invariance check for all five turbo types at row lengths straddling the vec_dot chunk size. No GGML graphs, no backend kernels.
-- `test-quantize-fns` - CPU quantize/dequantize functions against error budgets, including TQ3_1S/TQ4_1S. Skips TURBO2_0/3_0/4_0 by design: their dequant output stays in the WHT-rotated domain.
+- `test-turbo-quant` - CPU codec round-trip quality: quantize -> dequantize -> CPU inverse WHT, MSE/cosine on fixed vectors, plus a chunked-dequant invariance check for all seven turbo cache types at row lengths straddling the vec_dot chunk size. No GGML graphs, no backend kernels.
+- `test-quantize-fns` - CPU quantize/dequantize functions against error budgets, including TQ3_1S/TQ4_1S. Skips TURBO2_0/3_0/4_0/5_0/6_0 by design: their dequant output stays in the WHT-rotated domain.
 - `test-backend-ops` - per-op GGML graphs, run on each backend and compared numerically against the CPU reference. This is the only gate that exercises backend kernels.
 - `llama-bench` - tokens/s on real models. Timing only; it never checks output correctness.
 
