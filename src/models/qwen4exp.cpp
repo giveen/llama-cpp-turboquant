@@ -547,9 +547,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    GGML_ASSERT((layer.nextn.embed_tokens || model.tok_embd) &&
-            "QWEN4EXP MTP: checkpoint has neither nextn.embed_tokens nor a trunk token_embd.weight to draft from");
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    if (tok_embd_w == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->tok_embd != nullptr &&
+                "QWEN4EXP MTP: draft-only checkpoint requires the target model's token embeddings");
+        tok_embd_w = model_other->tok_embd;
+    }
     ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
@@ -692,7 +697,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
+    if (head_w == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->output != nullptr &&
+                "QWEN4EXP MTP: draft-only checkpoint requires the target model's output projection");
+        head_w = model_other->output;
+        head_s = model_other->output_s;
+    }
 
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);

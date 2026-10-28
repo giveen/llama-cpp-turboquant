@@ -92,7 +92,7 @@ A change touching several backends requires the checks for all of them, not just
 
 What each suite does:
 
-- `test-turbo-quant` - CPU codec round-trip quality: quantize -> dequantize -> CPU inverse WHT, MSE/cosine on fixed vectors, plus a chunked-dequant invariance check for all seven turbo cache types at row lengths straddling the vec_dot chunk size. No GGML graphs, no backend kernels.
+- `test-turbo-quant` - CPU codec round-trip quality: quantize -> dequantize -> CPU inverse WHT, MSE/cosine on fixed vectors, plus a chunked-dequant invariance check for all five turbo cache types (and TQ3_1S/TQ4_1S) at row lengths straddling the vec_dot chunk size. No GGML graphs, no backend kernels.
 - `test-quantize-fns` - CPU quantize/dequantize functions against error budgets, including TQ3_1S/TQ4_1S. Skips TURBO2_0/3_0/4_0/5_0/6_0 by design: their dequant output stays in the WHT-rotated domain.
 - `test-backend-ops` - per-op GGML graphs, run on each backend and compared numerically against the CPU reference. This is the only gate that exercises backend kernels.
 - `llama-bench` - tokens/s on real models. Timing only; it never checks output correctness.

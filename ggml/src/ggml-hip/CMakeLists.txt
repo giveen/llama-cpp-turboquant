@@ -63,7 +63,7 @@ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 # Exclude D>=576 tile kernels: exceed HIP local memory limit (67584 > 65536)
-list(FILTER SRCS EXCLUDE REGEX "dkq(576|640)")
+list(FILTER SRCS EXCLUDE REGEX "dkq640")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
@@ -106,7 +106,20 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo6_0-turbo6_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo6_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo6_0-turbo4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo6_0-q8_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo6_0-f16.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo6_0-turbo5_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo6_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo5_0-turbo5_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo5_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo5_0-turbo4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo5_0-q8_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo5_0-f16.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo5_0.cu)
 endif()
 
 ggml_add_backend_library(ggml-hip
